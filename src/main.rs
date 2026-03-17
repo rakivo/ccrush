@@ -278,7 +278,9 @@ pub type CResult<T> = Result<T, CError>;
 pub enum TK {
     Eof, Ident, Number, StrLit,
     LParen, RParen, LCurly, RCurly, Comma, SemiColon, TripleDot,
-    Plus, Minus, Star, Slash, Eq, EqEq, NotEq,
+    Plus, Minus, Star, Slash, Eq,
+    PlusEq, MinusEq, StarEq, SlashEq,
+    EqEq, NotEq,
     Less, Greater, LessEq, GreaterEq, BinAnd, BinOr, Not,
 
     // PP-internal - never escapes cooked stream
@@ -324,6 +326,7 @@ const HASH_UNDEF:   u64 = fnv1a_str("undef");
 const HASH_IFNDEF:  u64 = fnv1a_str("ifndef");
 const HASH_IFDEF:   u64 = fnv1a_str("ifdef");
 const HASH_IF:      u64 = fnv1a_str("if");
+const HASH_FOR:     u64 = fnv1a_str("for");
 const HASH_ELSE:    u64 = fnv1a_str("else");
 const HASH_ELIF:    u64 = fnv1a_str("elif");
 const HASH_ENDIF:   u64 = fnv1a_str("endif");
@@ -357,8 +360,10 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileId) -> Token {
         b'('  => tok!(TK::LParen),  b')' => tok!(TK::RParen),
         b'{'  => tok!(TK::LCurly),  b'}' => tok!(TK::RCurly),
         b','  => tok!(TK::Comma),   b';' => tok!(TK::SemiColon),
-        b'+'  => tok!(TK::Plus),    b'-' => tok!(TK::Minus),
-        b'*'  => tok!(TK::Star),    b'#' => tok!(TK::Hash),
+        b'+' => tok2!(b'=', TK::PlusEq,  TK::Plus),
+        b'-' => tok2!(b'=', TK::MinusEq, TK::Minus),
+        b'*' => tok2!(b'=', TK::StarEq,  TK::Star),
+        b'#'  => tok!(TK::Hash),
         b'&'  => tok!(TK::BinAnd),  b'|' => tok!(TK::BinOr),
         b'!'  => tok2!(b'=', TK::NotEq,     TK::Not),
         b'<'  => tok2!(b'=', TK::LessEq,    TK::Less),
@@ -380,6 +385,8 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileId) -> Token {
                     span: Span { file: fid, start: start as u32, len: (*pos-start) as u16 },
                     hash: 0
                 }
+            } else if *pos < src.len() && src[*pos] == b'=' {
+                *pos += 1; tok!(TK::SlashEq)
             } else {
                 tok!(TK::Slash)
             }
@@ -1672,6 +1679,13 @@ impl CodeBuf {
         self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x10, 0xC0 | (dst as u8) << 3 | src as u8]);
     }
 
+    #[inline]
+    pub fn cvtsi2sd(&mut self, dst: XmmReg, src: Reg) {
+        let rex = 0x48 | (src.ext() as u8);
+        self.bytes.extend_from_slice(&[0xF2, rex, 0x0F, 0x2A]);
+        self.bytes.push(0xC0 | (dst as u8) << 3 | src.enc());
+    }
+
     // cvtss2sd xmm_dst, xmm_src  - float -> double promotion
     #[inline]
     pub fn cvtss2sd(&mut self, dst: XmmReg, src: XmmReg) {
@@ -1691,6 +1705,7 @@ pub struct ValueStack { vals: [CValue; VALUE_STACK_CAP], top: usize }
 impl ValueStack {
     pub fn new() -> Self { Self { vals: [CValue::imm(CType::Int, 0); VALUE_STACK_CAP], top: 0 } }
     pub fn push(&mut self, v: CValue) { self.vals[self.top] = v; self.top += 1; }
+    #[track_caller]
     pub fn pop (&mut self) -> CValue  { self.top -= 1; self.vals[self.top] }
     pub fn peek(&self)     -> CValue  { self.vals[self.top - 1] }
     pub fn len (&self)     -> usize   { self.top }
@@ -2002,6 +2017,25 @@ impl Compiler {
         }
     }
 
+    // in compile_binop float path, after force_xmm calls:
+    #[inline]
+    fn coerce_to_xmm(&mut self, v: CValue, target_ty: CType) -> CResult<XmmReg> {
+        if v.ty.is_float() {
+            return self.force_xmm(v);
+        }
+
+        // int -> float conversion via cvtsi2sd then optional cvtsd2ss
+        let gp = self.force_gp(v)?;
+        let xmm = self.xmms.alloc(Span::POISONED)?;
+        self.buf.cvtsi2sd(xmm, gp);  // Always convert to double first
+        self.regs.free(gp);
+        if target_ty == CType::Float {
+            self.buf.cvtsd2ss(xmm, xmm);
+        }
+
+        Ok(xmm)
+    }
+
     #[inline]
     fn free_reg(&mut self, reg: ValReg) {
         match reg {
@@ -2183,6 +2217,7 @@ impl Compiler {
                 let h = self.current_token.hash;
                 if h == HASH_RETURN             { self.compile_return()     }
                 else if h == HASH_IF            { self.compile_if()         }
+                else if h == HASH_FOR           { self.compile_for()         }
                 else if HASH_TYPES.contains(&h) { self.compile_local_decl() }
                 else                            { self.compile_expr_stmt()  }
             }
@@ -2260,6 +2295,110 @@ impl Compiler {
         } else {
             self.buf.patch_rel32(je_patch, self.buf.pos());
         }
+
+        Ok(())
+    }
+
+    fn compile_for(&mut self) -> CResult<()> {
+        self.next(); // for
+        self.expect(TK::LParen, "'('")?;
+
+        //
+        // Init
+        //
+        if self.current_token.kind != TK::SemiColon {
+            let h = self.current_token.hash;
+            if HASH_TYPES.contains(&h) {
+                self.compile_local_decl()?;
+            } else {
+                self.compile_expr()?;
+                let v = self.vstack.pop();
+                if v.kind == VK::Reg { self.free_reg(v.reg); }
+                self.expect(TK::SemiColon, "';'")?;
+            }
+        } else {
+            self.next(); // ';'
+        }
+
+        //
+        // Collect cond tokens
+        //
+        let mut cond_toks = Vec::new();
+        while self.current_token.kind != TK::SemiColon && !self.at_eof() {
+            cond_toks.push(self.next());
+        }
+        self.expect(TK::SemiColon, "';'")?;
+
+        //
+        // Collect post tokens
+        //
+        let mut post_toks = Vec::new();
+        let mut depth = 0usize;
+        loop {
+            match self.current_token.kind {
+                TK::LParen              => { depth += 1; post_toks.push(self.next()); }
+                TK::RParen if depth > 0 => { depth -= 1; post_toks.push(self.next()); }
+                TK::RParen              => { self.next(); break; }
+                TK::Eof                 => break,
+                _                       => { post_toks.push(self.next()); }
+            }
+        }
+
+        //
+        // Jmp to cond
+        //
+        let jmp_cond = self.buf.jmp_rel32();
+        let loop_top = self.buf.pos();
+
+        //
+        // Body
+        //
+        self.compile_stmt()?;
+
+        //
+        // Post
+        //
+        if !post_toks.is_empty() {
+            let saved_cur  = self.pp.current_token;
+            let saved_peek = self.pp.next_token;
+
+            let mut replay = post_toks;
+            replay.push(saved_cur);
+            replay.push(saved_peek);
+
+            self.pp.exp.push(replay.as_slice());
+            self.pp.current_token = self.pp.cook();
+            self.pp.next_token    = self.pp.cook();
+
+            self.compile_expr()?;
+            let v = self.vstack.pop();
+            if v.kind == VK::Reg { self.free_reg(v.reg); }
+        }
+
+        //
+        // Cond
+        //
+        self.buf.patch_rel32(jmp_cond, self.buf.pos());
+        if !cond_toks.is_empty() {
+            let saved_cur  = self.pp.current_token;
+            let saved_peek = self.pp.next_token;
+
+            let mut replay = cond_toks;
+            replay.push(saved_cur);
+            replay.push(saved_peek);
+
+            self.pp.exp.push(replay.as_slice());
+            self.pp.current_token = self.pp.cook();
+            self.pp.next_token    = self.pp.cook();
+
+            self.compile_expr()?;
+            let (r, _) = self.pop_reg()?;
+            self.buf.test_rr(r);
+            self.regs.free(r);
+        }
+
+        let jne_patch = self.buf.jne_rel32();
+        self.buf.patch_rel32(jne_patch, loop_top);
 
         Ok(())
     }
@@ -2349,10 +2488,10 @@ impl Compiler {
         }
     }
 
-    // -- Expressions - Pratt parser -------------------------------------------
+    // -- Expressions -------------------------------------------
     //
     // prec table (low -> high):
-    //   1  =   (right-assoc)
+    //   1  = += -= *= /= &= |=  (right-assoc)
     //   2  == !=
     //   3  < > <= >=
     //   4  + -
@@ -2368,7 +2507,7 @@ impl Compiler {
     #[inline]
     const fn op_prec(k: TK) -> Option<(u8, bool)> {
         match k {
-            TK::Eq                                         => Some((1, true)),
+            TK::Eq   | TK::PlusEq | TK::MinusEq | TK::StarEq | TK::SlashEq => Some((1, true)),
             TK::EqEq | TK::NotEq                           => Some((2, false)),
             TK::Less | TK::Greater | TK::LessEq | TK::GreaterEq => Some((3, false)),
             TK::Plus | TK::Minus                           => Some((4, false)),
@@ -2395,11 +2534,40 @@ impl Compiler {
             let span = self.current_token.span;
             self.next();
 
-            if op == TK::Eq {
+            if matches!(op, TK::Eq | TK::PlusEq | TK::MinusEq | TK::StarEq | TK::SlashEq) {
                 let lhs = self.vstack.pop();
                 if !lhs.is_lvalue() { return Err(CError::NotLvalue { span }); }
 
                 self.compile_expr_impl(if right { prec } else { prec + 1 })?;
+
+                if op != TK::Eq {
+                    // rhs is on top - pop it, load lhs value, push both back in order
+                    let rhs = self.vstack.pop();
+                    let base = lhs.reg.as_gp();
+
+                    if lhs.ty.is_float() {
+                        let tmp = self.xmms.alloc(span)?;
+                        match lhs.ty {
+                            CType::Float => self.buf.movss_load(tmp, base, lhs.offset),
+                            _            => self.buf.movsd_load(tmp, base, lhs.offset),
+                        }
+                        self.vstack.push(CValue::xmm(lhs.ty, tmp));
+                    } else {
+                        let tmp = self.regs.alloc(span)?;
+                        self.buf.mov_load(tmp, base, lhs.offset, lhs.ty.is64());
+                        self.vstack.push(CValue::gp(lhs.ty, tmp));
+                    }
+
+                    self.vstack.push(rhs);
+                    let arith_op = match op {
+                        TK::PlusEq  => TK::Plus,
+                        TK::MinusEq => TK::Minus,
+                        TK::StarEq  => TK::Star,
+                        TK::SlashEq => TK::Slash,
+                        _ => unreachable!(),
+                    };
+                    self.compile_binop(arith_op, span)?;
+                }
 
                 let base = lhs.reg.as_gp();
                 self.compile_store_keep(base, lhs.offset, lhs.ty)?;
@@ -2420,8 +2588,13 @@ impl Compiler {
                 let lhs = self.vstack.pop();
 
                 if lhs.ty.is_float() {
-                    let l = self.force_xmm(lhs)?;
-                    let r = self.force_xmm(rhs)?;
+                    let target_ty = if lhs.ty == CType::Double || rhs.ty == CType::Double {
+                        CType::Double
+                    } else {
+                        CType::Float
+                    };
+                    let l = self.coerce_to_xmm(lhs, target_ty)?;
+                    let r = self.coerce_to_xmm(rhs, target_ty)?;
 
                     let ty = self.normalize_xmm(l, lhs.ty, r, rhs.ty);
                     match (op, ty) {
