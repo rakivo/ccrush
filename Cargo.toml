@@ -1,0 +1,37 @@
+[package]
+name = "ccrush"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bitflags = "2.11.0"
+libc = "0.2.183"
+memmap2 = "0.9.10"
+nohash-hasher = "0.2.0"
+smallvec = { version = "1.15.1", features = ["const_new"] }
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release-fast]
+inherits = "release"
+opt-level = 3
+panic = "abort"
+codegen-units = 1
+lto = "fat"
+debug = false
+strip = true
+overflow-checks = false
+debug-assertions = false
+
+# also: set RUSTFLAGS="-C force-frame-pointers=yes"
+[profile.profiling]
+inherits = "release"
+debug = true                      # keep DWARF symbols
+split-debuginfo = "packed"        # so perf can find them easily (Linux)
+strip = "none"                    # don’t strip symbols
+lto = false
+codegen-units = 16
+overflow-checks = false
+panic = "abort"                   # optional: less noise, smaller code

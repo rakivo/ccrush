@@ -1,0 +1,8 @@
+*.o
+*.svg
+*.py
+*.c
+*.h
+*.out
+.idea
+target
