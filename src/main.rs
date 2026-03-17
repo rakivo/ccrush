@@ -1745,7 +1745,7 @@ impl LocalTable {
 
     #[inline]
     pub fn find(&self, hash: u64) -> Option<Local> {
-        self.locals.iter().find(|var| var.hash == hash).copied()
+        self.locals.iter().rev().find(|var| var.hash == hash).copied()
     }
 }
 
@@ -2022,10 +2022,21 @@ impl Compiler {
     #[inline]
     fn coerce_to_xmm(&mut self, v: CValue, target_ty: CType) -> CResult<XmmReg> {
         if v.ty.is_float() {
-            return self.force_xmm(v);
+            let r = self.force_xmm(v)?;
+
+            // Still need to convert if types differ
+            if v.ty == CType::Double && target_ty == CType::Float {
+                self.buf.cvtsd2ss(r, r);
+            } else if v.ty == CType::Float && target_ty == CType::Double {
+                self.buf.cvtss2sd(r, r);
+            }
+
+            return Ok(r);
         }
 
-        // int -> float conversion via cvtsi2sd then optional cvtsd2ss
+        //
+        // int -> float
+        //
         let gp = self.force_gp(v)?;
         let xmm = self.xmms.alloc(Span::POISONED)?;
         self.buf.cvtsi2sd(xmm, gp);  // Always convert to double first
@@ -2245,10 +2256,11 @@ impl Compiler {
 
         if self.current_token.kind != TK::SemiColon {
             self.compile_expr()?;
-            if self.ret_ty.is_float() {
-                let (r, src_ty) = self.pop_xmm()?;
 
-                self.convert_float_if_needed(src_ty, self.ret_ty, r);
+            let ret_ty = self.ret_ty;
+            if ret_ty.is_float() {
+                let v = self.vstack.pop();
+                let r = self.coerce_to_xmm(v, ret_ty)?;
 
                 match self.ret_ty {
                     CType::Float => self.buf.movss_rr(XmmReg::Xmm0, r),
@@ -2458,15 +2470,6 @@ impl Compiler {
     }
 
     #[inline]
-    fn convert_float_if_needed(&mut self, src_ty: CType, dst_ty: CType, r: XmmReg) {
-        if src_ty == CType::Double       && dst_ty == CType::Float {
-            self.buf.cvtsd2ss(r, r);
-        } else if src_ty == CType::Float && dst_ty == CType::Double {
-            self.buf.cvtss2sd(r, r);
-        }
-    }
-
-    #[inline]
     fn compile_store_impl(&mut self, base: Reg, off: i32, ty: CType, keep: bool) -> CResult<()> {
         if !ty.is_float() {
             let (r, _) = self.pop_reg()?;
@@ -2481,9 +2484,8 @@ impl Compiler {
             return Ok(());
         }
 
-        let (r, src_ty) = self.pop_xmm()?;
-
-        self.convert_float_if_needed(src_ty, ty, r);
+        let v = self.vstack.pop();
+        let r = self.coerce_to_xmm(v, ty)?;
 
         match ty {
             CType::Float => self.buf.movss_store(base, off, r),
