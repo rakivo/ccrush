@@ -2773,11 +2773,15 @@ impl Compiler {
                 let base = lhs.reg.as_gp();
                 self.compile_store_keep(base, lhs.offset, lhs.ty)?;
             } else if op == TK::And || op == TK::Or {
+                //
                 // xor result, result  (result = 0)
+                //
                 let result = self.regs.alloc(span)?;
-                self.buf.xor_rr(result, result);  // wrong place, result not alloc'd yet
+                self.buf.xor_rr(result, result);
 
-                // lhs
+                //
+                // Lhs
+                //
                 let (l, _) = self.pop_reg()?;
                 self.buf.test_rr(l);
                 self.regs.free(l);
@@ -2788,20 +2792,24 @@ impl Compiler {
                     self.buf.jne_rel32()  // ||: skip if lhs true
                 };
 
-                // rhs
+                //
+                // Rhs
+                //
                 self.compile_expr_impl(prec + 1)?;
                 let (r, _) = self.pop_reg()?;
                 self.buf.test_rr(r);
                 self.regs.free(r);
 
                 let result = self.regs.alloc(span)?;
-                self.buf.setcc(result, 0x95); // setne — result = (rhs != 0)
+                self.buf.setcc(result, 0x95); // setne - result = (rhs != 0)
                 self.buf.movzx_rr(result, result);
 
                 let done = self.buf.jmp_rel32();
                 self.buf.patch_rel32(short, self.buf.pos());
 
-                // short-circuit result
+                //
+                // Short-circuit result
+                //
                 if op == TK::And {
                     self.buf.xor_rr(result, result);  // false
                 } else {
