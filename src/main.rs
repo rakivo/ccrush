@@ -327,6 +327,7 @@ const HASH_IFNDEF:  u64 = fnv1a_str("ifndef");
 const HASH_IFDEF:   u64 = fnv1a_str("ifdef");
 const HASH_IF:      u64 = fnv1a_str("if");
 const HASH_FOR:     u64 = fnv1a_str("for");
+const HASH_WHILE:   u64 = fnv1a_str("while");
 const HASH_ELSE:    u64 = fnv1a_str("else");
 const HASH_ELIF:    u64 = fnv1a_str("elif");
 const HASH_ENDIF:   u64 = fnv1a_str("endif");
@@ -2215,9 +2216,10 @@ impl Compiler {
         match self.current_token.kind {
             TK::Ident => {
                 let h = self.current_token.hash;
-                if h == HASH_RETURN             { self.compile_return()     }
+                     if h == HASH_RETURN        { self.compile_return()     }
                 else if h == HASH_IF            { self.compile_if()         }
-                else if h == HASH_FOR           { self.compile_for()         }
+                else if h == HASH_FOR           { self.compile_for()        }
+                else if h == HASH_WHILE         { self.compile_while()      }
                 else if HASH_TYPES.contains(&h) { self.compile_local_decl() }
                 else                            { self.compile_expr_stmt()  }
             }
@@ -2295,6 +2297,58 @@ impl Compiler {
         } else {
             self.buf.patch_rel32(je_patch, self.buf.pos());
         }
+
+        Ok(())
+    }
+
+    fn compile_while(&mut self) -> CResult<()> {
+        self.next(); // while
+        self.expect(TK::LParen, "'('")?;
+
+        //
+        // Collect cond tokens
+        //
+        let mut cond_toks = Vec::new();
+        while self.current_token.kind != TK::RParen && !self.at_eof() {
+            cond_toks.push(self.next());
+        }
+        self.expect(TK::RParen, "')'")?;
+
+        //
+        // Jmp to cond
+        //
+        let jmp_cond = self.buf.jmp_rel32();
+        let loop_top = self.buf.pos();
+
+        //
+        // Body
+        //
+        self.compile_stmt()?;
+
+        //
+        // Cond
+        //
+        self.buf.patch_rel32(jmp_cond, self.buf.pos());
+        if !cond_toks.is_empty() {
+            let saved_cur  = self.pp.current_token;
+            let saved_peek = self.pp.next_token;
+
+            let mut replay = cond_toks;
+            replay.push(saved_cur);
+            replay.push(saved_peek);
+
+            self.pp.exp.push(replay.as_slice());
+            self.pp.current_token = self.pp.cook();
+            self.pp.next_token    = self.pp.cook();
+
+            self.compile_expr()?;
+            let (r, _) = self.pop_reg()?;
+            self.buf.test_rr(r);
+            self.regs.free(r);
+        }
+
+        let jne_patch = self.buf.jne_rel32();
+        self.buf.patch_rel32(jne_patch, loop_top);
 
         Ok(())
     }
