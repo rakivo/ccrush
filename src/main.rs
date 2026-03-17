@@ -286,10 +286,15 @@ pub type CResult<T> = Result<T, CError>;
 pub enum TK {
     Eof, Ident, Number, StrLit,
     LParen, RParen, LCurly, RCurly, Comma, SemiColon, TripleDot,
-    Plus, Minus, Star, Slash, Eq,
-    PlusEq, MinusEq, StarEq, SlashEq,
-    EqEq, NotEq,
-    Less, Greater, LessEq, GreaterEq, BinAnd, BinOr, Not,
+    Plus, PlusPlus, Minus, MinusMinus,
+    PlusEq,         MinusEq,
+    Star,   Slash,
+    StarEq, SlashEq,
+    Eq, EqEq, NotEq,
+    Xor, XorEq, Not, BitNot,
+    And, Or,
+    Less, Greater, LessEq, GreaterEq, BinAnd,   BinOr,
+                                      BinAndEq, BinOrEq,
 
     // PP-internal - never escapes cooked stream
     Hash, Newline,
@@ -357,29 +362,49 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileId) -> Token {
     let start = *pos;
     let ch = src[*pos]; *pos += 1;
 
-    macro_rules! tok  { ($k:expr) => {
-        Token { kind: $k, span: Span { file: fid, start: start as u32, len: (*pos-start) as u16 }, hash: 0 } }
-    }
-    macro_rules! tok2 {
-        ($c:expr,$y:expr,$n:expr) => {{
-            if *pos < src.len() && src[*pos]==$c { *pos+=1; tok!($y) } else { tok!($n) }
-        }}
-    }
+    macro_rules! tok  { ($k:expr) => { Token {
+        kind: $k, span: Span { file: fid, start: start as u32, len: (*pos-start) as u16 }, hash: 0
+    }}}
+
+    macro_rules! tok2 { ($c:expr, $y:expr, $n:expr) => {{
+        if *pos < src.len() && src[*pos]==$c { *pos+=1; tok!($y) } else { tok!($n) }
+    }}}
 
     match ch {
         b'\n' => tok!(TK::Newline),
+        b'#'  => tok!(TK::Hash),
         b'('  => tok!(TK::LParen),  b')' => tok!(TK::RParen),
         b'{'  => tok!(TK::LCurly),  b'}' => tok!(TK::RCurly),
         b','  => tok!(TK::Comma),   b';' => tok!(TK::SemiColon),
-        b'+' => tok2!(b'=', TK::PlusEq,  TK::Plus),
-        b'-' => tok2!(b'=', TK::MinusEq, TK::Minus),
-        b'*' => tok2!(b'=', TK::StarEq,  TK::Star),
-        b'#'  => tok!(TK::Hash),
-        b'&'  => tok!(TK::BinAnd),  b'|' => tok!(TK::BinOr),
+        b'~'  => tok!(TK::BitNot),
+        b'*'  => tok2!(b'=', TK::StarEq,    TK::Star),
+        b'^'  => tok2!(b'=', TK::XorEq,     TK::Xor),
         b'!'  => tok2!(b'=', TK::NotEq,     TK::Not),
         b'<'  => tok2!(b'=', TK::LessEq,    TK::Less),
         b'>'  => tok2!(b'=', TK::GreaterEq, TK::Greater),
         b'='  => tok2!(b'=', TK::EqEq,      TK::Eq),
+
+        b'&' => {
+            if *pos < src.len() && src[*pos] == b'&' { *pos += 1; tok!(TK::And) }
+            else if *pos < src.len() && src[*pos] == b'=' { *pos += 1; tok!(TK::BinAndEq) }
+            else { tok!(TK::BinAnd) }
+        }
+        b'|' => {
+            if *pos < src.len() && src[*pos] == b'|' { *pos += 1; tok!(TK::Or) }
+            else if *pos < src.len() && src[*pos] == b'=' { *pos += 1; tok!(TK::BinOrEq) }
+            else { tok!(TK::BinOr) }
+        }
+
+        b'+' => {
+            if *pos < src.len() && src[*pos] == b'+' { *pos += 1; tok!(TK::PlusPlus) }
+            else if *pos < src.len() && src[*pos] == b'=' { *pos += 1; tok!(TK::PlusEq) }
+            else { tok!(TK::Plus) }
+        }
+        b'-' => {
+            if *pos < src.len() && src[*pos] == b'-' { *pos += 1; tok!(TK::MinusMinus) }
+            else if *pos < src.len() && src[*pos] == b'=' { *pos += 1; tok!(TK::MinusEq) }
+            else { tok!(TK::Minus) }
+        }
 
         b'.'  => {
             if *pos+1 < src.len() && src[*pos]==b'.' && src[*pos+1]==b'.' {
@@ -1393,8 +1418,24 @@ impl CodeBuf {
     }
 
     #[inline]
+    pub fn add_ri8(&mut self, dst: Reg, imm: i8) {
+        self.rex_w(Reg::Rax, dst);
+        self.emit_byte(0x83);
+        self.emit_byte(0xC0 | dst.enc());
+        self.emit_byte(imm as u8);
+    }
+
+    #[inline]
     pub fn xor_rr   (&mut self, dst: Reg, src: Reg) {
-        self.rex_w(src, dst); self.emit_byte(0x33); self.modrm_rr(src, dst);
+        self.rex_w(src, dst); self.emit_byte(0x31); self.modrm_rr(src, dst);
+    }
+    #[inline]
+    pub fn and_rr   (&mut self, dst: Reg, src: Reg) {
+        self.rex_w(src, dst); self.emit_byte(0x21); self.modrm_rr(src, dst);
+    }
+    #[inline]
+    pub fn or_rr    (&mut self, dst: Reg, src: Reg) {
+        self.rex_w(src, dst); self.emit_byte(0x09); self.modrm_rr(src, dst);
     }
     #[inline]
     pub fn add_rr   (&mut self, dst: Reg, src: Reg) {
@@ -1411,6 +1452,12 @@ impl CodeBuf {
     #[inline]
     pub fn cqo      (&mut self) { self.bytes.extend_from_slice(&[0x48, 0x99]); }
 
+    #[inline]
+    pub fn not_r(&mut self, r: Reg) {
+        self.rex_w(Reg::Rax, r);
+        self.emit_byte(0xF7);
+        self.emit_byte(0xD0 | r.enc());
+    }
     #[inline]
     pub fn idiv_r(&mut self, src: Reg) {
         self.rex_w(Reg::Rax, src); self.emit_byte(0xF7); self.emit_byte(0xF8 | src.enc());
@@ -2037,7 +2084,6 @@ impl Compiler {
         }
     }
 
-    // in compile_binop float path, after force_xmm calls:
     #[inline]
     fn coerce_to_xmm(&mut self, v: CValue, target_ty: CType) -> CResult<XmmReg> {
         if v.ty.is_float() {
@@ -2646,12 +2692,20 @@ impl Compiler {
     #[inline]
     const fn op_prec(k: TK) -> Option<(u8, bool)> {
         match k {
-            TK::Eq   | TK::PlusEq | TK::MinusEq | TK::StarEq | TK::SlashEq => Some((1, true)),
-            TK::EqEq | TK::NotEq                           => Some((2, false)),
-            TK::Less | TK::Greater | TK::LessEq | TK::GreaterEq => Some((3, false)),
-            TK::Plus | TK::Minus                           => Some((4, false)),
-            TK::Star | TK::Slash                           => Some((5, false)),
-            _                                              => None,
+            TK::Eq     | TK::PlusEq  | TK::MinusEq  |
+            TK::StarEq | TK::SlashEq | TK::BinAndEq |
+            TK::XorEq  | TK::BinOrEq => Some((1, true)),
+            TK::Or                   => Some((2, false)),
+            TK::And                  => Some((3, false)),
+            TK::BinOr                => Some((4, false)),
+            TK::Xor                  => Some((5, false)),
+            TK::BinAnd               => Some((6, false)),
+            TK::EqEq | TK::NotEq     => Some((7, false)),
+            TK::Less | TK::Greater | TK::LessEq | TK::GreaterEq => Some((8, false)),
+            TK::Plus | TK::Minus     => Some((9, false)),
+            TK::Star | TK::Slash     => Some((10, false)),
+
+            _ => None
         }
     }
 
@@ -2659,7 +2713,7 @@ impl Compiler {
     fn compile_expr_impl(&mut self, min_prec: u8) -> CResult<()> {
         // Fast path: no prefix operator - go straight to primary
         match self.current_token.kind {
-            TK::Minus | TK::BinAnd | TK::Star => self.compile_unary()?,
+            TK::Minus | TK::BinAnd | TK::Star | TK::BitNot | TK::PlusPlus | TK::MinusMinus => self.compile_unary()?,
             _ => self.compile_primary()?,
         }
 
@@ -2673,7 +2727,12 @@ impl Compiler {
             let span = self.current_token.span;
             self.next();
 
-            if matches!(op, TK::Eq | TK::PlusEq | TK::MinusEq | TK::StarEq | TK::SlashEq) {
+            if matches!(
+                op,
+                TK::Eq     | TK::PlusEq  | TK::MinusEq  |
+                TK::StarEq | TK::SlashEq | TK::BinAndEq |
+                TK::XorEq  | TK::BinOrEq
+            ) {
                 let lhs = self.vstack.pop();
                 if !lhs.is_lvalue() { return Err(CError::NotLvalue { span }); }
 
@@ -2699,10 +2758,13 @@ impl Compiler {
 
                     self.vstack.push(rhs);
                     let arith_op = match op {
-                        TK::PlusEq  => TK::Plus,
-                        TK::MinusEq => TK::Minus,
-                        TK::StarEq  => TK::Star,
-                        TK::SlashEq => TK::Slash,
+                        TK::PlusEq   => TK::Plus,
+                        TK::MinusEq  => TK::Minus,
+                        TK::StarEq   => TK::Star,
+                        TK::SlashEq  => TK::Slash,
+                        TK::BinAndEq => TK::BinAnd,
+                        TK::XorEq    => TK::Xor,
+                        TK::BinOrEq  => TK::BinOr,
                         _ => unreachable!(),
                     };
                     self.compile_binop(arith_op, span)?;
@@ -2710,6 +2772,44 @@ impl Compiler {
 
                 let base = lhs.reg.as_gp();
                 self.compile_store_keep(base, lhs.offset, lhs.ty)?;
+            } else if op == TK::And || op == TK::Or {
+                // xor result, result  (result = 0)
+                let result = self.regs.alloc(span)?;
+                self.buf.xor_rr(result, result);  // wrong place, result not alloc'd yet
+
+                // lhs
+                let (l, _) = self.pop_reg()?;
+                self.buf.test_rr(l);
+                self.regs.free(l);
+
+                let short = if op == TK::And {
+                    self.buf.je_rel32()   // &&: skip if lhs false
+                } else {
+                    self.buf.jne_rel32()  // ||: skip if lhs true
+                };
+
+                // rhs
+                self.compile_expr_impl(prec + 1)?;
+                let (r, _) = self.pop_reg()?;
+                self.buf.test_rr(r);
+                self.regs.free(r);
+
+                let result = self.regs.alloc(span)?;
+                self.buf.setcc(result, 0x95); // setne — result = (rhs != 0)
+                self.buf.movzx_rr(result, result);
+
+                let done = self.buf.jmp_rel32();
+                self.buf.patch_rel32(short, self.buf.pos());
+
+                // short-circuit result
+                if op == TK::And {
+                    self.buf.xor_rr(result, result);  // false
+                } else {
+                    self.buf.mov_ri64(result, 1);     // true
+                }
+
+                self.buf.patch_rel32(done, self.buf.pos());
+                self.vstack.push(CValue::gp(CType::Int, result));
             } else {
                 self.compile_expr_impl(if right { prec } else { prec + 1 })?;
                 self.compile_binop(op, span)?;
@@ -2785,10 +2885,23 @@ impl Compiler {
                 }
             }
 
+            TK::BinAnd | TK::BinOr | TK::Xor => {
+                let (rhs, _)  = self.pop_reg()?;
+                let (lhs, ty) = self.pop_reg()?;
+                match op {
+                    TK::BinAnd => self.buf.and_rr(lhs, rhs),
+                    TK::BinOr  => self.buf.or_rr(lhs, rhs),
+                    TK::Xor    => self.buf.xor_rr(lhs, rhs),
+                    _ => unreachable!(),
+                }
+                self.regs.free(rhs);
+                self.vstack.push(CValue::gp(ty, lhs));
+            }
+
             TK::EqEq | TK::NotEq | TK::Less | TK::Greater | TK::LessEq | TK::GreaterEq =>
                 self.compile_cmp(op)?,
 
-            _ => unreachable!(),
+            other => unreachable!("{other:?}"),
         }
 
         Ok(())
@@ -2910,6 +3023,36 @@ impl Compiler {
                 self.vstack.push(CValue::gp(CType::Ptr(1), dst));
             }
 
+            TK::BitNot => {
+                self.next();
+                self.compile_unary()?;
+
+                let (r, ty) = self.pop_reg()?;
+                self.buf.not_r(r);
+                self.vstack.push(CValue::gp(ty, r));
+            }
+
+            TK::PlusPlus | TK::MinusMinus => {
+                let op = self.current_token.kind;
+                self.next();
+                self.compile_unary()?;
+
+                let v = self.vstack.pop();
+                if !v.is_lvalue() { return Err(CError::NotLvalue { span: Span::POISONED }); }
+
+                let base = v.reg.as_gp();
+                let (r, ty) = (self.regs.alloc(Span::POISONED)?, v.ty);
+
+                self.buf.mov_load(r, base, v.offset, ty.is64());
+                match op {
+                    TK::PlusPlus  => self.buf.add_ri8(r, 1),
+                    _             => self.buf.add_ri8(r, -1),
+                }
+
+                self.buf.mov_store(base, v.offset, r, ty.is64());
+                self.vstack.push(CValue::gp(ty, r));
+            }
+
             TK::Star => {
                 self.next();
                 self.compile_unary()?;
@@ -2942,7 +3085,11 @@ impl Compiler {
                 let is_float_literal = s.contains('.');
 
                 if !is_float_literal {
-                    let v: i64 = s.parse().unwrap_or(0);
+                    let v: i64 = if s.starts_with("0x") || s.starts_with("0X") {
+                        i64::from_str_radix(&s[2..], 16).unwrap_or(0)
+                    } else {
+                        s.parse().unwrap_or(0)
+                    };
                     self.vstack.push(CValue::imm(CType::Int, v));
                     return Ok(())
                 }
@@ -3016,6 +3163,32 @@ impl Compiler {
                     self.compile_call(hash, name_tok)?;
                 } else if let Some(lv) = self.locals.find(hash) {
                     self.vstack.push(CValue::local(lv.ty, lv.rbp_off));
+
+                    // postfix ++ / --
+                    if matches!(self.current_token.kind, TK::PlusPlus | TK::MinusMinus) {
+                        let op = self.current_token.kind;
+                        self.next();
+
+                        // @Cutnpaste from compile_unary
+
+                        let v = self.vstack.pop();
+                        let base = v.reg.as_gp();
+
+                        // return OLD value, but store incremented
+                        let old = self.regs.alloc(Span::POISONED)?;
+                        self.buf.mov_load(old, base, v.offset, v.ty.is64());
+                        let tmp = self.regs.alloc(Span::POISONED)?;
+
+                        self.buf.mov_rr(tmp, old);
+                        match op {
+                            TK::PlusPlus  => self.buf.add_ri8(tmp, 1),
+                            _             => self.buf.add_ri8(tmp, -1),
+                        }
+
+                        self.buf.mov_store(base, v.offset, tmp, v.ty.is64());
+                        self.regs.free(tmp);
+                        self.vstack.push(CValue::gp(v.ty, old));
+                    }
                 } else {
                     return Err(CError::Undefined {
                         span: name_tok.span,
