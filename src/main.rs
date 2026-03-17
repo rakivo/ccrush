@@ -249,6 +249,12 @@ pub enum CError {
     #[error("argument count mismatch for '{name}' (expected {expected})")]
     ArgumentCountMismatch { span: Span, name: String, expected: usize },
 
+    #[error("break outside loop")]
+    BreakOutsideLoop { span: Span },
+
+    #[error("continue outside loop")]
+    ContinueOutsideLoop { span: Span },
+
     #[error("register spill - not yet implemented")]
     RegSpill    { span: Span },
 }
@@ -262,6 +268,8 @@ impl CError {
             CError::Undefined   { span, .. } => *span,
             CError::NotLvalue   { span, .. } => *span,
             CError::ArgumentCountMismatch { span, .. } => *span,
+            CError::BreakOutsideLoop { span, .. } => *span,
+            CError::ContinueOutsideLoop { span, .. } => *span,
             CError::RegSpill    { span, .. } => *span,
         }
     }
@@ -310,27 +318,29 @@ impl Token {
 
 // Pre-computed fnv1a hashes of every keyword.  Used in place of string
 // comparisons throughout the compiler hot path - integer equality only.
-const HASH_RETURN:  u64 = fnv1a_str("return");
-const HASH_INT:     u64 = fnv1a_str("int");
-const HASH_LONG:    u64 = fnv1a_str("long");
-const HASH_CHAR:    u64 = fnv1a_str("char");
-const HASH_VOID:    u64 = fnv1a_str("void");
-const HASH_FLOAT:   u64 = fnv1a_str("float");
-const HASH_DOUBLE:  u64 = fnv1a_str("double");
-const HASH_ONCE:    u64 = fnv1a_str("once");
-const HASH_EXTERN:  u64 = fnv1a_str("extern");
-const HASH_DEFINE:  u64 = fnv1a_str("define");
-const HASH_INCLUDE: u64 = fnv1a_str("include");
-const HASH_PRAGMA:  u64 = fnv1a_str("pragma");
-const HASH_UNDEF:   u64 = fnv1a_str("undef");
-const HASH_IFNDEF:  u64 = fnv1a_str("ifndef");
-const HASH_IFDEF:   u64 = fnv1a_str("ifdef");
-const HASH_IF:      u64 = fnv1a_str("if");
-const HASH_FOR:     u64 = fnv1a_str("for");
-const HASH_WHILE:   u64 = fnv1a_str("while");
-const HASH_ELSE:    u64 = fnv1a_str("else");
-const HASH_ELIF:    u64 = fnv1a_str("elif");
-const HASH_ENDIF:   u64 = fnv1a_str("endif");
+const HASH_RETURN:   u64 = fnv1a_str("return");
+const HASH_INT:      u64 = fnv1a_str("int");
+const HASH_LONG:     u64 = fnv1a_str("long");
+const HASH_CHAR:     u64 = fnv1a_str("char");
+const HASH_VOID:     u64 = fnv1a_str("void");
+const HASH_FLOAT:    u64 = fnv1a_str("float");
+const HASH_DOUBLE:   u64 = fnv1a_str("double");
+const HASH_ONCE:     u64 = fnv1a_str("once");
+const HASH_EXTERN:   u64 = fnv1a_str("extern");
+const HASH_DEFINE:   u64 = fnv1a_str("define");
+const HASH_INCLUDE:  u64 = fnv1a_str("include");
+const HASH_PRAGMA:   u64 = fnv1a_str("pragma");
+const HASH_UNDEF:    u64 = fnv1a_str("undef");
+const HASH_IFNDEF:   u64 = fnv1a_str("ifndef");
+const HASH_IFDEF:    u64 = fnv1a_str("ifdef");
+const HASH_IF:       u64 = fnv1a_str("if");
+const HASH_FOR:      u64 = fnv1a_str("for");
+const HASH_WHILE:    u64 = fnv1a_str("while");
+const HASH_ELSE:     u64 = fnv1a_str("else");
+const HASH_ELIF:     u64 = fnv1a_str("elif");
+const HASH_ENDIF:    u64 = fnv1a_str("endif");
+const HASH_BREAK:    u64 = fnv1a_str("break");
+const HASH_CONTINUE: u64 = fnv1a_str("continue");
 
 const HASH_TYPES: &[u64] = &[
     HASH_INT, HASH_LONG, HASH_CHAR, HASH_VOID, HASH_FLOAT, HASH_DOUBLE
@@ -1874,20 +1884,28 @@ pub struct RodataReloc {
     pub rodata_off: u32
 }
 
+pub struct LoopContext {
+    break_patches:    Vec<usize>,    // list of jmp sites to patch for break
+    continue_patches: Vec<usize>,    // list of jmp sites to patch for continue (for loops)
+}
+
 pub struct Compiler {
-    pub pp:            PP,
     pub buf:           CodeBuf,
     pub vstack:        ValueStack,
     pub xmms:          XmmAlloc,
     pub regs:          RegAlloc,
-    pub syms:          SymTable,
-    pub relocs:        Vec<Reloc>,
-    pub rodata:        Vec<u8>,
-    pub rodata_relocs: Vec<RodataReloc>,
 
     // Reset per function
     locals:  LocalTable,
     ret_ty:  CType,
+
+    pub syms:          SymTable,
+    pub relocs:        Vec<Reloc>,
+    pub rodata:        Vec<u8>,
+    pub rodata_relocs: Vec<RodataReloc>,
+    pub loop_stack:    Vec<LoopContext>,
+
+    pub pp:            PP,
 }
 
 impl Deref for Compiler {
@@ -1907,6 +1925,7 @@ impl Compiler {
     pub fn new(pp: PP) -> Self {
         Self {
             pp,
+            loop_stack: Vec::new(),
             buf: CodeBuf::new(), vstack: ValueStack::new(),
             regs: RegAlloc::new(), xmms: XmmAlloc::new(),
             syms: SymTable::new(), relocs: Vec::new(),
@@ -2072,7 +2091,8 @@ impl Compiler {
     pub fn compile(&mut self) {
         while !self.at_eof() {
             if let Err(e) = self.compile_top_level() {
-                e.emit(&self.pp.src_arena); std::process::exit(1);
+                e.emit(&self.pp.src_arena);
+                std::process::exit(1);
             }
         }
     }
@@ -2231,6 +2251,8 @@ impl Compiler {
                 else if h == HASH_IF            { self.compile_if()         }
                 else if h == HASH_FOR           { self.compile_for()        }
                 else if h == HASH_WHILE         { self.compile_while()      }
+                else if h == HASH_BREAK         { self.compile_break(self.current_token.span)    }
+                else if h == HASH_CONTINUE      { self.compile_continue(self.current_token.span) }
                 else if HASH_TYPES.contains(&h) { self.compile_local_decl() }
                 else                            { self.compile_expr_stmt()  }
             }
@@ -2313,6 +2335,30 @@ impl Compiler {
         Ok(())
     }
 
+    #[inline]
+    fn compile_break(&mut self, span: Span) -> CResult<()> {
+        self.next(); // break
+        self.expect(TK::SemiColon, "';'")?;
+
+        let ctx = self.loop_stack.last_mut().ok_or(CError::BreakOutsideLoop { span })?;
+        let patch = self.buf.jmp_rel32();
+        ctx.break_patches.push(patch);
+
+        Ok(())
+    }
+
+    #[inline]
+    fn compile_continue(&mut self, span: Span) -> CResult<()> {
+        self.next(); // continue
+        self.expect(TK::SemiColon, "';'")?;
+
+        let ctx = self.loop_stack.last_mut().ok_or(CError::ContinueOutsideLoop { span })?;
+        let patch = self.buf.jmp_rel32();
+        ctx.continue_patches.push(patch);
+
+        Ok(())
+    }
+
     fn compile_while(&mut self) -> CResult<()> {
         self.next(); // while
         self.expect(TK::LParen, "'('")?;
@@ -2335,7 +2381,20 @@ impl Compiler {
         //
         // Body
         //
+
+        self.loop_stack.push(LoopContext {
+            break_patches: Vec::new(),
+            continue_patches: Vec::new(),
+        });
+
         self.compile_stmt()?;
+
+        let ctx = self.loop_stack.pop().unwrap();
+
+        let cond_top = self.buf.pos();
+        for patch in ctx.continue_patches {
+            self.buf.patch_rel32(patch, cond_top);
+        }
 
         //
         // Cond
@@ -2361,6 +2420,11 @@ impl Compiler {
 
         let jne_patch = self.buf.jne_rel32();
         self.buf.patch_rel32(jne_patch, loop_top);
+
+        // Patch all break jumps to here
+        for patch in ctx.break_patches {
+            self.buf.patch_rel32(patch, self.buf.pos());
+        }
 
         Ok(())
     }
@@ -2419,11 +2483,26 @@ impl Compiler {
         //
         // Body
         //
+
+        self.loop_stack.push(LoopContext {
+            break_patches: Vec::new(),
+            continue_patches: Vec::new(),
+        });
+
         self.compile_stmt()?;
 
         //
         // Post
         //
+
+        let post_top = self.buf.pos();
+
+        let ctx = self.loop_stack.pop().unwrap();
+        // Patch continue jumps to post
+        for patch in ctx.continue_patches {
+            self.buf.patch_rel32(patch, post_top);
+        }
+
         if !post_toks.is_empty() {
             let saved_cur  = self.pp.current_token;
             let saved_peek = self.pp.next_token;
@@ -2465,6 +2544,10 @@ impl Compiler {
 
         let jne_patch = self.buf.jne_rel32();
         self.buf.patch_rel32(jne_patch, loop_top);
+
+        for patch in ctx.break_patches {
+            self.buf.patch_rel32(patch, self.buf.pos());
+        }
 
         Ok(())
     }
