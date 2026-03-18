@@ -3,7 +3,7 @@
 // TODO(#1): sizeof
 // TODO(#6): typedef
 // TODO(#3): Function pointers
-// TODO: __attribute__
+// TODO(#7): __attribute__
 // TODO: __restrict, __THROW, __wur, __attribute_malloc__ __attr_dealloc_fclose
 
 use std::fs::File;
@@ -5681,4 +5681,4 @@ fn run_main(mut c: Compiler) {
     let result = f(argc, argv.as_ptr(), envp.as_ptr());
     std::process::exit(result);
 }
-        
+    
