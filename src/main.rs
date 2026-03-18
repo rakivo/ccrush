@@ -1,7 +1,11 @@
 // TODO(#2): Structs
 // TODO(#4): Enums
 // TODO(#1): sizeof
+// TODO(#7): typedef
 // TODO(#3): Function pointers
+// TODO(#8): ifdef, ifndef, if defined, etc
+// TODO(#5): __attribute__
+// TODO: Global extern symbols
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -5678,3 +5682,4 @@ fn run_main(mut c: Compiler) {
     let result = f(argc, argv.as_ptr(), envp.as_ptr());
     std::process::exit(result);
 }
+    
