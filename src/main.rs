@@ -1409,7 +1409,7 @@ impl CodeBuf {
 
     #[inline]
     pub fn lea_rip(&mut self, dst: Reg) -> usize {
-        self.rex_w(dst, Reg::Rax);
+        self.rex_w(dst, Reg::Rax);  // REX.R set if dst >= R8
         self.emit_byte(0x8D);
         self.emit_byte(0x05 | (dst.enc() << 3));
         let patch = self.pos();
@@ -1614,145 +1614,173 @@ impl CodeBuf {
     #[inline]
     pub fn ret(&mut self) { self.emit_byte(0xC3); }
 
+    #[inline]
+    fn xmm_rex(&mut self, dst: XmmReg, src: XmmReg) {
+        let byte = 0x40 | ((dst as u8 >= 8) as u8) << 2 | ((src as u8 >= 8) as u8);
+        if byte != 0x40 { self.emit_byte(byte); }
+    }
+
+    #[inline]
+    fn xmm_modrm(&self, dst: XmmReg, src: XmmReg) -> u8 {
+        0xC0 | (dst as u8 & 7) << 3 | (src as u8 & 7)
+    }
+
     // Scalar double arithmetic
     #[inline]
     pub fn addsd(&mut self, dst: XmmReg, src: XmmReg) {
-        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x58, 0xC0 | (dst as u8) << 3 | src as u8]);
+        self.xmm_rex(dst, src);
+        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x58, self.xmm_modrm(dst, src)]);
     }
     #[inline]
     pub fn subsd(&mut self, dst: XmmReg, src: XmmReg) {
-        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x5C, 0xC0 | (dst as u8) << 3 | src as u8]);
+        self.xmm_rex(dst, src);
+        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x5C, self.xmm_modrm(dst, src)]);
     }
     #[inline]
     pub fn mulsd(&mut self, dst: XmmReg, src: XmmReg) {
-        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x59, 0xC0 | (dst as u8) << 3 | src as u8]);
+        self.xmm_rex(dst, src);
+        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x59, self.xmm_modrm(dst, src)]);
     }
     #[inline]
     pub fn divsd(&mut self, dst: XmmReg, src: XmmReg) {
-        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x5E, 0xC0 | (dst as u8) << 3 | src as u8]);
+        self.xmm_rex(dst, src);
+        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x5E, self.xmm_modrm(dst, src)]);
     }
 
     // Scalar float arithmetic
     #[inline]
     pub fn addss(&mut self, dst: XmmReg, src: XmmReg) {
-        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x58, 0xC0 | (dst as u8) << 3 | src as u8]);
+        self.xmm_rex(dst, src);
+        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x58, self.xmm_modrm(dst, src)]);
     }
     #[inline]
     pub fn subss(&mut self, dst: XmmReg, src: XmmReg) {
-        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x5C, 0xC0 | (dst as u8) << 3 | src as u8]);
+        self.xmm_rex(dst, src);
+        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x5C, self.xmm_modrm(dst, src)]);
     }
     #[inline]
     pub fn mulss(&mut self, dst: XmmReg, src: XmmReg) {
-        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x59, 0xC0 | (dst as u8) << 3 | src as u8]);
+        self.xmm_rex(dst, src);
+        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x59, self.xmm_modrm(dst, src)]);
     }
     #[inline]
     pub fn divss(&mut self, dst: XmmReg, src: XmmReg) {
-        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x5E, 0xC0 | (dst as u8) << 3 | src as u8]);
+        self.xmm_rex(dst, src);
+        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x5E, self.xmm_modrm(dst, src)]);
     }
 
     #[inline]
     pub fn ucomiss(&mut self, lhs: XmmReg, rhs: XmmReg) {
-        self.bytes.extend_from_slice(&[0x0F, 0x2E, 0xC0 | (lhs as u8) << 3 | rhs as u8]);
+        self.xmm_rex(lhs, rhs);
+        self.bytes.extend_from_slice(&[0x0F, 0x2E, self.xmm_modrm(lhs, rhs)]);
     }
 
     #[inline]
     pub fn ucomisd(&mut self, lhs: XmmReg, rhs: XmmReg) {
-        self.bytes.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xC0 | (lhs as u8) << 3 | rhs as u8]);
-    }
-
-    #[inline]
-    pub fn movss_load(&mut self, dst: XmmReg, base: Reg, off: i32) {
-        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x10]);
-        self.modrm_mem_impl(dst as u8, base, off);
-    }
-
-    #[inline]
-    pub fn movss_store(&mut self, base: Reg, off: i32, src: XmmReg) {
-        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x11]);
-        self.modrm_mem_impl(src as u8, base, off);
-    }
-
-    #[inline]
-    pub fn movsd_load(&mut self, dst: XmmReg, base: Reg, off: i32) {
-        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x10]);
-        self.modrm_mem_impl(dst as u8, base, off);
-    }
-
-    #[inline]
-    pub fn movsd_store(&mut self, base: Reg, off: i32, src: XmmReg) {
-        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x11]);
-        self.modrm_mem_impl(src as u8, base, off);
-    }
-
-    // movsd [rip+disp32], xmm  - store double
-    #[inline]
-    pub fn movsd_store_rip(&mut self, src: XmmReg) -> usize {
-        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x11]);
-        self.bytes.push(0x05 | (src as u8) << 3);
-        let patch = self.pos();
-        self.emit_i32(0);
-        patch
-    }
-
-    // movss xmm, [rip+disp32]  - load float from memory
-    #[inline]
-    pub fn movss_load_rip(&mut self, dst: XmmReg) -> usize {
-        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x10]);
-        self.bytes.push(0x05 | (dst as u8) << 3);
-        let patch = self.pos(); self.emit_i32(0); patch
-    }
-
-    // movsd xmm, [rip+disp32]  - load double from memory
-    #[inline]
-    pub fn movsd_load_rip(&mut self, dst: XmmReg) -> usize {
-        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x10]);
-        self.bytes.push(0x05 | (dst as u8) << 3);
-        let patch = self.pos(); self.emit_i32(0); patch
-    }
-
-    #[inline]
-    pub fn xorpd_rip(&mut self, dst: XmmReg) -> usize {
-        self.bytes.extend_from_slice(&[0x66, 0x0F, 0x57]);
-        self.bytes.push(0x05 | (dst as u8) << 3);
-        let patch = self.pos(); self.emit_i32(0); patch
-    }
-
-    #[inline]
-    pub fn xorps_rip(&mut self, dst: XmmReg) -> usize {
-        self.bytes.extend_from_slice(&[0x0F, 0x57]);
-        self.bytes.push(0x05 | (dst as u8) << 3);
-        let patch = self.pos(); self.emit_i32(0); patch
+        self.xmm_rex(lhs, rhs);
+        self.bytes.extend_from_slice(&[0x66, 0x0F, 0x2E, self.xmm_modrm(lhs, rhs)]);
     }
 
     #[inline]
     pub fn movss_rr(&mut self, dst: XmmReg, src: XmmReg) {
         if dst == src { return; }
-        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x10, 0xC0 | (dst as u8) << 3 | src as u8]);
+        self.xmm_rex(dst, src);
+        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x10, self.xmm_modrm(dst, src)]);
     }
 
-    // movsd xmm, xmm  - reg to reg move
     #[inline]
     pub fn movsd_rr(&mut self, dst: XmmReg, src: XmmReg) {
         if dst == src { return; }
-        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x10, 0xC0 | (dst as u8) << 3 | src as u8]);
+        self.xmm_rex(dst, src);
+        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x10, self.xmm_modrm(dst, src)]);
     }
 
-    #[inline]
-    pub fn cvtsi2sd(&mut self, dst: XmmReg, src: Reg) {
-        let rex = 0x48 | (src.ext() as u8);
-        self.bytes.extend_from_slice(&[0xF2, rex, 0x0F, 0x2A]);
-        self.bytes.push(0xC0 | (dst as u8) << 3 | src.enc());
-    }
-
-    // cvtss2sd xmm_dst, xmm_src  - float -> double promotion
     #[inline]
     pub fn cvtss2sd(&mut self, dst: XmmReg, src: XmmReg) {
-        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x5A, 0xC0 | (dst as u8) << 3 | src as u8]);
+        self.xmm_rex(dst, src);
+        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x5A, self.xmm_modrm(dst, src)]);
     }
 
     #[inline]
     pub fn cvtsd2ss(&mut self, dst: XmmReg, src: XmmReg) {
-        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x5A, 0xC0 | (dst as u8) << 3 | src as u8]);
+        self.xmm_rex(dst, src);
+        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x5A, self.xmm_modrm(dst, src)]);
+    }
+
+    #[inline]
+    pub fn cvtsi2sd(&mut self, dst: XmmReg, src: Reg) {
+        // REX.W=1 for 64-bit int src, REX.R if dst>=8, REX.B if src>=8
+        let rex = 0x48 | ((dst as u8 >= 8) as u8) << 2 | (src.ext() as u8);
+        self.bytes.extend_from_slice(&[0xF2, rex, 0x0F, 0x2A]);
+        self.bytes.push(0xC0 | (dst as u8 & 7) << 3 | src.enc());
+    }
+
+    #[inline]
+    pub fn movss_load_rip(&mut self, dst: XmmReg) -> usize {
+        if dst as u8 >= 8 { self.emit_byte(0x44); }
+        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x10]);
+        self.bytes.push(0x05 | (dst as u8 & 7) << 3);
+        let patch = self.pos(); self.emit_i32(0); patch
+    }
+
+    #[inline]
+    pub fn movsd_load_rip(&mut self, dst: XmmReg) -> usize {
+        if dst as u8 >= 8 { self.emit_byte(0x44); }
+        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x10]);
+        self.bytes.push(0x05 | (dst as u8 & 7) << 3);
+        let patch = self.pos(); self.emit_i32(0); patch
+    }
+
+    #[inline]
+    pub fn movsd_store_rip(&mut self, src: XmmReg) -> usize {
+        if src as u8 >= 8 { self.emit_byte(0x44); }
+        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x11]);
+        self.bytes.push(0x05 | (src as u8 & 7) << 3);
+        let patch = self.pos(); self.emit_i32(0); patch
+    }
+
+    #[inline]
+    pub fn xorpd_rip(&mut self, dst: XmmReg) -> usize {
+        if dst as u8 >= 8 { self.emit_byte(0x44); }
+        self.bytes.extend_from_slice(&[0x66, 0x0F, 0x57]);
+        self.bytes.push(0x05 | (dst as u8 & 7) << 3);
+        let patch = self.pos(); self.emit_i32(0); patch
+    }
+
+    #[inline]
+    pub fn xorps_rip(&mut self, dst: XmmReg) -> usize {
+        if dst as u8 >= 8 { self.emit_byte(0x44); }
+        self.bytes.extend_from_slice(&[0x0F, 0x57]);
+        self.bytes.push(0x05 | (dst as u8 & 7) << 3);
+        let patch = self.pos(); self.emit_i32(0); patch
+    }
+
+    #[inline]
+    pub fn movss_load(&mut self, dst: XmmReg, base: Reg, off: i32) {
+        if dst as u8 >= 8 { self.emit_byte(0x44); }
+        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x10]);
+        self.modrm_mem_impl(dst as u8 & 7, base, off);
+    }
+
+    #[inline]
+    pub fn movss_store(&mut self, base: Reg, off: i32, src: XmmReg) {
+        if src as u8 >= 8 { self.emit_byte(0x44); }
+        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x11]);
+        self.modrm_mem_impl(src as u8 & 7, base, off);
+    }
+
+    #[inline]
+    pub fn movsd_load(&mut self, dst: XmmReg, base: Reg, off: i32) {
+        if dst as u8 >= 8 { self.emit_byte(0x44); }
+        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x10]);
+        self.modrm_mem_impl(dst as u8 & 7, base, off);
+    }
+
+    #[inline]
+    pub fn movsd_store(&mut self, base: Reg, off: i32, src: XmmReg) {
+        if src as u8 >= 8 { self.emit_byte(0x44); }
+        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x11]);
+        self.modrm_mem_impl(src as u8 & 7, base, off);
     }
 }
 
@@ -1931,9 +1959,73 @@ pub struct RodataReloc {
     pub rodata_off: u32
 }
 
+pub struct DataReloc {
+    pub text_off: u32,
+    pub data_off: u32,
+    pub is_bss:   bool,
+}
+
 pub struct LoopContext {
-    break_patches:    Vec<usize>,    // list of jmp sites to patch for break
-    continue_patches: Vec<usize>,    // list of jmp sites to patch for continue (for loops)
+    break_patches:    Vec<usize>,
+    continue_patches: Vec<usize>,
+}
+
+#[derive(Copy, Clone)]
+pub struct GlobalVar {
+    pub hash:     u64,
+
+    pub data_off: u32,  // Offset into .data OR .bss
+    pub name_off: u32,
+    pub name_len: u16,
+
+    pub ty:       CType,
+    pub is_bss:   bool,
+}
+
+impl GlobalVar {
+    #[inline]
+    pub fn s<'a>(&self, buf: &'a [u8]) -> &'a str {
+        unsafe {
+            std::str::from_utf8_unchecked(
+                &buf[
+                    self.name_off as usize
+                    ..
+                    self.name_off as usize + self.name_len as usize
+                ]
+            )
+        }
+    }
+}
+
+pub struct GlobalTable {
+    pub vars:     SmallVec<[GlobalVar; 64]>,
+    index:        IntMap<u64, u32>,
+    pub name_buf: Vec<u8>,
+}
+
+impl GlobalTable {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            vars: SmallVec::new(),
+            index: IntMap::default(),
+            name_buf: Vec::new()
+        }
+    }
+
+    #[inline]
+    pub fn find(&self, hash: u64) -> Option<GlobalVar> {
+        self.index.get(&hash).map(|&i| self.vars[i as usize])
+    }
+
+    #[inline]
+    pub fn insert(&mut self, name: &str, hash: u64, ty: CType, data_off: u32, is_bss: bool) {
+        let name_off = self.name_buf.len() as u32;
+        self.name_buf.extend_from_slice(name.as_bytes());
+        let i = self.vars.len() as u32;
+        self.vars.push(GlobalVar { hash, name_off, name_len: name.len() as u16, ty, data_off, is_bss });
+        self.index.insert(hash, i);
+    }
 }
 
 pub struct Compiler {
@@ -1946,11 +2038,19 @@ pub struct Compiler {
     locals:  LocalTable,
     ret_ty:  CType,
 
+    pub globals:       GlobalTable,
+
+    pub data:          Vec<u8>,
+    pub data_relocs:   Vec<DataReloc>,
+    pub bss_size:      usize,
+
     pub syms:          SymTable,
+
+    pub loop_stack:    Vec<LoopContext>,
+
     pub relocs:        Vec<Reloc>,
     pub rodata:        Vec<u8>,
     pub rodata_relocs: Vec<RodataReloc>,
-    pub loop_stack:    Vec<LoopContext>,
 
     pub pp:            PP,
 }
@@ -1973,6 +2073,8 @@ impl Compiler {
         Self {
             pp,
             loop_stack: Vec::new(),
+            data: Vec::new(), globals: GlobalTable::new(),
+            bss_size: 0, data_relocs: Vec::new(),
             buf: CodeBuf::new(), vstack: ValueStack::new(),
             regs: RegAlloc::new(), xmms: XmmAlloc::new(),
             syms: SymTable::new(), relocs: Vec::new(),
@@ -2038,8 +2140,10 @@ impl Compiler {
                 Ok(r)
             }
             VK::Local | VK::RegInd => {
+                let base = v.reg.as_gp();
                 let r = self.regs.alloc(Span::POISONED)?;
-                self.buf.mov_load(r, v.reg.as_gp(), v.offset, v.ty.is64());
+                self.buf.mov_load(r, base, v.offset, v.ty.is64());
+                if v.kind == VK::RegInd { self.regs.free(base); }
                 Ok(r)
             }
         }
@@ -2063,22 +2167,17 @@ impl Compiler {
                     CType::Float  => self.rodata.extend_from_slice(&(v.fimm as f32).to_bits().to_le_bytes()),
                     _             => self.rodata.extend_from_slice(&v.fimm.to_bits().to_le_bytes()),
                 }
-                let text_off = match v.ty {
-                    CType::Float => self.buf.movss_load_rip(xmm),
-                    _            => self.buf.movsd_load_rip(xmm),
-                } as _;
+                let text_off = self.emit_float_load_rip(xmm, v.ty) as _;
                 self.rodata_relocs.push(RodataReloc { text_off, rodata_off });
 
                 Ok(xmm)
             }
 
             VK::Local | VK::RegInd => {
-                let xmm = self.xmms.alloc(Span::POISONED)?;
                 let base = match v.reg { ValReg::Gp(r) => r, _ => unreachable!() };
-                match v.ty {
-                    CType::Float => self.buf.movss_load(xmm, base, v.offset),
-                    _            => self.buf.movsd_load(xmm, base, v.offset),
-                }
+                let xmm = self.xmms.alloc(Span::POISONED)?;
+                self.emit_float_load(xmm, base, v.offset, v.ty);
+                if v.kind == VK::RegInd { self.regs.free(base); }
                 Ok(xmm)
             }
         }
@@ -2154,12 +2253,7 @@ impl Compiler {
         let hash     = name_tok.hash;
 
         if self.current_token.kind != TK::LParen {
-            // Global variable - skip for now
-            while !matches!(self.current_token.kind, TK::SemiColon | TK::Eof) {
-                self.next();
-            }
-            self.expect(TK::SemiColon, "';'")?;
-
+            self.compile_global_decl(ret_ty, &name, hash, is_extern)?;
             return Ok(());
         }
 
@@ -2236,8 +2330,9 @@ impl Compiler {
         self.expect(TK::RCurly, "'}'")?;
 
         //
-        // Fall-through epilogue (handles void / implicit return)
+        // Fall-through epilogue
         //
+        self.buf.xor_rr(Reg::Rax, Reg::Rax);  // Implicit return 0
         self.buf.mov_rr(Reg::Rsp, Reg::Rbp);
         self.buf.pop_r(Reg::Rbp);
         self.buf.ret();
@@ -2330,10 +2425,7 @@ impl Compiler {
                 let v = self.vstack.pop();
                 let r = self.coerce_to_xmm(v, ret_ty)?;
 
-                match self.ret_ty {
-                    CType::Float => self.buf.movss_rr(XmmReg::Xmm0, r),
-                    _            => self.buf.movsd_rr(XmmReg::Xmm0, r),
-                }
+                self.emit_float_mov(XmmReg::Xmm0, r, self.ret_ty);
 
                 self.xmms.free(r);
             } else {
@@ -2563,7 +2655,9 @@ impl Compiler {
 
             self.compile_expr()?;
             let v = self.vstack.pop();
-            if v.kind == VK::Reg { self.free_reg(v.reg); }
+            if matches!(v.kind, VK::Reg | VK::RegInd) {
+                self.free_reg(v.reg);
+            }
         }
 
         //
@@ -2616,10 +2710,7 @@ impl Compiler {
         let v = self.vstack.pop();
         let r = self.coerce_to_xmm(v, ty)?;
 
-        match ty {
-            CType::Float => self.buf.movss_store(base, off, r),
-            _            => self.buf.movsd_store(base, off, r),
-        }
+        self.emit_float_store(base, off, r, ty);
 
         if keep {
             self.vstack.push(CValue::xmm(ty, r));
@@ -2641,6 +2732,89 @@ impl Compiler {
     }
 
     #[inline]
+    fn compile_global_decl(&mut self, ty: CType, name: &str, hash: u64, is_extern: bool) -> CResult<()> {
+        if is_extern {
+            //
+            // @Incomplete
+            // Extern global - treat like extern function, add to sym table
+            // for now skip - extern globals need GOT relocs which is more complex
+            //
+            while !matches!(self.current_token.kind, TK::SemiColon | TK::Eof) {
+                self.next();
+            }
+            self.expect(TK::SemiColon, "';'")?;
+            return Ok(());
+        }
+
+        if self.current_token.kind == TK::Eq {  // @Refactor
+            self.next();
+            // Constant initializer only
+            let (is_bss, data_off) = match ty {
+                CType::Int | CType::Long | CType::Char => {
+                    let v = self.parse_const_int()?;
+                    if v == 0 {
+                        let off = self.bss_size;
+                        self.bss_size += ty.size() as usize;
+                        (true, off as u32)
+                    } else {
+                        let off = self.data.len() as u32;
+                        match ty {
+                            CType::Char => self.data.push(v as u8),
+                            CType::Int  => self.data.extend_from_slice(&(v as i32).to_le_bytes()),
+                            _           => self.data.extend_from_slice(&v.to_le_bytes()),
+                        }
+                        (false, off)
+                    }
+                }
+
+                CType::Float => {
+                    let v = self.parse_const_float()?;
+                    if v == 0.0 {
+                        let off = self.bss_size;
+                        self.bss_size += 4;
+                        (true, off as u32)
+                    } else {
+                        let off = self.data.len() as u32;
+                        self.data.extend_from_slice(&(v as f32).to_bits().to_le_bytes());
+                        (false, off)
+                    }
+                }
+
+                CType::Double => {
+                    let v = self.parse_const_float()?;
+                    if v == 0.0 {
+                        let off = self.bss_size;
+                        self.bss_size += 8;
+                        (true, off as u32)
+                    } else {
+                        let off = self.data.len() as u32;
+                        self.data.extend_from_slice(&v.to_bits().to_le_bytes());
+                        (false, off)
+                    }
+                }
+
+                _ => {
+                    while !matches!(self.current_token.kind, TK::SemiColon | TK::Eof) {
+                        self.next();
+                    }
+                    self.expect(TK::SemiColon, "';'")?;
+                    return Ok(());
+                }
+            };
+
+            self.globals.insert(name, hash, ty, data_off, is_bss);
+        } else {
+            // no initializer - goes in .bss
+            let off = self.bss_size;
+            self.bss_size += ty.size() as usize;
+            self.globals.insert(name, hash, ty, off as u32, true);
+        }
+
+        self.expect(TK::SemiColon, "';'")?;
+        Ok(())
+    }
+
+    #[inline]
     fn compile_local_decl(&mut self) -> CResult<()> {
         let ty       = self.compile_type()?;
         let name_tok = self.eat_ident("variable name")?;
@@ -2658,7 +2832,9 @@ impl Compiler {
     fn compile_expr_stmt(&mut self) -> CResult<()> {
         self.compile_expr()?;
         let v = self.vstack.pop();
-        if v.kind == VK::Reg { self.free_reg(v.reg); }
+        if matches!(v.kind, VK::Reg | VK::RegInd) {
+            self.free_reg(v.reg);
+        }
         self.expect(TK::SemiColon, "';'").map(|_| ())
     }
 
@@ -2745,10 +2921,7 @@ impl Compiler {
 
                     if lhs.ty.is_float() {
                         let tmp = self.xmms.alloc(span)?;
-                        match lhs.ty {
-                            CType::Float => self.buf.movss_load(tmp, base, lhs.offset),
-                            _            => self.buf.movsd_load(tmp, base, lhs.offset),
-                        }
+                        self.emit_float_load(tmp, base, lhs.offset, lhs.ty);
                         self.vstack.push(CValue::xmm(lhs.ty, tmp));
                     } else {
                         let tmp = self.regs.alloc(span)?;
@@ -2772,13 +2945,8 @@ impl Compiler {
 
                 let base = lhs.reg.as_gp();
                 self.compile_store_keep(base, lhs.offset, lhs.ty)?;
+                self.regs.free(base);  // Free the address register - result is now on vstack as VK::Reg
             } else if op == TK::And || op == TK::Or {
-                //
-                // xor result, result  (result = 0)
-                //
-                let result = self.regs.alloc(span)?;
-                self.buf.xor_rr(result, result);
-
                 //
                 // Lhs
                 //
@@ -2844,17 +3012,7 @@ impl Compiler {
                     let r = self.coerce_to_xmm(rhs, target_ty)?;
 
                     let ty = self.normalize_xmm(l, lhs.ty, r, rhs.ty);
-                    match (op, ty) {
-                        (TK::Plus,  CType::Float)  => self.buf.addss(l, r),
-                        (TK::Plus,  _)             => self.buf.addsd(l, r),
-                        (TK::Minus, CType::Float)  => self.buf.subss(l, r),
-                        (TK::Minus, _)             => self.buf.subsd(l, r),
-                        (TK::Star,  CType::Float)  => self.buf.mulss(l, r),
-                        (TK::Star,  _)             => self.buf.mulsd(l, r),
-                        (TK::Slash, CType::Float)  => self.buf.divss(l, r),
-                        (TK::Slash, _)             => self.buf.divsd(l, r),
-                        _ => unreachable!(),
-                    }
+                    self.emit_float_arith(op, l, r, ty);
 
                     self.xmms.free(r);
                     self.vstack.push(CValue::xmm(ty, l));
@@ -2932,16 +3090,16 @@ impl Compiler {
         let rhs = self.vstack.pop();
         let lhs = self.vstack.pop();
 
-        if lhs.ty.is_float() {
-            let l = self.force_xmm(lhs)?;
-            let r = self.force_xmm(rhs)?;
+        if lhs.ty.is_float() || rhs.ty.is_float() {
+            let target_ty = if lhs.ty == CType::Double || rhs.ty == CType::Double {
+                CType::Double
+            } else {
+                CType::Float
+            };
+            let l = self.coerce_to_xmm(lhs, target_ty)?;
+            let r = self.coerce_to_xmm(rhs, target_ty)?;
 
-            let ty = self.normalize_xmm(l, lhs.ty, r, rhs.ty);
-
-            match ty {
-                CType::Float => self.buf.ucomiss(l, r),
-                _            => self.buf.ucomisd(l, r),
-            }
+            self.emit_float_cmp(l, r, target_ty);
 
             self.xmms.free(l);
             self.xmms.free(r);
@@ -3008,10 +3166,7 @@ impl Compiler {
                     _             => self.rodata.extend_from_slice(&0x8000000000000000u64.to_le_bytes()),
                 }
 
-                let text_off = match ty {
-                    CType::Float => self.buf.xorps_rip(r),
-                    _            => self.buf.xorpd_rip(r),
-                } as _;
+                let text_off = self.emit_float_xor_rip(r, ty) as _;
 
                 self.rodata_relocs.push(RodataReloc { text_off, rodata_off });
                 self.vstack.push(CValue::xmm(ty, r));
@@ -3028,6 +3183,7 @@ impl Compiler {
 
                 let dst = self.regs.alloc(span)?;
                 self.buf.lea(dst, base, v.offset);
+                if v.kind == VK::RegInd { self.regs.free(base); }
                 self.vstack.push(CValue::gp(CType::Ptr(1), dst));
             }
 
@@ -3058,6 +3214,7 @@ impl Compiler {
                 }
 
                 self.buf.mov_store(base, v.offset, r, ty.is64());
+                if v.kind == VK::RegInd { self.regs.free(base); }  // free address reg
                 self.vstack.push(CValue::gp(ty, r));
             }
 
@@ -3083,6 +3240,103 @@ impl Compiler {
         Ok(())
     }
 
+    #[inline]
+    fn emit_float_load(&mut self, dst: XmmReg, base: Reg, off: i32, ty: CType) {
+        match ty {
+            CType::Float => self.buf.movss_load(dst, base, off),
+            _            => self.buf.movsd_load(dst, base, off),
+        }
+    }
+
+    #[inline]
+    fn emit_float_store(&mut self, base: Reg, off: i32, src: XmmReg, ty: CType) {
+        match ty {
+            CType::Float => self.buf.movss_store(base, off, src),
+            _            => self.buf.movsd_store(base, off, src),
+        }
+    }
+
+    #[inline]
+    fn emit_float_mov(&mut self, dst: XmmReg, src: XmmReg, ty: CType) {
+        if dst == src { return; }
+        match ty {
+            CType::Float => self.buf.movss_rr(dst, src),
+            _            => self.buf.movsd_rr(dst, src),
+        }
+    }
+
+    #[inline]
+    fn emit_float_load_rip(&mut self, dst: XmmReg, ty: CType) -> usize {
+        match ty {
+            CType::Float => self.buf.movss_load_rip(dst),
+            _            => self.buf.movsd_load_rip(dst),
+        }
+    }
+
+    #[inline]
+    fn emit_float_xor_rip(&mut self, dst: XmmReg, ty: CType) -> usize {
+        match ty {
+            CType::Float => self.buf.xorps_rip(dst),
+            _            => self.buf.xorpd_rip(dst),
+        }
+    }
+
+    #[inline]
+    fn emit_float_arith(&mut self, op: TK, dst: XmmReg, src: XmmReg, ty: CType) {
+        match (op, ty) {
+            (TK::Plus,  CType::Float) => self.buf.addss(dst, src),
+            (TK::Plus,  _)            => self.buf.addsd(dst, src),
+            (TK::Minus, CType::Float) => self.buf.subss(dst, src),
+            (TK::Minus, _)            => self.buf.subsd(dst, src),
+            (TK::Star,  CType::Float) => self.buf.mulss(dst, src),
+            (TK::Star,  _)            => self.buf.mulsd(dst, src),
+            (TK::Slash, CType::Float) => self.buf.divss(dst, src),
+            (TK::Slash, _)            => self.buf.divsd(dst, src),
+            _ => unreachable!()
+        }
+    }
+
+    #[inline]
+    fn emit_float_cmp(&mut self, lhs: XmmReg, rhs: XmmReg, ty: CType) {
+        match ty {
+            CType::Float => self.buf.ucomiss(lhs, rhs),
+            _            => self.buf.ucomisd(lhs, rhs),
+        }
+    }
+
+    #[inline]
+    fn parse_const_int(&mut self) -> CResult<i64> {
+        let neg = self.current_token.kind == TK::Minus;
+        if neg { self.next(); }
+        let t = self.expect(TK::Number, "constant")?;
+        let v = Self::parse_number_int(self.s(t));
+        Ok(if neg { -v } else { v })
+    }
+
+    #[inline]
+    fn parse_const_float(&mut self) -> CResult<f64> {
+        let neg = self.current_token.kind == TK::Minus;
+        if neg { self.next(); }
+        let t = self.expect(TK::Number, "constant")?;
+        let v = Self::parse_number_float(self.s(t));
+        Ok(if neg { -v } else { v })
+    }
+
+    #[inline]
+    fn parse_number_int(s: &str) -> i64 {
+        if s.starts_with("0x") || s.starts_with("0X") {
+            i64::from_str_radix(&s[2..], 16).unwrap_or(0)
+        } else {
+            s.parse().unwrap_or(0)
+        }
+    }
+
+    #[inline]
+    fn parse_number_float(s: &str) -> f64 {
+        let s = if s.ends_with('f') { &s[..s.len()-1] } else { s };
+        s.parse().unwrap_or(0.0)
+    }
+
     fn compile_primary(&mut self) -> CResult<()> {
         match self.current_token.kind {
             TK::Number => {
@@ -3093,11 +3347,7 @@ impl Compiler {
                 let is_float_literal = s.contains('.');
 
                 if !is_float_literal {
-                    let v: i64 = if s.starts_with("0x") || s.starts_with("0X") {
-                        i64::from_str_radix(&s[2..], 16).unwrap_or(0)
-                    } else {
-                        s.parse().unwrap_or(0)
-                    };
+                    let v = Self::parse_number_int(s);
                     self.vstack.push(CValue::imm(CType::Int, v));
                     return Ok(())
                 }
@@ -3107,8 +3357,7 @@ impl Compiler {
                 //
 
                 let is_float = s.ends_with('f');
-                let num_str = if is_float { &s[..s.len()-1] } else { s };
-                let v: f64 = num_str.parse().unwrap_or(0.0);
+                let v = Self::parse_number_float(s);
                 let ty = if is_float { CType::Float } else { CType::Double };
 
                 let rodata_off = self.rodata.len() as u32;
@@ -3195,8 +3444,22 @@ impl Compiler {
 
                         self.buf.mov_store(base, v.offset, tmp, v.ty.is64());
                         self.regs.free(tmp);
+                        if v.kind == VK::RegInd { self.regs.free(base); }  // free address reg
                         self.vstack.push(CValue::gp(v.ty, old));
                     }
+                } else if let Some(gv) = self.globals.find(hash) {
+                    //
+                    // RIP-relative address of global
+                    // push as a RegInd with a data/bss reloc
+                    //
+                    let dst = self.regs.alloc(name_tok.span)?;
+                    let text_off = self.buf.lea_rip(dst);
+                    self.data_relocs.push(DataReloc {
+                        text_off: text_off as u32,
+                        data_off: gv.data_off,
+                        is_bss:   gv.is_bss,
+                    });
+                    self.vstack.push(CValue::regind(gv.ty, dst, 0));
                 } else {
                     return Err(CError::Undefined {
                         span: name_tok.span,
@@ -3224,17 +3487,54 @@ impl Compiler {
         Ok(())
     }
 
-    // -- call - SysV AMD64 ABI ------------------------------------------------
-    //   eval args -> rdi rsi rdx rcx r8 r9
-    //   xor eax, eax  (al = SSE arg count = 0, if callee is variadic)
-    //   call rel32
-    //   result in rax
+    fn spill_vstack_across_call(&mut self) -> CResult<()> {
+        for i in 0..self.vstack.len() {
+            let v = self.vstack.vals[i];
+            match v.kind {
+                VK::Imm | VK::Local => continue, // Already safe
+                VK::Reg | VK::RegInd => {}
+            }
+
+            let spill_off = self.locals.alloc(0, v.ty);
+
+            if v.ty.is_float() {
+                let xmm = if v.kind == VK::RegInd {
+                    let tmp = self.xmms.alloc(Span::POISONED)?;
+                    self.emit_float_load(tmp, v.reg.as_gp(), v.offset, v.ty);
+                    self.regs.free(v.reg.as_gp());
+                    tmp
+                } else {
+                    v.reg.as_xmm()
+                };
+
+                self.emit_float_store(Reg::Rbp, spill_off, xmm, v.ty);
+
+                if v.kind == VK::RegInd { self.xmms.free(xmm); }
+                // VK::Reg xmm is freed by clobber_caller_save - don't free here
+            } else {
+                let gp = if v.kind == VK::RegInd {
+                    let tmp = self.regs.alloc(Span::POISONED)?;
+                    self.buf.mov_load(tmp, v.reg.as_gp(), v.offset, v.ty.is64());
+                    self.regs.free(v.reg.as_gp());
+                    tmp
+                } else {
+                    v.reg.as_gp()
+                };
+
+                self.buf.mov_store(Reg::Rbp, spill_off, gp, v.ty.is64());
+
+                if v.kind == VK::RegInd { self.regs.free(gp); }
+                // VK::Reg gp is freed by clobber_caller_save - don't free here
+            }
+
+            self.vstack.vals[i] = CValue::local(v.ty, spill_off);
+        }
+
+        Ok(())
+    }
 
     fn compile_call(&mut self, callee_hash: u64, name_tok: Token) -> CResult<()> {
         self.next(); // '('
-
-        let mut argc     = 0;
-        let mut xmm_argc = 0;
 
         let Some(sym_index) = self.syms.find(callee_hash) else {
             return Err(CError::Undefined {
@@ -3245,65 +3545,46 @@ impl Compiler {
         let sym = self.syms[sym_index];
         let is_variadic = sym.flags.contains(SymFlags::VARIADIC);
 
+        //
+        // Evaluate all args and spill to locals
+        // This ensures nested calls don't clobber already-evaluated args
+        //
+        //                             off   ty
+        let mut arg_spills: SmallVec<[(i32, CType); 8]> = SmallVec::new();
+
         while self.current_token.kind != TK::RParen && !self.at_eof() {
+            //
+            // Spill any live registers before evaluating this arg
+            //
+            self.spill_vstack_across_call()?;
+
             self.compile_expr()?;
             let v = self.vstack.pop();
 
+            let spill_off = self.locals.alloc(0, v.ty);
+
             if v.ty.is_float() {
-                if xmm_argc >= XMM_ARG_REGS.len() {
-                    return Err(CError::ArgumentCountMismatch {
-                        span: self.current_token.span,
-                        expected: XMM_ARG_REGS.len(),
-                        name: name_tok.s(&self.src_arena).to_owned()
-                    });
-                }
-
-                let src = self.force_xmm(v)?;
-                let dst = XMM_ARG_REGS[xmm_argc];
-
-                //
-                // Varargs: promote float -> double (SYSV)
-                //
-
-                if is_variadic && v.ty == CType::Float {
-                    self.buf.cvtss2sd(dst, src);
-                } else {
-                    self.buf.movsd_rr(dst, src);
-                }
-
-                self.xmms.free(src);
-
-                xmm_argc += 1;
+                let xmm = self.coerce_to_xmm(v, v.ty)?;
+                self.emit_float_store(Reg::Rbp, spill_off, xmm, v.ty);
+                self.xmms.free(xmm);
             } else {
-                if argc >= ARG_REGS.len() {
-                    return Err(CError::ArgumentCountMismatch {
-                        span: self.current_token.span,
-                        expected: ARG_REGS.len(),
-                        name: name_tok.s(&self.src_arena).to_owned()
-                    });
-                }
-
-                let r = self.force_gp(v)?;
-                self.buf.mov_rr(ARG_REGS[argc], r);
-                self.regs.free(r);
-
-                argc += 1;
+                let gp = self.force_gp(v)?;
+                self.buf.mov_store(Reg::Rbp, spill_off, gp, v.ty.is64());
+                self.regs.free(gp);
             }
 
-            if self.current_token.kind == TK::Comma {
-                self.next();
-            } else {
-                break;
-            }
+            arg_spills.push((spill_off, v.ty));
+
+            if self.current_token.kind == TK::Comma { self.next(); }
         }
 
         let rparen = self.expect(TK::RParen, "')'")?;
         let call_span = name_tok.span.merge(rparen.span);
-        let total_argc = argc + xmm_argc;
 
         //
-        // Check the counts match
+        // Check arg counts
         //
+        let total_argc = arg_spills.len();
         if sym.flags.contains(SymFlags::VARIADIC) {
             if total_argc < sym.param_count as usize {
                 return Err(CError::ArgumentCountMismatch {
@@ -3320,7 +3601,57 @@ impl Compiler {
             });
         }
 
-        // al = number of xmm args used (SYSV)
+        //
+        // Spill anything still live on the vstack before we load arg registers
+        //
+        self.spill_vstack_across_call()?;
+
+        //
+        // Load spilled args into arg registers
+        // No expressions evaluated here so no clobbering possible
+        //
+        let mut argc     = 0usize;
+        let mut xmm_argc = 0usize;
+
+        for &(spill_off, ty) in &arg_spills {
+            if ty.is_float() {
+                if xmm_argc >= XMM_ARG_REGS.len() {
+                    return Err(CError::ArgumentCountMismatch {
+                        span: call_span,
+                        expected: XMM_ARG_REGS.len(),
+                        name: name_tok.s(&self.src_arena).to_owned()
+                    });
+                }
+
+                let dst = XMM_ARG_REGS[xmm_argc];
+                if is_variadic && ty == CType::Float {
+                    //
+                    // Load as float then promote to double (SYSV)
+                    //
+                    self.buf.movss_load(dst, Reg::Rbp, spill_off);
+                    self.buf.cvtss2sd(dst, dst);
+                } else {
+                    self.emit_float_load(dst, Reg::Rbp, spill_off, ty);
+                }
+
+                xmm_argc += 1;
+            } else {
+                if argc >= ARG_REGS.len() {
+                    return Err(CError::ArgumentCountMismatch {
+                        span: call_span,
+                        expected: ARG_REGS.len(),
+                        name: name_tok.s(&self.src_arena).to_owned()
+                    });
+                }
+
+                self.buf.mov_load(ARG_REGS[argc], Reg::Rbp, spill_off, ty.is64());
+                argc += 1;
+            }
+        }
+
+        //
+        // al = number of xmm args (SYSV)
+        //
         if is_variadic {
             if xmm_argc == 0 {
                 self.buf.xor_rr(Reg::Rax, Reg::Rax);
@@ -3355,26 +3686,28 @@ impl Compiler {
     }
 }
 
-// --- ELF64 writer ------------------------------------------------------------
-//
-// Sections:
-//   [0] null   [1] .text   [2] .rodata   [3] .rela.text
-//   [4] .symtab  [5] .strtab  [6] .shstrtab
-//
-// Symbols:
-//   [0] null sentinel   [1] .rodata STT_SECTION (for PC32 relocs)
-//   [2..] defined globals   [...] extern (undefined) globals
-
 pub fn write_elf(c: &Compiler) -> Vec<u8> {
     let nsyms = c.syms.len();
+    let ngvars = c.globals.vars.len();
 
+    //
     // strtab
+    //
+
     let mut strtab = Vec::with_capacity(c.syms.name_buf.len() + nsyms); // +1 null per sym
     strtab.push(0u8);
-    let mut sym_name_index = Vec::with_capacity(nsyms);
+
+    let mut sym_name_index  = Vec::with_capacity(nsyms);
+    let mut gvar_name_index = Vec::with_capacity(ngvars);
+
     for sym in c.syms.iter() {
         sym_name_index.push(strtab.len() as u32);
         strtab.extend_from_slice(sym.s(&c.syms.name_buf).as_bytes());
+        strtab.push(0);
+    }
+    for gv in c.globals.vars.iter() {
+        gvar_name_index.push(strtab.len() as u32);
+        strtab.extend_from_slice(gv.s(&c.globals.name_buf).as_bytes());
         strtab.push(0);
     }
 
@@ -3389,6 +3722,8 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
     };
     let sh_text     = sname(".text");
     let sh_rodata   = sname(".rodata");
+    let sh_data     = sname(".data");
+    let sh_bss      = sname(".bss");
     let sh_rela     = sname(".rela.text");
     let sh_symtab   = sname(".symtab");
     let sh_strtab   = sname(".strtab");
@@ -3397,44 +3732,71 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
     //
     // symtab
     //
-
-    const SHN_UNDEF:  u16 = 0;
-    const SHN_TEXT:   u16 = 1;
-    const SHN_RODATA: u16 = 2;
-    const STB_LOCAL:  u8  = 0;
-    const STB_GLOBAL: u8  = 1;
-    const STT_FUNC:   u8  = 2;
-    const STT_NOTYPE: u8  = 0;
-    const STT_SECTION:u8  = 3;
+    // Layout:
+    //   [0]  null
+    //   [1]  STT_SECTION .rodata
+    //   [2]  STT_SECTION .data
+    //   [3]  STT_SECTION .bss
+    //   [4+] defined functions (global)
+    //   [..] global variables (STT_OBJECT)
+    //   [..] extern functions (undefined)
+    //
+    const SHN_UNDEF:   u16 = 0;
+    const SHN_TEXT:    u16 = 1;
+    const SHN_RODATA:  u16 = 2;
+    const SHN_DATA:    u16 = 3;
+    const SHN_BSS:     u16 = 4;
+    const STB_LOCAL:   u8  = 0;
+    const STB_GLOBAL:  u8  = 1;
+    const STT_FUNC:    u8  = 2;
+    const STT_OBJECT:  u8  = 1;
+    const STT_NOTYPE:  u8  = 0;
+    const STT_SECTION: u8  = 3;
 
     let mut symtab = Vec::with_capacity((nsyms + 2) * 24);
-    let push_sym = |symtab: &mut Vec<u8>, name: u32, info: u8, shndx: u16, value: u64| {
+    let push_sym = |symtab: &mut Vec<u8>, name: u32, info: u8, shndx: u16, value: u64, size: u64| {
         symtab.extend_from_slice(&name.to_le_bytes());
         symtab.push(info); symtab.push(0);
         symtab.extend_from_slice(&shndx.to_le_bytes());
         symtab.extend_from_slice(&value.to_le_bytes());
-        symtab.extend_from_slice(&0u64.to_le_bytes());
+        symtab.extend_from_slice(&size.to_le_bytes());
     };
 
-    push_sym(&mut symtab, 0, 0, SHN_UNDEF, 0);  // [0] null
-    push_sym(&mut symtab, 0, (STB_LOCAL<<4)|STT_SECTION, SHN_RODATA, 0); // [1] .rodata
+    push_sym(&mut symtab, 0, 0, SHN_UNDEF, 0, 0);                           // [0] null
+    push_sym(&mut symtab, 0, (STB_LOCAL<<4)|STT_SECTION, SHN_RODATA, 0, 0); // [1] .rodata
+    push_sym(&mut symtab, 0, (STB_LOCAL<<4)|STT_SECTION, SHN_DATA,   0, 0); // [2] .data
+    push_sym(&mut symtab, 0, (STB_LOCAL<<4)|STT_SECTION, SHN_BSS,    0, 0); // [3] .bss
+
+    const RODATA_SYM: u64 = 1;
+    const DATA_SYM:   u64 = 2;
+    const BSS_SYM:    u64 = 3;
+    let first_global_sym = symtab.len() / 24; // sh_info = this
 
     for (i, sym) in c.syms.iter().enumerate() {
         if !sym.flags.contains(SymFlags::DEFINED) { continue; }
-        push_sym(&mut symtab, sym_name_index[i], (STB_GLOBAL<<4)|STT_FUNC, SHN_TEXT, sym.code_off as u64);
+        push_sym(&mut symtab, sym_name_index[i], (STB_GLOBAL<<4)|STT_FUNC,
+            SHN_TEXT, sym.code_off as u64, sym.code_len as u64);
+    }
+    for (i, gv) in c.globals.vars.iter().enumerate() {
+        let shndx = if gv.is_bss { SHN_BSS } else { SHN_DATA };
+        push_sym(&mut symtab, gvar_name_index[i], (STB_GLOBAL<<4)|STT_OBJECT,
+            shndx, gv.data_off as u64, gv.ty.size() as u64);
     }
 
-    let mut elf_sym_index = vec![0u32; c.syms.len()];
+    let mut elf_sym_index = vec![0u32; nsyms];
     for (i, sym) in c.syms.iter().enumerate() {
         if !sym.flags.contains(SymFlags::EXTERN) { continue; }
         elf_sym_index[i] = (symtab.len() / 24) as u32;
-        push_sym(&mut symtab, sym_name_index[i], (STB_GLOBAL<<4)|STT_NOTYPE, SHN_UNDEF, 0);
+        push_sym(&mut symtab, sym_name_index[i], (STB_GLOBAL<<4)|STT_NOTYPE,
+            SHN_UNDEF, 0, 0);
     }
 
+    //
     // rela.text
+    //
     const R_PLT32: u64 = 4;
     const R_PC32:  u64 = 2;
-    let mut rela = Vec::with_capacity((c.relocs.len() + c.rodata_relocs.len()) * 24);
+    let mut rela = Vec::new();
     let push_rela = |rela: &mut Vec<u8>, offset: u64, sym: u64, rtype: u64, addend: i64| {
         rela.extend_from_slice(&offset.to_le_bytes());
         rela.extend_from_slice(&((sym<<32)|rtype).to_le_bytes());
@@ -3442,35 +3804,41 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
     };
 
     for r in &c.relocs {
-        push_rela(&mut rela, r.offset as u64, elf_sym_index[r.sym_index as usize] as u64, R_PLT32, r.addend);
+        push_rela(&mut rela, r.offset as u64,
+            elf_sym_index[r.sym_index as usize] as u64, R_PLT32, r.addend);
     }
     for r in &c.rodata_relocs {
-        push_rela(&mut rela, r.text_off as u64, 1, R_PC32, r.rodata_off as i64 - 4);
+        push_rela(&mut rela, r.text_off as u64, RODATA_SYM, R_PC32,
+            r.rodata_off as i64 - 4);
+    }
+    for r in &c.data_relocs {
+        let sym = if r.is_bss { BSS_SYM } else { DATA_SYM };
+        push_rela(&mut rela, r.text_off as u64, sym, R_PC32,
+            r.data_off as i64 - 4);
     }
 
     //
     // Layout
     //
-
     const EHSZ: usize = 64;
     const SHSZ: usize = 64;
-    const NSEC: usize = 7;
+    const NSEC: usize = 9;
 
-    let text_off  = EHSZ;
-    let text_sz   = c.buf.bytes.len();
-    let rodata_off = align(text_off  + text_sz,   16); let rodata_sz = c.rodata.len();
-    let rela_off   = align(rodata_off + rodata_sz,  8); let rela_sz   = rela.len();
-    let sym_off    = align(rela_off  + rela_sz,     8); let sym_sz    = symtab.len();
-    let str_off    = align(sym_off   + sym_sz,      8); let str_sz    = strtab.len();
-    let shstr_off  = align(str_off   + str_sz,      8); let shstr_sz  = shstrtab.len();
-    let shdrs_off  = align(shstr_off + shstr_sz,    8);
+    let text_off    = EHSZ;
+    let text_sz     = c.buf.bytes.len();
+    let rodata_off  = align(text_off   + text_sz,        16); let rodata_sz  = c.rodata.len();
+    let data_off    = align(rodata_off + rodata_sz,       16); let data_sz    = c.data.len();
+    let rela_off    = align(data_off   + data_sz,          8); let rela_sz    = rela.len();
+    let sym_off     = align(rela_off   + rela_sz,          8); let sym_sz     = symtab.len();
+    let str_off     = align(sym_off    + sym_sz,           8); let str_sz     = strtab.len();
+    let shstr_off   = align(str_off    + str_sz,           8); let shstr_sz   = shstrtab.len();
+    let shdrs_off   = align(shstr_off  + shstr_sz,         8);
 
     let mut out = vec![0u8; shdrs_off + NSEC * SHSZ];
 
     //
     // ELF header
     //
-
     out[0..4].copy_from_slice(b"\x7fELF");
     out[4]=2; out[5]=1; out[6]=1; out[7]=0;
     out[16..18].copy_from_slice(&1u16.to_le_bytes());   // ET_REL
@@ -3480,23 +3848,23 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
     out[52..54].copy_from_slice(&(EHSZ as u16).to_le_bytes());
     out[58..60].copy_from_slice(&(SHSZ as u16).to_le_bytes());
     out[60..62].copy_from_slice(&(NSEC as u16).to_le_bytes());
-    out[62..64].copy_from_slice(&6u16.to_le_bytes()); // e_shstrndx
+    out[62..64].copy_from_slice(&8u16.to_le_bytes()); // e_shstrndx = .shstrtab
 
     //
     // Section data
     //
-
     out[text_off  ..text_off  +text_sz  ].copy_from_slice(&c.buf.bytes);
     out[rodata_off..rodata_off+rodata_sz].copy_from_slice(&c.rodata);
+    out[data_off  ..data_off  +data_sz  ].copy_from_slice(&c.data);
+    // .bss has no file content - zero sized in file
     out[rela_off  ..rela_off  +rela_sz  ].copy_from_slice(&rela);
     out[sym_off   ..sym_off   +sym_sz   ].copy_from_slice(&symtab);
     out[str_off   ..str_off   +str_sz   ].copy_from_slice(&strtab);
     out[shstr_off ..shstr_off +shstr_sz ].copy_from_slice(&shstrtab);
 
     //
-    // Section header
+    // Section headers
     //
-
     let section_header = |
         out: &mut [u8], i: usize, name: u32, ty: u32, flags: u64,
         off: u64, sz: u64, link: u32, info: u32, align: u64, esz: u64
@@ -3519,16 +3887,25 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
     const SYMTAB:   u32 = 2;
     const STRTAB:   u32 = 3;
     const RELA:     u32 = 4;
+    const NOBITS:   u32 = 8;  // .bss
     const ALLOC:    u64 = 0x2;
+    const WRITE:    u64 = 0x1;
     const EXEC:     u64 = 0x4;
 
-    section_header(&mut out, 0, 0,           NULL,     0,            0,                 0,                0, 0, 0,  00);
-    section_header(&mut out, 1, sh_text,     PROGBITS, ALLOC|EXEC,   text_off   as u64, text_sz   as u64, 0, 0, 16, 00);
-    section_header(&mut out, 2, sh_rodata,   PROGBITS, ALLOC,        rodata_off as u64, rodata_sz as u64, 0, 0, 16, 00);
-    section_header(&mut out, 3, sh_rela,     RELA,     0,            rela_off   as u64, rela_sz   as u64, 4, 1, 8,  24);
-    section_header(&mut out, 4, sh_symtab,   SYMTAB,   0,            sym_off    as u64, sym_sz    as u64, 5, 2, 8,  24);
-    section_header(&mut out, 5, sh_strtab,   STRTAB,   0,            str_off    as u64, str_sz    as u64, 0, 0, 1,  00);
-    section_header(&mut out, 6, sh_shstrtab, STRTAB,   0,            shstr_off  as u64, shstr_sz  as u64, 0, 0, 1,  00);
+    //
+    // Section indices:
+    // 0=null 1=.text 2=.rodata 3=.data 4=.bss 5=.rela.text 6=.symtab 7=.strtab 8=.shstrtab
+    //
+
+    section_header(&mut out, 0, 0,           NULL,     0,           0,                 0,                0, 0,                       0,  0);
+    section_header(&mut out, 1, sh_text,     PROGBITS, ALLOC|EXEC,  text_off   as u64, text_sz   as u64, 0, 0,                       16, 0);
+    section_header(&mut out, 2, sh_rodata,   PROGBITS, ALLOC,       rodata_off as u64, rodata_sz as u64, 0, 0,                       16, 0);
+    section_header(&mut out, 3, sh_data,     PROGBITS, ALLOC|WRITE, data_off   as u64, data_sz   as u64, 0, 0,                       16, 0);
+    section_header(&mut out, 4, sh_bss,      NOBITS,   ALLOC|WRITE, data_off   as u64, c.bss_size as u64,0, 0,                       16, 0);
+    section_header(&mut out, 5, sh_rela,     RELA,     0,           rela_off   as u64, rela_sz   as u64, 6, 1,                       8,  24); // link=symtab(6), info=.text(1)
+    section_header(&mut out, 6, sh_symtab,   SYMTAB,   0,           sym_off    as u64, sym_sz    as u64, 7, first_global_sym as u32, 8,  24); // link=strtab(7)
+    section_header(&mut out, 7, sh_strtab,   STRTAB,   0,           str_off    as u64, str_sz    as u64, 0, 0,                       1,  0);
+    section_header(&mut out, 8, sh_shstrtab, STRTAB,   0,           shstr_off  as u64, shstr_sz  as u64, 0, 0,                       1,  0);
 
     out
 }
@@ -3567,47 +3944,51 @@ fn main() {
 
 fn run_main(mut c: Compiler) {
     use std::ffi::CString;
-    use std::os::raw::c_int;
 
     //
-    // Append rodata and patch rodata relocs
+    // Layout: [code][rodata][data][bss_zeros][trampolines]
     //
-
     let rodata_base = c.buf.bytes.len();
     c.buf.bytes.extend_from_slice(&c.rodata);
 
-    for r in &c.rodata_relocs {
-        let target = rodata_base + r.rodata_off as usize;
-        let patch_pos = r.text_off as usize;
-        let rel = (target as i64) - (patch_pos as i64 + 4);
+    let data_base = c.buf.bytes.len();
+    c.buf.bytes.extend_from_slice(&c.data);
 
+    let bss_base = c.buf.bytes.len();
+    c.buf.bytes.extend(std::iter::repeat(0u8).take(c.bss_size));
+
+    //
+    // Patch rodata relocs
+    //
+    for r in &c.rodata_relocs {
+        let target    = rodata_base + r.rodata_off as usize;
+        let patch_pos = r.text_off as usize;
+        let rel       = (target as i64) - (patch_pos as i64 + 4);
         c.buf.patch_i32(patch_pos, rel as i32);
     }
 
     //
-    // Emit trampolines and patch extern relocs
+    // Patch data/bss relocs
     //
-    // Layout: [code][rodata][trampolines]
-    // Each trampoline is 12 bytes: 48 B8 <imm64> FF E0
-    //
+    for r in &c.data_relocs {
+        let base      = if r.is_bss { bss_base } else { data_base };
+        let target    = base + r.data_off as usize;
+        let patch_pos = r.text_off as usize;
+        let rel       = (target as i64) - (patch_pos as i64 + 4);
+        c.buf.patch_i32(patch_pos, rel as i32);
+    }
 
     //
-    // Collect unique symbols first to deduplicate trampolines
+    // Trampolines
     //
-
-    let mut trampoline_offsets = Vec::new(); // (buf_offset, sym_addr)
     let mut sym_to_trampoline = IntMap::default();
-
     for r in &c.relocs {
         let sym_index = r.sym_index as usize;
         if sym_to_trampoline.contains_key(&sym_index) { continue; }
 
-        let sym_name = c.syms[sym_index].s(&c.syms.name_buf);
+        let sym_name   = c.syms[sym_index].s(&c.syms.name_buf);
         let sym_name_c = CString::new(sym_name).unwrap();
-        let sym_addr = unsafe {
-            libc::dlsym(libc::RTLD_DEFAULT, sym_name_c.as_ptr())
-        } as i64;
-
+        let sym_addr   = unsafe { libc::dlsym(libc::RTLD_DEFAULT, sym_name_c.as_ptr()) } as i64;
         if sym_addr == 0 {
             eprintln!("undefined symbol: {sym_name}");
             std::process::exit(1);
@@ -3615,89 +3996,61 @@ fn run_main(mut c: Compiler) {
 
         let trampoline_off = c.buf.bytes.len();
         sym_to_trampoline.insert(sym_index, trampoline_off);
-        trampoline_offsets.push((trampoline_off, sym_addr));
 
         c.buf.mov_ri64(Reg::R11, sym_addr);
         c.buf.jmp_r(Reg::R11);
     }
 
     //
-    // Prepare argc, argv, envp
+    // Prepare argc/argv/envp
     //
-
-    let args = std::env::args()
-        .map(|s| CString::new(s).unwrap())
-        .collect::<Vec<_>>();
-    let argv = args.iter()
-        .map(|s| s.as_ptr() as *const u8)
-        .chain([std::ptr::null()])
-        .collect::<Vec<_>>();
+    let args = std::env::args().map(|s| CString::new(s).unwrap()).collect::<Vec<_>>();
+    let argv = args.iter().map(|s| s.as_ptr() as *const u8).chain([std::ptr::null()]).collect::<Vec<_>>();
     let argc = args.len() as i32;
-
-    let env_vars = std::env::vars()
-        .map(|(k, v)| CString::new(format!("{k}={v}")).unwrap())
-        .collect::<Vec<_>>();
-    let envp = env_vars.iter()
-        .map(|s| s.as_ptr() as *const u8)
-        .chain([std::ptr::null()])
-        .collect::<Vec<_>>();
+    let env_vars = std::env::vars().map(|(k,v)| CString::new(format!("{k}={v}")).unwrap()).collect::<Vec<_>>();
+    let envp = env_vars.iter().map(|s| s.as_ptr() as *const u8).chain([std::ptr::null()]).collect::<Vec<_>>();
 
     //
     // Find main
     //
-
     let main_hash = fnv1a_str("main");
-    let Some(main_sym_index) = c.syms.find(main_hash) else {
-        eprintln!("program doesn't have a main function to run");
-        std::process::exit(1);
+    let Some(main_idx) = c.syms.find(main_hash) else {
+        eprintln!("no main function"); std::process::exit(1);
     };
-    let main_sym = &c.syms[main_sym_index];
+    let main_sym = &c.syms[main_idx];
     if !main_sym.flags.contains(SymFlags::DEFINED) {
-        eprintln!("program doesn't have a DEFINED main function to run");
-        std::process::exit(1);
+        eprintln!("main not defined"); std::process::exit(1);
     }
     let main_off = main_sym.code_off as usize;
 
     //
-    // Mmap, patch call sites, then make executable
+    // Mmap and patch extern relocs
     //
-
     let mut mmap = MmapMut::map_anon(c.buf.bytes.len()).unwrap();
     mmap.copy_from_slice(&c.buf.bytes);
-
-    //
-    // Patch extern call sites now that we know base
-    //
 
     let base = mmap.as_ptr() as i64;
     for r in &c.relocs {
         let trampoline_off = sym_to_trampoline[&(r.sym_index as usize)];
-        let patch_pos = r.offset as usize;
-        let call_site = base + patch_pos as i64 + 4;
-        let trampoline_addr = base + trampoline_off as i64;
-        let rel = (trampoline_addr - call_site) as i32;
+        let patch_pos      = r.offset as usize;
+        let rel = (base + trampoline_off as i64 - (base + patch_pos as i64 + 4)) as i32;
         unsafe {
-            std::ptr::write_unaligned(
-                mmap.as_mut_ptr().add(patch_pos) as *mut i32,
-                rel,
-            );
+            std::ptr::write_unaligned(mmap.as_mut_ptr().add(patch_pos) as *mut i32, rel);
         }
     }
 
-    let mmap_exec = mmap.make_exec().unwrap(); // Atomic W->X
-    let base = mmap_exec.as_ptr();
+    // Make entire mapping RWX - code needs exec (.data needs write)
+    unsafe {
+        libc::mprotect(
+            mmap.as_mut_ptr() as *mut libc::c_void,
+            mmap.len(),
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        );
+    }
 
-    //
-    // Call main
-    //
-
-    let f: extern "C" fn(c_int, *const *const u8, *const *const u8) -> c_int = unsafe {
+    let f: extern "C" fn(i32, *const *const u8, *const *const u8) -> i32 = unsafe {
         std::mem::transmute(base as usize + main_off)
     };
-
-    let argv_ptr = argv.as_ptr();
-    let envp_ptr = envp.as_ptr();
-
-    let result = f(argc, argv_ptr, envp_ptr);
+    let result = f(argc, argv.as_ptr(), envp.as_ptr());
     std::process::exit(result);
 }
