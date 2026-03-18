@@ -303,6 +303,7 @@ pub enum TK {
     Eq, EqEq, NotEq,
     Xor, XorEq, Not, BitNot,
     And, Or,
+    Dot,
     Less, Greater, LessEq, GreaterEq, BinAnd,   BinOr,
                                       BinAndEq, BinOrEq,
 
@@ -452,17 +453,43 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileId) -> Token {
             if *pos+1 < src.len() && src[*pos]==b'.' && src[*pos+1]==b'.' {
                 *pos += 2; tok!(TK::TripleDot)
             }
-            else { lex(src, pos, fid) } // Skip stray dot
+            else { tok!(TK::Dot) }
         }
 
         b'/' => {
             if *pos < src.len() && src[*pos] == b'/' {
+                // Line comment
+
                 while *pos < src.len() && src[*pos] != b'\n' { *pos += 1; }
                 Token {
                     kind: TK::Newline,
-                    span: Span { file: fid, start: start as u32, len: (*pos-start) as u16 },
-                    hash: 0
+                    span: Span { file: fid, start: start as u32, len: (*pos - start) as u16 },
+                    hash: 0,
                 }
+            } else if *pos + 1 <= src.len() && src[*pos] == b'*' {
+                // Block comment
+
+                *pos += 1; // *
+                let mut depth: u32 = 1;
+                while *pos + 1 < src.len() && depth > 0 {
+                    if src[*pos] == b'/' && src[*pos + 1] == b'*' {
+                        *pos += 2;
+                        depth += 1;
+                    } else if src[*pos] == b'*' && src[*pos + 1] == b'/' {
+                        *pos += 2;
+                        depth -= 1;
+                    } else {
+                        *pos += 1;
+                    }
+                }
+
+                if depth > 0 {
+                    // Unterminated block comment - consume to EOF
+                    *pos = src.len();
+                }
+
+                // Tail-call back to get the next real token
+                lex(src, pos, fid)
             } else if *pos < src.len() && src[*pos] == b'=' {
                 *pos += 1; tok!(TK::SlashEq)
             } else {
