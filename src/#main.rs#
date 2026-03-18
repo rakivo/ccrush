@@ -4,7 +4,7 @@
 // TODO(#6): typedef
 // TODO(#3): Function pointers
 // TODO(#7): __attribute__
-// TODO: __restrict, __THROW, __wur, __attribute_malloc__ __attr_dealloc_fclose
+// TODO(#5): __restrict, __THROW, __wur, __attribute_malloc__ __attr_dealloc_fclose
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -5681,4 +5681,3 @@ fn run_main(mut c: Compiler) {
     let result = f(argc, argv.as_ptr(), envp.as_ptr());
     std::process::exit(result);
 }
-    
