@@ -1,6 +1,6 @@
 // TODO(#2): Structs
 // TODO(#4): Enums
-// TODO: sizeof
+// TODO(#1): sizeof
 // TODO: Function pointers
 
 use std::fs::File;
@@ -5678,4 +5678,4 @@ fn run_main(mut c: Compiler) {
     let result = f(argc, argv.as_ptr(), envp.as_ptr());
     std::process::exit(result);
 }
-        
+    
