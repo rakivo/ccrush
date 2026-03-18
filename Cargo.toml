@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bitflags = "2.11.0"
+cranelift-entity = "0.129.1"
 libc = "0.2.183"
 memmap2 = "0.9.10"
 nohash-hasher = "0.2.0"

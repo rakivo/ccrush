@@ -6,22 +6,18 @@ use thiserror::Error;
 use smallvec::SmallVec;
 use nohash_hasher::IntMap;
 use memmap2::{Mmap, MmapMut, MmapOptions};
+use cranelift_entity::{PrimaryMap, entity_impl};
 
-#[inline]
-const fn fnv1a(b: &[u8]) -> u64 {
+#[inline(always)]
+pub const fn hash_str(s: &str) -> u64 {
+    let b = s.as_bytes();
     let mut h = 0xcbf29ce484222325u64;
     let mut i = 0;
     while i < b.len() {
-        let x = b[i];
-        h = (h ^ x as u64).wrapping_mul(0x100000001b3);
+        h = (h ^ b[i] as u64).wrapping_mul(0x100000001b3);
         i += 1;
     }
     h
-}
-
-#[inline]
-const fn fnv1a_str(s: &str) -> u64 {
-    fnv1a(s.as_bytes())
 }
 
 #[inline]
@@ -284,7 +280,7 @@ pub type CResult<T> = Result<T, CError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TK {
-    Eof, Ident, Number, StrLit,
+    Eof, Ident, Number, CharLit, StrLit,
     LParen, RParen, LCurly, RCurly, Comma, SemiColon, TripleDot,
     Plus, PlusPlus, Minus, MinusMinus,
     PlusEq,         MinusEq,
@@ -323,32 +319,47 @@ impl Token {
 
 // Pre-computed fnv1a hashes of every keyword.  Used in place of string
 // comparisons throughout the compiler hot path - integer equality only.
-const HASH_RETURN:   u64 = fnv1a_str("return");
-const HASH_INT:      u64 = fnv1a_str("int");
-const HASH_LONG:     u64 = fnv1a_str("long");
-const HASH_CHAR:     u64 = fnv1a_str("char");
-const HASH_VOID:     u64 = fnv1a_str("void");
-const HASH_FLOAT:    u64 = fnv1a_str("float");
-const HASH_DOUBLE:   u64 = fnv1a_str("double");
-const HASH_ONCE:     u64 = fnv1a_str("once");
-const HASH_EXTERN:   u64 = fnv1a_str("extern");
-const HASH_DEFINE:   u64 = fnv1a_str("define");
-const HASH_INCLUDE:  u64 = fnv1a_str("include");
-const HASH_PRAGMA:   u64 = fnv1a_str("pragma");
-const HASH_UNDEF:    u64 = fnv1a_str("undef");
-const HASH_IFNDEF:   u64 = fnv1a_str("ifndef");
-const HASH_IFDEF:    u64 = fnv1a_str("ifdef");
-const HASH_IF:       u64 = fnv1a_str("if");
-const HASH_FOR:      u64 = fnv1a_str("for");
-const HASH_WHILE:    u64 = fnv1a_str("while");
-const HASH_ELSE:     u64 = fnv1a_str("else");
-const HASH_ELIF:     u64 = fnv1a_str("elif");
-const HASH_ENDIF:    u64 = fnv1a_str("endif");
-const HASH_BREAK:    u64 = fnv1a_str("break");
-const HASH_CONTINUE: u64 = fnv1a_str("continue");
+const HASH_RETURN:   u64 = hash_str("return");
+const HASH_INT:      u64 = hash_str("int");
+const HASH_LONG:     u64 = hash_str("long");
+const HASH_CHAR:     u64 = hash_str("char");
+const HASH_VOID:     u64 = hash_str("void");
+const HASH_FLOAT:    u64 = hash_str("float");
+const HASH_SIGNED:   u64 = hash_str("signed");
+const HASH_UNSIGNED: u64 = hash_str("unsigned");
+const HASH_STATIC:   u64 = hash_str("static");
+const HASH_RESTRICT: u64 = hash_str("restrict");
+const HASH_VOLATILE: u64 = hash_str("volatile");
+const HASH_REGISTER: u64 = hash_str("register");
+const HASH_AUTO:     u64 = hash_str("auto");
+const HASH_INLINE:   u64 = hash_str("inline");
+const HASH_CONST:    u64 = hash_str("const");
+const HASH_DOUBLE:   u64 = hash_str("double");
+const HASH_SHORT:    u64 = hash_str("short");
+const HASH_ONCE:     u64 = hash_str("once");
+const HASH_EXTERN:   u64 = hash_str("extern");
+const HASH_DEFINE:   u64 = hash_str("define");
+const HASH_INCLUDE:  u64 = hash_str("include");
+const HASH_PRAGMA:   u64 = hash_str("pragma");
+const HASH_UNDEF:    u64 = hash_str("undef");
+const HASH_IFNDEF:   u64 = hash_str("ifndef");
+const HASH_IFDEF:    u64 = hash_str("ifdef");
+const HASH_IF:       u64 = hash_str("if");
+const HASH_FOR:      u64 = hash_str("for");
+const HASH_WHILE:    u64 = hash_str("while");
+const HASH_ELSE:     u64 = hash_str("else");
+const HASH_ELIF:     u64 = hash_str("elif");
+const HASH_ENDIF:    u64 = hash_str("endif");
+const HASH_BREAK:    u64 = hash_str("break");
+const HASH_CONTINUE: u64 = hash_str("continue");
 
 const HASH_TYPES: &[u64] = &[
-    HASH_INT, HASH_LONG, HASH_CHAR, HASH_VOID, HASH_FLOAT, HASH_DOUBLE
+    HASH_INT, HASH_LONG, HASH_CHAR, HASH_VOID,
+    HASH_FLOAT, HASH_DOUBLE, HASH_SHORT,
+
+    // Qualifiers can start a type too...... Sigh.............
+    HASH_UNSIGNED, HASH_SIGNED,
+    HASH_CONST, HASH_STATIC, HASH_RESTRICT, HASH_VOLATILE, HASH_AUTO, HASH_REGISTER
 ];
 
 fn lex(src: &[u8], pos: &mut usize, fid: FileId) -> Token {
@@ -428,6 +439,15 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileId) -> Token {
             }
         }
 
+        b'\'' => {
+            while *pos < src.len() && src[*pos] != b'\'' {
+                if src[*pos] == b'\\' { *pos += 1; }
+                *pos += 1;
+            }
+            if *pos < src.len() { *pos += 1; }
+            tok!(TK::CharLit)
+        }
+
         b'"' => {
             while *pos < src.len() && src[*pos] != b'"' && src[*pos] != b'\n' {
                 if src[*pos] == b'\\' { *pos += 1; }
@@ -493,9 +513,9 @@ impl MacroTable {
             defs: SmallVec::new(),
             index: IntMap::with_capacity_and_hasher(64, Default::default()),
             tok_pool: SmallVec::new(),
+            arg_ends: SmallVec::new(),
             scratch: Vec::with_capacity(256),
             arg_pool: Vec::with_capacity(256),
-            arg_ends: SmallVec::new(),
         }
     }
 
@@ -569,7 +589,7 @@ impl Expansions {
     #[inline]
     fn new() -> Self {
         Self {
-            pool:   Vec::with_capacity(512),
+            pool:   Vec::with_capacity(1024),
             frames: Vec::with_capacity(32),
         }
     }
@@ -602,20 +622,20 @@ fn exp_push_body(exp: &mut Expansions, body: &[Token]) {
 }
 
 pub struct PP {
-    src_arena:      SrcArena,
+    src_arena:         SrcArena,
 
-    pub current_token: Token,
-    pub next_token:    Token,
+    current_token:     Token,
+    next_token:        Token,
 
-    file_stack:     Vec<FileFrame>,
-    exp:            Expansions,
-    at_bol:         bool, // At beginning of line - gate for # directives
+    file_stack:        Vec<FileFrame>,
+    exp:               Expansions,
+    at_bol:            bool,  // At beginning of line - gate for # directives
 
     pragma_once_paths: Vec<PathBuf>,
 
-    include_dirs:   Vec<PathBuf>,
+    include_dirs:      Vec<PathBuf>,
 
-    macros:         MacroTable,
+    macros:            MacroTable,
 }
 
 impl PP {
@@ -640,7 +660,10 @@ impl PP {
             file_stack:         vec![FileFrame { fid, pos: 0 }],
             exp:                Expansions::new(),
             macros:             MacroTable::new(),
-            include_dirs:       vec![PathBuf::from("/usr/include").into(), PathBuf::from("/usr/local/include").into()],
+            include_dirs:       vec![
+                PathBuf::from("/usr/include").into(),
+                PathBuf::from("/usr/local/include").into()
+            ],
             pragma_once_paths: Vec::new(),
             at_bol:             true,
             current_token:      Token::EOF,
@@ -670,30 +693,42 @@ impl PP {
 
     #[inline]
     fn raw(&mut self) -> Token {
-        loop {
-            if let Some(frame) = self.exp.frames.last_mut() {
-                let (_, end, cursor) = frame;
-                if *cursor < *end {
-                    let t = self.exp.pool[*cursor as usize];
-                    *cursor += 1;
-                    return t;
-                }
-                self.exp.pop();
-            } else {
-                break;
+        // Fast path: expansion frames active
+        while let Some(frame) = self.exp.frames.last_mut() {
+            let (_, end, cursor) = frame;
+            if *cursor < *end {
+                let t = self.exp.pool[*cursor as usize];
+                *cursor += 1;
+                return t;
             }
+            self.exp.pop();
         }
 
-        while let Some(ff) = self.file_stack.last_mut() {
+        // Slow path: read from file stack
+        // Most tokens come from here - inline the common case
+        if let Some(ff) = self.file_stack.last_mut() {
             let data = self.src_arena.files[ff.fid.0 as usize].data.slice();
             if ff.pos < data.len() {
                 return lex(data, &mut ff.pos, ff.fid);
             }
-
-            self.file_stack.pop();
         }
 
-        Token::EOF
+        self.raw_slow()
+    }
+
+    #[inline(never)]
+    fn raw_slow(&mut self) -> Token {
+        loop {
+            let Some(ff) = self.file_stack.last_mut() else {
+                return Token::EOF;
+            };
+
+            let data = self.src_arena.files[ff.fid.0 as usize].data.slice();
+            if ff.pos < data.len() {
+                return lex(data, &mut ff.pos, ff.fid);
+            }
+            self.file_stack.pop();
+        }
     }
 
     #[inline]
@@ -713,7 +748,7 @@ impl PP {
                 TK::Ident => {
                     self.at_bol = false;
 
-                    let hash = fnv1a_str(t.s(&self.src_arena));
+                    let hash = hash_str(t.s(&self.src_arena));
                     let Some(index) = self.macros.find(hash) else {
                         return Token { kind: t.kind, span: t.span, hash };
                     };
@@ -744,7 +779,7 @@ impl PP {
             return Ok(());
         }
 
-        name.hash = fnv1a_str(name.s(&self.src_arena));
+        name.hash = hash_str(name.s(&self.src_arena));
 
         match name.hash {
             HASH_DEFINE  => self.pp_define(),
@@ -780,7 +815,7 @@ impl PP {
         let name_tok = self.raw();
         if name_tok.kind != TK::Ident { self.skip_line(); return Ok(()); }
 
-        let name_hash = fnv1a_str(name_tok.s(&self.src_arena));
+        let name_hash = hash_str(name_tok.s(&self.src_arena));
         let next      = self.raw();
 
         // Function macro: '(' must be immediately adjacent - no whitespace
@@ -791,13 +826,12 @@ impl PP {
         let mut def  = MacroDef {
             name_hash, def_span: name_tok.span, ..MacroDef::ZERO
         };
-        let mut body = Vec::new();
 
         #[inline]
         fn try_param_subst(t: Token, def: &MacroDef, arena: &SrcArena) -> Token {
             if t.kind != TK::Ident || def.param_count == 0 { return t; }
 
-            let h = fnv1a_str(t.s(arena));
+            let h = hash_str(t.s(arena));
             for i in 0..def.param_count as usize {
                 if def.param_hashes[i] == h {
                     return Token { kind: TK::Param(i as u8), span: t.span, hash: 0 };
@@ -807,6 +841,7 @@ impl PP {
             t
         }
 
+        let mut body = Vec::new();
         if is_func {
             loop {
                 let t = self.raw();
@@ -814,7 +849,7 @@ impl PP {
                     TK::RParen            => break,
                     TK::Comma             => {}
                     TK::Ident             => {
-                        let ph = fnv1a_str(t.s(&self.src_arena));
+                        let ph = hash_str(t.s(&self.src_arena));
                         def.param_hashes[def.param_count as usize] = ph;
                         def.param_count += 1;
                     }
@@ -846,7 +881,7 @@ impl PP {
     fn pp_undef(&mut self) {
         let t = self.raw();
         if t.kind == TK::Ident {
-            self.macros.undef(fnv1a_str(t.s(&self.src_arena)));
+            self.macros.undef(hash_str(t.s(&self.src_arena)));
         }
         self.skip_line();
     }
@@ -917,7 +952,7 @@ impl PP {
     #[inline]
     fn pp_pragma(&mut self) {
         let t = self.raw();
-        if t.kind == TK::Ident && fnv1a_str(t.s(&self.src_arena)) == HASH_ONCE {
+        if t.kind == TK::Ident && hash_str(t.s(&self.src_arena)) == HASH_ONCE {
             if let Some(ff) = self.file_stack.last() {
                 let path = Path::new(self.src_arena.files[ff.fid.0 as usize].path.as_ref());
                 if let Ok(canonical) = path.canonicalize() {
@@ -1069,34 +1104,656 @@ impl PP {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CType {
-    Void,
-    Int,
-    Long,
-    Char,
-    Float,
-    Double,
-    Ptr(u8) // Depth
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct TypeRef(u32);
+entity_impl!(TypeRef);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct FieldRef(u32);
+entity_impl!(FieldRef);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FieldEntry {
+    pub name:       u32,     // interned string id,                   0 otherwise
+    pub ty:         TypeRef, // field type
+    pub offset:     u32,     // byte offset within struct/union
+
+    // @Incomplete
+    pub bit_offset: u8,      // bit offset within byte for bitfields, 0 otherwise
+    pub bit_width:  u8,      // bit width for bitfields,              0 otherwise
+
+    pub _pad:       u16,
 }
 
-impl CType {
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
+pub enum TypeKind {
+    Void,
+    Bool,
+    Char,
+    Int,
+    Short,
+    Long,
+    LLong,
+    Float,
+    Double,
+    LDouble,
+    Ptr,      // ref_  = pointee TypeRef
+    Array,    // ref_  = element TypeRef,  extra = length (0 = unsized/VLA)
+    Struct,   //                           extra = field_pool start,          extra2 = field count
+    Union,    //                           extra = field_pool start,          extra2 = field count
+    Func,     // ref_  = return TypeRef,   extra = param_pool start,          extra2 = param count
+    Enum,     // ref_  = repr TypeRef
+}
+
+impl TypeKind {
     #[inline]
-    pub const fn size(self) -> u8 {
-        match self {
-            CType::Void => 0,
-            CType::Char => 1,
-            CType::Int | CType::Float => 4,
-            CType::Long | CType::Double | CType::Ptr(_) => 8
+    pub fn is_signed_int(self, is_unsigned: bool) -> bool {
+        self.is_integer() && !is_unsigned
+    }
+
+    #[inline]
+    pub fn is_float(self) -> bool {
+        matches!(self, TypeKind::Float | TypeKind::Double | TypeKind::LDouble)
+    }
+
+    #[inline]
+    pub fn is_integer(self) -> bool {
+        matches!(
+            self,
+            TypeKind::Bool | TypeKind::Char | TypeKind::Int | TypeKind::Short |
+            TypeKind::Long | TypeKind::LLong | TypeKind::Enum
+        )
+    }
+
+    #[inline]
+    pub fn is_ptr(self) -> bool {
+        self == TypeKind::Ptr
+    }
+
+    #[inline]
+    pub fn is_scalar(self) -> bool {
+        self.is_integer() || self.is_float() || self.is_ptr()
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+    pub struct QualFlags: u8 {
+        const CONST    = 0x1;
+        const VOLATILE = 0x2;
+        const RESTRICT = 0x4;
+        const UNSIGNED = 0x8;
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+    pub struct TypeFlags: u8 {
+        const VARIADIC  = 0x01;
+        const NORETURN  = 0x02;
+        const INLINE    = 0x04;
+        const PACKED    = 0x08;
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct TypeEntry {
+    pub kind:   TypeKind,    // 1 byte
+    pub quals:  QualFlags,   // 1 byte
+    pub flags:  TypeFlags,   // 1 byte
+    pub _pad:   u8,          // 1 byte
+    pub ref_:   TypeRef,     // 4 bytes - pointee     / element     / return type
+    pub extra:  u32,         // 4 bytes - array len   / field start / param start
+    pub extra2: u32,         // 4 bytes - field count / param count
+}
+
+impl Deref for TypeEntry {
+    type Target = TypeKind;
+    #[inline]
+    fn deref(&self) -> &Self::Target { &self.kind }
+}
+
+impl DerefMut for TypeEntry {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.kind }
+}
+
+impl TypeEntry {
+    // Typed accessors with debug assertions
+    #[inline]
+    pub fn pointee(&self) -> TypeRef {
+        debug_assert!(self.kind == TypeKind::Ptr);
+        self.ref_
+    }
+
+    #[inline]
+    pub fn elem(&self) -> TypeRef {
+        debug_assert!(self.kind == TypeKind::Array);
+        self.ref_
+    }
+
+    #[inline]
+    pub fn array_len(&self) -> u32 {
+        debug_assert!(self.kind == TypeKind::Array);
+        self.extra
+    }
+
+    #[inline]
+    pub fn ret_ty(&self) -> TypeRef {
+        debug_assert!(self.kind == TypeKind::Func);
+        self.ref_
+    }
+
+    #[inline]
+    pub fn param_start(&self) -> u32 {
+        debug_assert!(self.kind == TypeKind::Func);
+        self.extra
+    }
+
+    #[inline]
+    pub fn param_count(&self) -> u32 {
+        debug_assert!(self.kind == TypeKind::Func);
+        self.extra2
+    }
+
+    #[inline]
+    pub fn field_start(&self) -> u32 {
+        debug_assert!(matches!(self.kind, TypeKind::Struct | TypeKind::Union));
+        self.extra
+    }
+
+    #[inline]
+    pub fn field_count(&self) -> u32 {
+        debug_assert!(matches!(self.kind, TypeKind::Struct | TypeKind::Union));
+        self.extra2
+    }
+
+    #[inline]
+    pub fn is_signed_int(self) -> bool {
+        self.kind.is_signed_int(self.is_unsigned())
+    }
+
+    #[inline]
+    pub fn is_unsigned(&self) -> bool {
+        self.quals.contains(QualFlags::UNSIGNED)
+    }
+
+    #[inline]
+    pub fn is_variadic(&self) -> bool {
+        self.flags.contains(TypeFlags::VARIADIC)
+    }
+
+    #[inline]
+    pub fn is_noreturn(&self) -> bool {
+        self.flags.contains(TypeFlags::NORETURN)
+    }
+}
+
+pub const TYPE_VOID:   TypeRef = TypeRef(0);
+pub const TYPE_BOOL:   TypeRef = TypeRef(1);
+pub const TYPE_CHAR:   TypeRef = TypeRef(2);
+pub const TYPE_UCHAR:  TypeRef = TypeRef(3);
+pub const TYPE_SHORT:  TypeRef = TypeRef(4);
+pub const TYPE_USHORT: TypeRef = TypeRef(5);
+pub const TYPE_INT:    TypeRef = TypeRef(6);
+pub const TYPE_UINT:   TypeRef = TypeRef(7);
+pub const TYPE_LONG:   TypeRef = TypeRef(8);
+pub const TYPE_ULONG:  TypeRef = TypeRef(9);
+pub const TYPE_LLONG:  TypeRef = TypeRef(10);
+pub const TYPE_ULLONG: TypeRef = TypeRef(11);
+pub const TYPE_FLOAT:  TypeRef = TypeRef(12);
+pub const TYPE_DOUBLE: TypeRef = TypeRef(13);
+
+pub struct TypeTable {
+    // Flat pool - index is TypeRef
+    entries: PrimaryMap<TypeRef, TypeEntry>,
+
+    // Open-addressed dedup map: pack_key -> index into entries
+    map_keys: Vec<u64>,
+    map_vals: Vec<TypeRef>,
+    map_mask: usize,
+    map_used: usize,
+
+    // Sub-pools
+    pub field_pool:  Vec<FieldEntry>,
+    pub param_pool:  Vec<TypeRef>,    // Func param types
+}
+
+impl TypeTable {
+    const EMPTY_KEY: u64 = 0;
+
+    const LOAD_NUM:  usize = 3;
+    const LOAD_DEN:  usize = 4; // 75% load factor
+
+    #[inline]
+    pub fn new() -> Self {
+        let cap = 256usize;
+        let mut t = Self {
+            entries:    PrimaryMap::with_capacity(cap),
+            map_keys:   vec![Self::EMPTY_KEY; cap],
+            map_vals:   vec![TypeRef(0); cap],
+            map_mask:   cap - 1,
+            map_used:   0,
+            field_pool: Vec::with_capacity(256),
+            param_pool: Vec::with_capacity(256),
+        };
+
+        // Pre-intern primitives so their TypeRefs are stable constants
+        t.init_primitives();
+        t
+    }
+
+    #[inline]
+    fn init_primitives(&mut self) {
+        use TypeKind::*;
+        use QualFlags as Q;
+
+        for (kind, quals) in [
+            (Void,  Q::empty()),    // 0
+            (Bool,  Q::empty()),    // 1
+            (Char,  Q::empty()),    // 2
+            (Char,  Q::UNSIGNED),   // 3
+            (Short, Q::empty()),    // 4
+            (Short, Q::UNSIGNED),   // 5
+            (Int,   Q::empty()),    // 6
+            (Int,   Q::UNSIGNED),   // 7
+            (Long,  Q::empty()),    // 8
+            (Long,  Q::UNSIGNED),   // 9
+            (LLong, Q::empty()),    // 10
+            (LLong, Q::UNSIGNED),   // 11
+            (Float, Q::empty()),    // 12
+            (Double,Q::empty()),    // 13
+        ] {
+            self.intern(
+                kind,
+                quals, TypeFlags::empty(),
+                TypeRef(0),
+                0, 0
+            );
+        }
+    }
+
+    #[inline(always)]
+    fn pack_key(e: &TypeEntry) -> u64 {
+        let lo = (e.kind as u64)
+            | ((e.quals.bits() as u64) << 8)
+            | ((e.flags.bits() as u64) << 16)
+            | ((e.ref_.0       as u64) << 24)
+            | ((e.extra        as u64) << 32)
+            | ((e.extra2       as u64) << 48);
+
+        // Finalizer from wyhash/murmur - better avalanche than xor-shift
+        let lo = lo ^ (lo >> 30);
+        let lo = lo.wrapping_mul(0xbf58476d1ce4e5b9);
+        let lo = lo ^ (lo >> 27);
+        let lo = lo.wrapping_mul(0x94d049bb133111eb);
+        lo ^ (lo >> 31)
+    }
+
+    #[inline]
+    fn grow(&mut self) {
+        let new_cap = (self.map_keys.len() * 2).max(256);
+        let new_mask = new_cap - 1;
+
+        let mut new_keys = vec![Self::EMPTY_KEY; new_cap];
+        let mut new_vals = vec![TypeRef(0);      new_cap];
+
+        for i in 0..self.map_keys.len() {
+            let k = self.map_keys[i];
+            if k == Self::EMPTY_KEY { continue; }
+
+            let mut slot = (k as usize) & new_mask;
+            loop {
+                if new_keys[slot] == Self::EMPTY_KEY {
+                    new_keys[slot] = k;
+                    new_vals[slot] = self.map_vals[i];
+                    break;
+                }
+
+                slot = (slot + 1) & new_mask;
+            }
+        }
+
+        self.map_keys = new_keys;
+        self.map_vals = new_vals;
+        self.map_mask = new_mask;
+    }
+
+    #[inline(never)]
+    fn intern_noinline(&mut self, e: TypeEntry, key: u64, start_slot: usize) -> TypeRef {
+        let mut slot = start_slot;
+        loop {
+            let k = self.map_keys[slot];
+            if k == Self::EMPTY_KEY {
+                // Not found - insert
+
+                if self.map_used * Self::LOAD_DEN >= self.map_keys.len() * Self::LOAD_NUM {
+                    self.grow();
+                    slot = (key as usize) & self.map_mask;
+
+                    // Re-find slot after grow
+                    loop {
+                        if self.map_keys[slot] == Self::EMPTY_KEY { break; }
+                        slot = (slot + 1) & self.map_mask;
+                    }
+                }
+
+                let id = TypeRef(self.entries.len() as u32);
+                self.entries.push(e);
+                self.map_keys[slot] = key;
+                self.map_vals[slot] = id;
+                self.map_used += 1;
+
+                return id;
+            }
+
+            if k == key {
+                // Key match - verify full equality to handle hash collisions
+
+                let existing = &self.entries[self.map_vals[slot]];
+                if existing.eq(&e) { return self.map_vals[slot]; }
+            }
+
+            slot = (slot + 1) & self.map_mask;
+        }
+    }
+
+    #[inline(always)]
+    fn intern_raw(&mut self, e: TypeEntry) -> TypeRef {
+        let key = Self::pack_key(&e);
+        let key = if key == 0 { 1 } else { key };
+        let slot = (key as usize) & self.map_mask;
+
+        // Fast path: check first slot only, no loop
+        let k = self.map_keys[slot];
+        if k == key {
+            let existing = &self.entries[self.map_vals[slot]];
+            if existing.eq(&e) {
+                return self.map_vals[slot];
+            }
+        }
+
+        self.intern_noinline(e, key, slot)
+    }
+
+    #[inline(always)]
+    pub fn intern(
+        &mut self,
+        kind: TypeKind,
+        quals: QualFlags, flags: TypeFlags,
+        ref_: TypeRef,
+        extra: u32, extra2: u32
+    ) -> TypeRef {
+        let e = TypeEntry { kind, quals, flags, ref_, _pad: 0, extra, extra2 };
+        self.intern_raw(e)
+    }
+
+    #[inline]
+    pub fn get(&self, id: TypeRef) -> &TypeEntry {
+        &self.entries[id]
+    }
+
+    #[inline]
+    pub fn get_kind(&self, id: TypeRef) -> TypeKind {
+        self.entries[id].kind
+    }
+
+    #[inline]
+    pub fn array_of(&mut self, elem: TypeRef, len: u32) -> TypeRef {
+        self.intern(TypeKind::Array, QualFlags::empty(), TypeFlags::empty(), elem, len, 0)
+    }
+
+    #[inline]
+    pub fn is_integer(&self, id: TypeRef) -> bool {
+        matches!(self.get(id).kind, TypeKind::Bool | TypeKind::Int | TypeKind::Long | TypeKind::LLong)
+    }
+
+    #[inline]
+    pub fn is_float(&self, id: TypeRef) -> bool {
+        matches!(self.get(id).kind, TypeKind::Float | TypeKind::Double | TypeKind::LDouble)
+    }
+
+    #[inline]
+    pub fn is_ptr(&self, id: TypeRef) -> bool {
+        self.get(id).kind == TypeKind::Ptr
+    }
+
+    #[inline]
+    pub fn is_unsigned(&self, id: TypeRef) -> bool {
+        self.get(id).quals.contains(QualFlags::UNSIGNED)
+    }
+
+    #[inline]
+    pub fn ptr_to(&mut self, pointee: TypeRef) -> TypeRef {
+        self.intern(
+            TypeKind::Ptr,
+            QualFlags::empty(),
+            TypeFlags::empty(),
+            pointee,
+            0,
+            0,
+        )
+    }
+
+    #[inline]
+    pub fn deref(&self, id: TypeRef) -> TypeRef {
+        let e = self.get(id);
+        debug_assert!(e.kind == TypeKind::Ptr);
+        e.ref_   // just follow ref_ - no depth arithmetic
+    }
+
+    #[inline]
+    pub fn size_of(&self, id: TypeRef) -> u32 {
+        let e = self.get(id);
+        match e.kind {
+            TypeKind::Void                                => 0,
+            TypeKind::Short                               => 2,
+            TypeKind::Bool | TypeKind::Char               => 1,
+            TypeKind::Int                                 => 4,
+            TypeKind::Long | TypeKind::LLong              => 8,
+            TypeKind::Float                               => 4,
+            TypeKind::Double                              => 8,
+            TypeKind::LDouble                             => 16,
+            TypeKind::Ptr                                 => 8,
+            TypeKind::Enum                                => 4,
+            TypeKind::Array  => self.size_of(e.elem()) * e.array_len(),
+            TypeKind::Struct => self.struct_size(e.field_start(), e.field_count()),
+            TypeKind::Union  => self.union_size(e.field_start(), e.field_count()),
+            TypeKind::Func                                => 0,
         }
     }
 
     #[inline]
-    pub const fn is64(self)  -> bool { self.size() == 8 }
+    pub fn align_of(&self, id: TypeRef) -> u32 {
+        let e = self.get(id);
+        match e.kind {
+            TypeKind::Void | TypeKind::Func               => 1,
+            TypeKind::Bool | TypeKind::Char               => 1,
+            TypeKind::Short                               => 2,
+            TypeKind::Int                                 => 4,
+            TypeKind::Long | TypeKind::LLong              => 8,
+            TypeKind::Float                               => 4,
+            TypeKind::Double                              => 8,
+            TypeKind::LDouble                             => 16,
+            TypeKind::Ptr                                 => 8,
+            TypeKind::Enum                                => 4,
+            TypeKind::Array  => self.align_of(e.elem()),
+            TypeKind::Struct => self.struct_align(e.field_start(), e.field_count()),
+            TypeKind::Union  => self.union_align(e.field_start(), e.field_count()),
+        }
+    }
+
     #[inline]
-    pub const fn is_ptr(self)-> bool { matches!(self, CType::Ptr(_)) }
+    pub fn alloc_fields(&mut self, fields: &[FieldEntry]) -> (u32, u32) {
+        let start = self.field_pool.len() as u32;
+        self.field_pool.extend_from_slice(fields);
+        (start, fields.len() as u32)
+    }
+
     #[inline]
-    pub fn is_float(self) -> bool { matches!(self, CType::Float | CType::Double) }
+    pub fn field_slice(&self, start: u32, count: u32) -> &[FieldEntry] {
+        let s = start as usize;
+        let e = s + count as usize;
+        &self.field_pool[s..e]
+    }
+
+    #[inline]
+    pub fn find_field(&self, start: u32, count: u32, name: u32) -> Option<&FieldEntry> {
+        self.field_slice(start, count).iter().find(|f| f.name == name)
+    }
+
+    // Lay out a struct: compute offsets respecting alignment, return (size, align).
+    // Mutates the field_pool entries in-place to fill in offsets.
+    #[inline]
+    pub fn layout_struct(&mut self, start: u32, count: u32) -> (u32, u32) {
+        let mut offset    = 0u32;
+        let mut max_align = 1u32;
+
+        for i in 0..count as usize {
+            let idx = start as usize + i;
+            let ty  = self.field_pool[idx].ty;
+            let field_align = self.align_of(ty);
+            let field_size  = self.size_of(ty);
+
+            // Pad up to field alignment
+            offset = align(offset as _, field_align as _) as _;
+            max_align = max_align.max(field_align);
+
+            self.field_pool[idx].offset = offset;
+            offset += field_size;
+        }
+
+        // Final size padded to struct alignment
+        let size = align(offset as _, max_align as _) as _;
+        (size, max_align)
+    }
+
+    // Lay out a union: all fields start at offset 0, size = largest field.
+    // Mutates field_pool in-place.
+    #[inline]
+    pub fn layout_union(&mut self, start: u32, count: u32) -> (u32, u32) {
+        let mut max_size:  u32 = 0;
+        let mut max_align: u32 = 1;
+
+        for i in 0..count as usize {
+            let idx = start as usize + i;
+            let ty  = self.field_pool[idx].ty;
+            let field_align = self.align_of(ty);
+            let field_size  = self.size_of(ty);
+
+            // All fields at offset 0
+            self.field_pool[idx].offset = 0;
+
+            max_size  = max_size.max(field_size);
+            max_align = max_align.max(field_align);
+        }
+
+        // Union size padded to alignment
+        let size = align(max_size as _, max_align as _) as _;
+        (size, max_align)
+    }
+
+    //
+    // Size/align via stored layout
+    // Called from size_of/align_of after layout is done
+    //
+
+    #[inline]
+    pub fn struct_size(&self, start: u32, count: u32) -> u32 {
+        if count == 0 { return 0; }
+
+        // Size = offset of last field + size of last field, padded to alignment
+        let fields = self.field_slice(start, count);
+
+        let last       = &fields[count as usize - 1];
+        let last_size  = self.size_of(last.ty);
+        let last_end   = last.offset + last_size;
+        let max_align  = self.struct_align(start, count);
+        align(last_end as _, max_align as _) as _
+    }
+
+    #[inline]
+    pub fn struct_align(&self, start: u32, count: u32) -> u32 {
+        self.field_slice(start, count)
+            .iter()
+            .map(|f| self.align_of(f.ty))
+            .max()
+            .unwrap_or(1)
+    }
+
+    #[inline]
+    pub fn union_size(&self, start: u32, count: u32) -> u32 {
+        let max_size  = self.field_slice(start, count)
+            .iter()
+            .map(|f| self.size_of(f.ty))
+            .max()
+            .unwrap_or(0);
+
+        let max_align = self.union_align(start, count);
+        align(max_size as _, max_align as _) as _
+    }
+
+    #[inline]
+    pub fn union_align(&self, start: u32, count: u32) -> u32 {
+        self.field_slice(start, count)
+            .iter()
+            .map(|f| self.align_of(f.ty))
+            .max()
+            .unwrap_or(1)
+    }
+
+    // Call after layout_struct to register the type
+    #[inline]
+    pub fn make_struct(&mut self, field_start: u32, field_count: u32) -> TypeRef {
+        self.intern(
+            TypeKind::Struct,
+            QualFlags::empty(),
+            TypeFlags::empty(),
+            TypeRef(0),
+            field_start,
+            field_count,
+        )
+    }
+
+    #[inline]
+    pub fn make_union(&mut self, field_start: u32, field_count: u32) -> TypeRef {
+        self.intern(
+            TypeKind::Union,
+            QualFlags::empty(),
+            TypeFlags::empty(),
+            TypeRef(0),
+            field_start,
+            field_count,
+        )
+    }
+
+    #[inline]
+    pub fn make_func(&mut self, ret: TypeRef, param_start: u32, param_count: u32, variadic: bool) -> TypeRef {
+        self.intern(
+            TypeKind::Func,
+            QualFlags::empty(),
+            if variadic { TypeFlags::VARIADIC } else { TypeFlags::empty() },
+            ret,
+            param_start,
+            param_count,
+        )
+    }
+
+    #[inline]
+    pub fn alloc_params(&mut self, params: &[TypeRef]) -> u32 {
+        let start = self.param_pool.len() as u32;
+        self.param_pool.extend_from_slice(params);
+        start
+    }
+
+    #[inline]
+    pub fn param_slice(&self, start: u32, count: u32) -> &[TypeRef] {
+        let s = start as usize;
+        &self.param_pool[s..s + count as usize]
+    }
 }
 
 #[repr(u8)]
@@ -1152,17 +1809,20 @@ impl ValReg {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VK { Imm, Reg, Local, RegInd }
 
-// --- CValue - value stack entry ----------------------------------------------
+//
+// CValue - value stack entry ----------------------------------------------
+//
 //   Imm    - compile-time constant
 //   Reg    - value in register
 //   Local  - [rbp + offset]
 //   RegInd - [reg + offset] (register indirection: deref, array, struct field)
+//
 
 #[derive(Clone, Copy, Debug)]
 pub struct CValue {
     pub imm:    i64,
     pub fimm:   f64,
-    pub ty:     CType,
+    pub ty:     TypeRef,
     pub reg:    ValReg,
     pub kind:   VK,
     pub offset: i32,
@@ -1170,32 +1830,32 @@ pub struct CValue {
 
 impl CValue {
     #[inline]
-    pub fn imm(ty: CType, v: i64)            -> Self {
+    pub fn imm(ty: TypeRef, v: i64)            -> Self {
         Self { kind: VK::Imm,    ty, reg: ValReg::Gp(Reg::Rax), offset: 0,   imm: v, fimm: 0.0 }
     }
 
     #[inline]
-    pub fn fimm(ty: CType, v: f64)           -> Self {
+    pub fn fimm(ty: TypeRef, v: f64)           -> Self {
         Self { kind: VK::Imm,    ty, reg: ValReg::Gp(Reg::Rax), offset: 0,   imm: 0, fimm: v   }
     }
 
     #[inline]
-    pub fn gp(ty: CType, r: Reg)             -> Self {
+    pub fn gp(ty: TypeRef, r: Reg)             -> Self {
         Self { kind: VK::Reg,    ty, reg: ValReg::Gp(r),        offset: 0,   imm: 0, fimm: 0.0 }
     }
 
     #[inline]
-    pub fn xmm(ty: CType, r: XmmReg)         -> Self {
+    pub fn xmm(ty: TypeRef, r: XmmReg)         -> Self {
         Self { kind: VK::Reg,    ty, reg: ValReg::Xmm(r),       offset: 0,   imm: 0, fimm: 0.0 }
     }
 
     #[inline]
-    pub fn local(ty: CType, off: i32)        -> Self {
+    pub fn local(ty: TypeRef, off: i32)        -> Self {
         Self { kind: VK::Local,  ty, reg: ValReg::Gp(Reg::Rbp), offset: off, imm: 0, fimm: 0.0 }
     }
 
     #[inline]
-    pub fn regind(ty: CType, r: Reg, o: i32) -> Self {
+    pub fn regind(ty: TypeRef, r: Reg, o: i32) -> Self {
         Self { kind: VK::RegInd, ty, reg: ValReg::Gp(r),        offset: o,   imm: 0, fimm: 0.0 }
     }
 
@@ -1284,10 +1944,8 @@ impl CodeBuf {
 
     #[inline]
     fn emit_byte(&mut self, b: u8) { self.bytes.push(b); }
-
     #[inline]
     fn emit_i32(&mut self, v: i32) { self.bytes.extend_from_slice(&v.to_le_bytes()); }
-
     #[inline]
     fn emit_i64(&mut self, v: i64) { self.bytes.extend_from_slice(&v.to_le_bytes()); }
 
@@ -1383,6 +2041,52 @@ impl CodeBuf {
     #[inline]
     pub fn mov_load (&mut self, dst: Reg, base: Reg, off: i32, is64: bool) {
         self.rex(is64, dst,  base); self.emit_byte(0x8B); self.modrm_mem(dst,  base, off);
+    }
+    // movsx r64, byte [base+off]
+    #[inline]
+    pub fn movsx8_load(&mut self, dst: Reg, base: Reg, off: i32) {
+        self.rex_w(dst, base);
+        self.bytes.extend_from_slice(&[0x0F, 0xBE]);
+        self.modrm_mem(dst, base, off);
+    }
+    // movzx r64, byte [base+off]
+    #[inline]
+    pub fn movzx8_load(&mut self, dst: Reg, base: Reg, off: i32) {
+        self.rex_w(dst, base);
+        self.bytes.extend_from_slice(&[0x0F, 0xB6]);
+        self.modrm_mem(dst, base, off);
+    }
+    // movsx r64, word [base+off]
+    #[inline]
+    pub fn movsx16_load(&mut self, dst: Reg, base: Reg, off: i32) {
+        self.rex_w(dst, base);
+        self.bytes.extend_from_slice(&[0x0F, 0xBF]);
+        self.modrm_mem(dst, base, off);
+    }
+    // movzx r64, word [base+off]
+    #[inline]
+    pub fn movzx16_load(&mut self, dst: Reg, base: Reg, off: i32) {
+        self.rex_w(dst, base);
+        self.bytes.extend_from_slice(&[0x0F, 0xB7]);
+        self.modrm_mem(dst, base, off);
+    }
+    // mov byte [base+off], src
+    #[inline]
+    pub fn mov_store8(&mut self, base: Reg, off: i32, src: Reg) {
+        // need REX if src is sil/dil/spl/bpl (rsi/rdi/rsp/rbp low byte)
+        if src.ext() || src as u8 >= 4 {
+            self.emit_byte(0x40 | (src.ext() as u8));
+        }
+        self.emit_byte(0x88);
+        self.modrm_mem(src, base, off);
+    }
+    // mov word [base+off], src
+    #[inline]
+    pub fn mov_store16(&mut self, base: Reg, off: i32, src: Reg) {
+        self.emit_byte(0x66); // operand size prefix
+        if src.ext() { self.emit_byte(0x41); }
+        self.emit_byte(0x89);
+        self.modrm_mem(src, base, off);
     }
     #[inline]
     pub fn mov_store(&mut self, base: Reg, off: i32, src: Reg, is64: bool) {
@@ -1487,7 +2191,6 @@ impl CodeBuf {
         self.emit_byte(0xFF);
         self.emit_byte(0xD0 | r.enc());
     }
-
     #[inline]
     pub fn jmp_r(&mut self, r: Reg) {
         if r.ext() { self.emit_byte(0x41); }
@@ -1503,7 +2206,6 @@ impl CodeBuf {
         self.emit_i32(-4);
         p
     }
-
     /// JMP rel8 (short jump, ±127 bytes)
     #[inline]
     pub fn jmp_rel8(&mut self) -> usize {
@@ -1519,7 +2221,6 @@ impl CodeBuf {
         let rel = (target as i64 - (patch as i64 + 4)) as i32;
         self.patch_i32(patch, rel);
     }
-
     /// Patch a rel8 jump site (1 byte)
     #[inline]
     pub fn patch_rel8(&mut self, patch: usize, target: usize) {
@@ -1619,7 +2320,6 @@ impl CodeBuf {
         let byte = 0x40 | ((dst as u8 >= 8) as u8) << 2 | ((src as u8 >= 8) as u8);
         if byte != 0x40 { self.emit_byte(byte); }
     }
-
     #[inline]
     fn xmm_modrm(&self, dst: XmmReg, src: XmmReg) -> u8 {
         0xC0 | (dst as u8 & 7) << 3 | (src as u8 & 7)
@@ -1674,7 +2374,6 @@ impl CodeBuf {
         self.xmm_rex(lhs, rhs);
         self.bytes.extend_from_slice(&[0x0F, 0x2E, self.xmm_modrm(lhs, rhs)]);
     }
-
     #[inline]
     pub fn ucomisd(&mut self, lhs: XmmReg, rhs: XmmReg) {
         self.xmm_rex(lhs, rhs);
@@ -1687,7 +2386,6 @@ impl CodeBuf {
         self.xmm_rex(dst, src);
         self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x10, self.xmm_modrm(dst, src)]);
     }
-
     #[inline]
     pub fn movsd_rr(&mut self, dst: XmmReg, src: XmmReg) {
         if dst == src { return; }
@@ -1700,13 +2398,11 @@ impl CodeBuf {
         self.xmm_rex(dst, src);
         self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x5A, self.xmm_modrm(dst, src)]);
     }
-
     #[inline]
     pub fn cvtsd2ss(&mut self, dst: XmmReg, src: XmmReg) {
         self.xmm_rex(dst, src);
         self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x5A, self.xmm_modrm(dst, src)]);
     }
-
     #[inline]
     pub fn cvtsi2sd(&mut self, dst: XmmReg, src: Reg) {
         // REX.W=1 for 64-bit int src, REX.R if dst>=8, REX.B if src>=8
@@ -1722,7 +2418,6 @@ impl CodeBuf {
         self.bytes.push(0x05 | (dst as u8 & 7) << 3);
         let patch = self.pos(); self.emit_i32(0); patch
     }
-
     #[inline]
     pub fn movsd_load_rip(&mut self, dst: XmmReg) -> usize {
         if dst as u8 >= 8 { self.emit_byte(0x44); }
@@ -1730,7 +2425,6 @@ impl CodeBuf {
         self.bytes.push(0x05 | (dst as u8 & 7) << 3);
         let patch = self.pos(); self.emit_i32(0); patch
     }
-
     #[inline]
     pub fn movsd_store_rip(&mut self, src: XmmReg) -> usize {
         if src as u8 >= 8 { self.emit_byte(0x44); }
@@ -1746,7 +2440,6 @@ impl CodeBuf {
         self.bytes.push(0x05 | (dst as u8 & 7) << 3);
         let patch = self.pos(); self.emit_i32(0); patch
     }
-
     #[inline]
     pub fn xorps_rip(&mut self, dst: XmmReg) -> usize {
         if dst as u8 >= 8 { self.emit_byte(0x44); }
@@ -1761,21 +2454,18 @@ impl CodeBuf {
         self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x10]);
         self.modrm_mem_impl(dst as u8 & 7, base, off);
     }
-
     #[inline]
     pub fn movss_store(&mut self, base: Reg, off: i32, src: XmmReg) {
         if src as u8 >= 8 { self.emit_byte(0x44); }
         self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x11]);
         self.modrm_mem_impl(src as u8 & 7, base, off);
     }
-
     #[inline]
     pub fn movsd_load(&mut self, dst: XmmReg, base: Reg, off: i32) {
         if dst as u8 >= 8 { self.emit_byte(0x44); }
         self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x10]);
         self.modrm_mem_impl(dst as u8 & 7, base, off);
     }
-
     #[inline]
     pub fn movsd_store(&mut self, base: Reg, off: i32, src: XmmReg) {
         if src as u8 >= 8 { self.emit_byte(0x44); }
@@ -1789,7 +2479,7 @@ const VALUE_STACK_CAP: usize = 64;
 pub struct ValueStack { vals: [CValue; VALUE_STACK_CAP], top: usize }
 
 impl ValueStack {
-    pub fn new() -> Self { Self { vals: [CValue::imm(CType::Int, 0); VALUE_STACK_CAP], top: 0 } }
+    pub fn new() -> Self { Self { vals: [CValue::imm(TYPE_INT, 0); VALUE_STACK_CAP], top: 0 } }
     pub fn push(&mut self, v: CValue) { self.vals[self.top] = v; self.top += 1; }
     #[track_caller]
     pub fn pop (&mut self) -> CValue  { self.top -= 1; self.vals[self.top] }
@@ -1800,15 +2490,17 @@ impl ValueStack {
 const MAX_LOCALS: usize = 128;
 
 #[derive(Clone, Copy)]
-pub struct Local {
+pub struct LocalEntry {
     pub hash: u64,
-    pub ty: CType,
+    pub ty: TypeRef,
     pub rbp_off: i32
 }
 
 pub struct LocalTable {
-    locals: SmallVec<[Local; MAX_LOCALS]>,
-    pub frame_bytes: i32,
+    locals:      SmallVec<[LocalEntry; MAX_LOCALS]>,
+    index:       IntMap<u64, u32>,              // hash -> index of most recent in current scope
+    scope_stack: Vec<Vec<(u64, Option<u32>)>>,  // stack of (hash, previous_index) per scope
+    frame_bytes: i32,
 }
 
 impl LocalTable {
@@ -1816,30 +2508,66 @@ impl LocalTable {
     pub fn new() -> Self {
         Self {
             locals: SmallVec::new(),
+            index: IntMap::default(),
+            scope_stack: vec![Default::default()],
             frame_bytes: 0
         }
     }
 
     #[inline]
-    pub fn alloc(&mut self, hash: u64, ty: CType) -> i32 {
-        self.frame_bytes += ty.size() as i32;
+    pub fn alloc(&mut self, hash: u64, ty: TypeRef, type_table: &TypeTable) -> i32 {
+        self.frame_bytes += type_table.size_of(ty) as i32;
         let rbp_off = -(self.frame_bytes);
-        self.locals.push(Local { hash, ty, rbp_off });
+
+        let idx = self.locals.len() as u32;
+        self.locals.push(LocalEntry { hash, ty, rbp_off });
+
+        if hash != 0 {
+            // Save previous index for this hash so we can restore on scope exit
+            let prev = self.index.insert(hash, idx);
+            if let Some(scope) = self.scope_stack.last_mut() {
+                scope.push((hash, prev));
+            }
+        }
+
         rbp_off
     }
 
     #[inline]
-    pub fn find(&self, hash: u64) -> Option<Local> {
-        self.locals.iter().rev().find(|var| var.hash == hash).copied()
+    pub fn find(&self, hash: u64) -> Option<LocalEntry> {
+        self.index.get(&hash).map(|&i| self.locals[i as usize])
+    }
+
+    #[inline]
+    pub fn push_scope(&mut self) {
+        self.scope_stack.push(Default::default());
+    }
+
+    #[inline]
+    pub fn pop_scope(&mut self) {
+        let Some(scope) = self.scope_stack.pop() else { return; };
+
+        //
+        // Restore previous index entries in reverse order
+        //
+        for (hash, prev) in scope.into_iter().rev() {
+            match prev {
+                Some(i) => { self.index.insert(hash, i); }
+                None    => { self.index.remove(&hash); }
+            }
+        }
+
+        // Frame space is permanent - don't shrink locals..
     }
 }
 
 bitflags::bitflags! {
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
     pub struct SymFlags: u8 {
         const DEFINED  = 0x1;
         const EXTERN   = 0x2;
         const VARIADIC = 0x4;
+        const STATIC   = 0x8;
     }
 }
 
@@ -1850,12 +2578,11 @@ pub struct Symbol {
     pub code_off:    u32,
     pub code_len:    u32,
 
+    // For procedures
+    pub func_ty:     TypeRef,
+
     pub name_off:    u32,
     pub name_len:    u16,
-
-    // For procedures
-    pub param_count: u8,
-    pub ret_ty:      CType,
 
     pub flags:       SymFlags
 }
@@ -1913,10 +2640,9 @@ impl SymTable {
         name: &str,
         code_off: u32, code_len: u32,
         flags: SymFlags,
-        param_count: Option<u8>,
-        ret_ty: Option<CType>
+        func_ty: Option<TypeRef>
     ) -> usize {
-        let hash = fnv1a_str(name);
+        let hash = hash_str(name);
         if let Some(&i) = self.index.get(&hash) {
             let s = &mut self.syms[i as usize];
             s.code_off = code_off;
@@ -1932,8 +2658,7 @@ impl SymTable {
             hash,
             name_off, name_len: name.len() as u16,
             code_off, code_len,
-            param_count: param_count.unwrap_or(0),
-            ret_ty: ret_ty.unwrap_or(CType::Void),
+            func_ty: func_ty.unwrap_or(TYPE_VOID),
             flags,
         });
         self.index.insert(hash, i as u32);
@@ -1971,18 +2696,21 @@ pub struct LoopContext {
 }
 
 #[derive(Copy, Clone)]
-pub struct GlobalVar {
+pub struct GlobalEntry {
     pub hash:     u64,
 
     pub data_off: u32,  // Offset into .data OR .bss
     pub name_off: u32,
     pub name_len: u16,
 
-    pub ty:       CType,
-    pub is_bss:   bool,
+    pub ty:       TypeRef,
+
+    // @BitFlagsCandidate
+    pub is_bss:    bool,
+    pub is_static: bool,
 }
 
-impl GlobalVar {
+impl GlobalEntry {
     #[inline]
     pub fn s<'a>(&self, buf: &'a [u8]) -> &'a str {
         unsafe {
@@ -1998,7 +2726,7 @@ impl GlobalVar {
 }
 
 pub struct GlobalTable {
-    pub vars:     SmallVec<[GlobalVar; 64]>,
+    pub vars:     SmallVec<[GlobalEntry; 64]>,
     index:        IntMap<u64, u32>,
     pub name_buf: Vec<u8>,
 }
@@ -2014,16 +2742,21 @@ impl GlobalTable {
     }
 
     #[inline]
-    pub fn find(&self, hash: u64) -> Option<GlobalVar> {
+    pub fn find(&self, hash: u64) -> Option<GlobalEntry> {
         self.index.get(&hash).map(|&i| self.vars[i as usize])
     }
 
     #[inline]
-    pub fn insert(&mut self, name: &str, hash: u64, ty: CType, data_off: u32, is_bss: bool) {
+    pub fn insert(&mut self, name: &str, hash: u64, ty: TypeRef, data_off: u32, is_bss: bool, is_static: bool) {
         let name_off = self.name_buf.len() as u32;
         self.name_buf.extend_from_slice(name.as_bytes());
         let i = self.vars.len() as u32;
-        self.vars.push(GlobalVar { hash, name_off, name_len: name.len() as u16, ty, data_off, is_bss });
+        self.vars.push(GlobalEntry {
+            hash,
+            name_off, name_len: name.len() as u16,
+            ty, data_off,
+            is_bss, is_static
+        });
         self.index.insert(hash, i);
     }
 }
@@ -2035,8 +2768,10 @@ pub struct Compiler {
     pub regs:          RegAlloc,
 
     // Reset per function
-    locals:  LocalTable,
-    ret_ty:  CType,
+    pub locals:        LocalTable,
+    pub ret_ty:        TypeRef,
+
+    pub type_table:    TypeTable,
 
     pub globals:       GlobalTable,
 
@@ -2067,19 +2802,33 @@ impl DerefMut for Compiler {
     fn deref_mut(&mut self) -> &mut PP { &mut self.pp }
 }
 
+#[allow(unused)]
+impl Compiler {  // TypeTable helpers
+    #[inline] fn ty(&self, id: TypeRef) -> &TypeEntry { self.type_table.get(id) }
+    #[inline] fn is_float(&self, id: TypeRef) -> bool { self.type_table.get(id).is_float() }
+    #[inline] fn is_integer(&self, id: TypeRef) -> bool { self.type_table.get(id).is_integer() }
+    #[inline] fn is_ptr(&self, id: TypeRef) -> bool { self.type_table.get(id).is_ptr() }
+    #[inline] fn size_of(&self, id: TypeRef) -> u32 { self.type_table.size_of(id) }
+    #[inline] fn align_of(&self, id: TypeRef) -> u32 { self.type_table.align_of(id) }
+    #[inline] fn is64(&self, id: TypeRef) -> bool { self.type_table.size_of(id) == 8 }
+    #[inline] fn get(&self, id: TypeRef) -> &TypeEntry { self.type_table.get(id) }
+    #[inline] fn get_kind(&self, id: TypeRef) -> TypeKind { self.type_table.get_kind(id) }
+}
+
 impl Compiler {
     #[inline]
     pub fn new(pp: PP) -> Self {
         Self {
             pp,
             loop_stack: Vec::new(),
+            type_table: TypeTable::new(),
             data: Vec::new(), globals: GlobalTable::new(),
             bss_size: 0, data_relocs: Vec::new(),
             buf: CodeBuf::new(), vstack: ValueStack::new(),
             regs: RegAlloc::new(), xmms: XmmAlloc::new(),
             syms: SymTable::new(), relocs: Vec::new(),
             rodata: Vec::new(), rodata_relocs: Vec::new(),
-            locals: LocalTable::new(), ret_ty: CType::Void,
+            locals: LocalTable::new(), ret_ty: TYPE_VOID,
         }
     }
 
@@ -2088,8 +2837,13 @@ impl Compiler {
     #[inline]
     fn expect(&mut self, kind: TK, what: &'static str) -> CResult<Token> {
         let t = self.current_token;
-        if t.kind == kind { self.next(); Ok(t) }
-        else { Err(CError::Expected { span: t.span, expected: what, got: self.s(t).to_owned() }) }
+        if t.kind == kind {
+            self.next(); Ok(t)
+        } else {
+            Err(CError::Expected {
+                span: t.span, expected: what, got: self.s(t).to_owned()
+            })
+        }
     }
 
     #[inline]
@@ -2101,29 +2855,95 @@ impl Compiler {
     fn at_eof(&self) -> bool { self.current_token.kind == TK::Eof }
 
     #[inline]
-    fn compile_type(&mut self) -> CResult<CType> {
-        let t = self.eat_ident("type name")?;
-        let base = match t.hash {
-            HASH_INT  => CType::Int,
-            HASH_LONG => CType::Long,
-            HASH_CHAR => CType::Char,
-            HASH_VOID => CType::Void,
-            HASH_FLOAT => CType::Float,
-            HASH_DOUBLE => CType::Double,
+    fn compile_type(&mut self) -> CResult<TypeRef> {
+        let mut quals = QualFlags::empty();
+        let mut kind  = None;
 
-            _ => return Err(CError::UnknownType {
-                span: t.span,
-                name: t.s(&self.pp.src_arena).to_owned()
-            }),
-        };
+        //
+        // Consume qualifiers and type keywords in any order.... Sigh.......
+        //
+        loop {
+            match self.current_token.kind {
+                TK::Ident if self.current_token.hash == HASH_CONST    => { quals |= QualFlags::CONST;    self.next(); }
+                TK::Ident if self.current_token.hash == HASH_UNSIGNED => { quals |= QualFlags::UNSIGNED; self.next(); }
+                TK::Ident if self.current_token.hash == HASH_VOLATILE => { quals |= QualFlags::VOLATILE; self.next(); }
+                TK::Ident if self.current_token.hash == HASH_RESTRICT => { quals |= QualFlags::RESTRICT; self.next(); }
+                TK::Ident if self.current_token.hash == HASH_SIGNED   => { self.next(); } // default, ignore
+                TK::Ident if self.current_token.hash == HASH_REGISTER => { self.next(); } // no-op, hint only
+                TK::Ident if self.current_token.hash == HASH_AUTO     => { self.next(); } // no-op, default storage
+                TK::Ident if self.current_token.hash == HASH_INLINE   => { self.next(); } // handle in compile_top_level
+                TK::Ident if self.current_token.hash == HASH_STATIC   => { self.next(); } // handle in compile_top_level
 
-        let mut depth = 0u8;
-        while self.current_token.kind == TK::Star {
-            self.next();
-            depth += 1;
+                TK::Ident  => {
+                    let t = self.current_token;
+                    match t.hash {
+                        HASH_INT    => { kind = Some(TypeKind::Int);    self.next(); }
+                        HASH_CHAR   => { kind = Some(TypeKind::Char);   self.next(); }
+                        HASH_SHORT  => { kind = Some(TypeKind::Short);  self.next(); }
+                        HASH_VOID   => { kind = Some(TypeKind::Void);   self.next(); }
+                        HASH_FLOAT  => { kind = Some(TypeKind::Float);  self.next(); }
+                        HASH_DOUBLE => { kind = Some(TypeKind::Double); self.next(); }
+                        HASH_LONG   => {
+                            self.next();
+                            if self.current_token.kind == TK::Ident && self.current_token.hash == HASH_LONG {
+                                self.next();
+                                kind = Some(TypeKind::LLong); // long long
+                            } else {
+                                kind = Some(TypeKind::Long);
+                            }
+                        }
+                        _ => {
+                            if kind.is_none() {
+                                return Err(CError::UnknownType {
+                                    span: t.span,
+                                    name: t.s(&self.pp.src_arena).to_owned()
+                                });
+                            }
+
+                            break;  // Next token is not a type keyword, stop
+                        }
+                    }
+                }
+
+                _ => break,
+            }
         }
 
-        if depth > 0 { Ok(CType::Ptr(depth)) } else { Ok(base) }
+        let kind = kind.unwrap_or(TypeKind::Int); // Default to int if only qualifiers seen... Sigh....
+
+        //
+        // Intern the base type
+        //
+        let mut id = self.type_table.intern(
+            kind,
+            quals,
+            TypeFlags::empty(),
+            TypeRef(0),
+            0,
+            0,
+        );
+
+        //
+        // Pointer declarators
+        //
+        while self.current_token.kind == TK::Star {
+            self.next();
+            let mut ptr_quals = QualFlags::empty();
+            if self.current_token.kind == TK::Ident && self.current_token.hash == HASH_CONST {
+                ptr_quals |= QualFlags::CONST;
+                self.next();
+            }
+            id = self.type_table.intern(
+                TypeKind::Ptr,
+                ptr_quals,
+                TypeFlags::empty(),
+                id,
+                0,
+                0,
+            );
+        }
+
+        Ok(id)
     }
 
     // Materialize a CValue into a register
@@ -2142,7 +2962,7 @@ impl Compiler {
             VK::Local | VK::RegInd => {
                 let base = v.reg.as_gp();
                 let r = self.regs.alloc(Span::POISONED)?;
-                self.buf.mov_load(r, base, v.offset, v.ty.is64());
+                self.emit_int_load(r, base, v.offset, v.ty);
                 if v.kind == VK::RegInd { self.regs.free(base); }
                 Ok(r)
             }
@@ -2163,9 +2983,9 @@ impl Compiler {
 
                 let xmm = self.xmms.alloc(Span::POISONED)?;
                 let rodata_off = self.rodata.len() as u32;
-                match v.ty {
-                    CType::Float  => self.rodata.extend_from_slice(&(v.fimm as f32).to_bits().to_le_bytes()),
-                    _             => self.rodata.extend_from_slice(&v.fimm.to_bits().to_le_bytes()),
+                match self.get_kind(v.ty) {
+                    TypeKind::Float => self.rodata.extend_from_slice(&(v.fimm as f32).to_bits().to_le_bytes()),
+                    _               => self.rodata.extend_from_slice(&v.fimm.to_bits().to_le_bytes()),
                 }
                 let text_off = self.emit_float_load_rip(xmm, v.ty) as _;
                 self.rodata_relocs.push(RodataReloc { text_off, rodata_off });
@@ -2184,14 +3004,19 @@ impl Compiler {
     }
 
     #[inline]
-    fn coerce_to_xmm(&mut self, v: CValue, target_ty: CType) -> CResult<XmmReg> {
-        if v.ty.is_float() {
+    fn coerce_to_xmm(&mut self, v: CValue, target_ty: TypeRef) -> CResult<XmmReg> {
+        let v_kind = self.get_kind(v.ty);
+        let target_kind = self.get_kind(target_ty);
+
+        if self.is_float(v.ty) {
             let r = self.force_xmm(v)?;
 
+            // @Incomplete
+
             // Still need to convert if types differ
-            if v.ty == CType::Double && target_ty == CType::Float {
+            if v_kind == TypeKind::Double && target_kind == TypeKind::Float {
                 self.buf.cvtsd2ss(r, r);
-            } else if v.ty == CType::Float && target_ty == CType::Double {
+            } else if v_kind == TypeKind::Float && target_kind == TypeKind::Double {
                 self.buf.cvtss2sd(r, r);
             }
 
@@ -2205,7 +3030,7 @@ impl Compiler {
         let xmm = self.xmms.alloc(Span::POISONED)?;
         self.buf.cvtsi2sd(xmm, gp);  // Always convert to double first
         self.regs.free(gp);
-        if target_ty == CType::Float {
+        if target_kind == TypeKind::Float {
             self.buf.cvtsd2ss(xmm, xmm);
         }
 
@@ -2221,13 +3046,13 @@ impl Compiler {
     }
 
     #[inline]
-    fn pop_reg(&mut self) -> CResult<(Reg, CType)> {
+    fn pop_reg(&mut self) -> CResult<(Reg, TypeRef)> {
         let v = self.vstack.pop();
         Ok((self.force_gp(v)?, v.ty))
     }
 
     #[inline]
-    fn pop_xmm(&mut self) -> CResult<(XmmReg, CType)> {
+    fn pop_xmm(&mut self) -> CResult<(XmmReg, TypeRef)> {
         let v = self.vstack.pop();
         Ok((self.force_xmm(v)?, v.ty))
     }
@@ -2243,9 +3068,28 @@ impl Compiler {
     }
 
     fn compile_top_level(&mut self) -> CResult<()> {
-        let is_extern = self.current_token.kind == TK::Ident &&
-                        self.current_token.hash == HASH_EXTERN;
-        if is_extern { self.next(); }
+        bitflags::bitflags! {
+            #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+            pub struct TopLevelFlags: u8 {
+                const EXTERN  = 0x2;
+                const STATIC  = 0x8;
+                const INLINE  = 0x10; // no-op
+            }
+        }
+
+        let mut top_flags = TopLevelFlags::empty();
+
+        //
+        // Consume specifiers
+        //
+        loop {
+            match self.current_token.kind {
+                TK::Ident if self.current_token.hash == HASH_EXTERN => { top_flags.insert(TopLevelFlags::EXTERN); self.next(); }
+                TK::Ident if self.current_token.hash == HASH_STATIC => { top_flags.insert(TopLevelFlags::STATIC); self.next(); }
+                TK::Ident if self.current_token.hash == HASH_INLINE => { top_flags.insert(TopLevelFlags::INLINE); self.next(); }
+                _ => break,
+            }
+        }
 
         let ret_ty   = self.compile_type()?;
         let name_tok = self.eat_ident("function or variable name")?;
@@ -2253,7 +3097,12 @@ impl Compiler {
         let hash     = name_tok.hash;
 
         if self.current_token.kind != TK::LParen {
-            self.compile_global_decl(ret_ty, &name, hash, is_extern)?;
+            self.compile_global_decl(
+                ret_ty,
+                &name, hash,
+                top_flags.contains(TopLevelFlags::EXTERN),
+                top_flags.contains(TopLevelFlags::STATIC),
+            )?;
             return Ok(());
         }
 
@@ -2264,24 +3113,31 @@ impl Compiler {
         let mut flags = SymFlags::empty();
         flags.set(SymFlags::VARIADIC, is_variadic);
 
-        if is_extern || self.current_token.kind == TK::SemiColon {
-            flags.insert(SymFlags::EXTERN);
+        if top_flags.contains(TopLevelFlags::STATIC) { flags.insert(SymFlags::STATIC) };
+        if top_flags.contains(TopLevelFlags::EXTERN) { flags.insert(SymFlags::EXTERN) };
 
+        let param_types = params.iter().map(|(ty, _)| *ty).collect::<SmallVec<[_; MAX_PARAMS]>>();
+        let param_start = self.type_table.alloc_params(&param_types);
+
+        let func_ty = self.type_table.make_func(ret_ty, param_start, params.len() as _, is_variadic);
+
+        if flags.contains(SymFlags::EXTERN) || self.current_token.kind == TK::SemiColon {
             self.expect(TK::SemiColon, "';'")?;
-            self.syms.insert(&name, 0, 0, flags, Some(params.len() as _), Some(ret_ty));
+            self.syms.insert(&name, 0, 0, flags, Some(func_ty));
             return Ok(());
         }
 
         flags.insert(SymFlags::DEFINED);
-        self.compile_func(&name, hash, ret_ty, params, flags)
+        self.compile_func(&name, hash, ret_ty, func_ty, params, flags)
     }
 
     fn compile_func(
         &mut self,
         name: &str,
         _hash: u64,
-        ret_ty: CType,
-        params: Vec<(CType,u64)>,
+        ret_ty: TypeRef,
+        func_ty: TypeRef,
+        params: Vec<(TypeRef, u64)>,
         flags: SymFlags
     ) -> CResult<()> {
         self.locals = LocalTable::new();
@@ -2300,8 +3156,7 @@ impl Compiler {
             code_off,
             code_len,
             flags,
-            Some(params.len() as _),
-            Some(ret_ty)
+            Some(func_ty)
         );
 
         //
@@ -2316,8 +3171,8 @@ impl Compiler {
         // Spill args to stack (convenience, for pop_reg)
         //
         for (i, (ty, phash)) in params.iter().enumerate() {
-            let off = self.locals.alloc(*phash, *ty);
-            self.buf.mov_store(Reg::Rbp, off, ARG_REGS[i], ty.is64());
+            let off = self.locals.alloc(*phash, *ty, &self.type_table);
+            self.emit_int_store(Reg::Rbp, off, ARG_REGS[i], *ty);
         }
 
         self.expect(TK::LCurly, "'{'")?;
@@ -2350,7 +3205,7 @@ impl Compiler {
     }
 
     #[inline]
-    fn compile_params(&mut self) -> CResult<(Vec<(CType,u64)>, bool)> {
+    fn compile_params(&mut self) -> CResult<(Vec<(TypeRef, u64)>, bool)> {
         let mut params = Vec::new();
         if self.current_token.kind == TK::RParen {
             return Ok((params, false));
@@ -2407,9 +3262,15 @@ impl Compiler {
     #[inline]
     fn compile_block(&mut self) -> CResult<()> {
         self.expect(TK::LCurly, "'{'")?;
+        self.locals.push_scope();
+
         while self.current_token.kind != TK::RCurly && !self.at_eof() {
-            if let Err(e) = self.compile_stmt() { e.emit(&self.pp.src_arena); self.recover(); }
+            if let Err(e) = self.compile_stmt() {
+                e.emit(&self.pp.src_arena); self.recover();
+            }
         }
+
+        self.locals.pop_scope();
         self.expect(TK::RCurly, "'}'").map(|_| ())
     }
 
@@ -2421,7 +3282,7 @@ impl Compiler {
             self.compile_expr()?;
 
             let ret_ty = self.ret_ty;
-            if ret_ty.is_float() {
+            if self.is_float(ret_ty) {
                 let v = self.vstack.pop();
                 let r = self.coerce_to_xmm(v, ret_ty)?;
 
@@ -2571,9 +3432,14 @@ impl Compiler {
         self.next(); // for
         self.expect(TK::LParen, "'('")?;
 
+
         //
         // Init
         //
+
+        // Init has its own scope
+        self.locals.push_scope();
+
         if self.current_token.kind != TK::SemiColon {
             let h = self.current_token.hash;
             if HASH_TYPES.contains(&h) {
@@ -2636,6 +3502,7 @@ impl Compiler {
         let post_top = self.buf.pos();
 
         let ctx = self.loop_stack.pop().unwrap();
+
         // Patch continue jumps to post
         for patch in ctx.continue_patches {
             self.buf.patch_rel32(patch, post_top);
@@ -2685,18 +3552,23 @@ impl Compiler {
         let jne_patch = self.buf.jne_rel32();
         self.buf.patch_rel32(jne_patch, loop_top);
 
+        // Patch continue jumps to end
         for patch in ctx.break_patches {
             self.buf.patch_rel32(patch, self.buf.pos());
         }
+
+        // Exit init's scope
+        self.locals.pop_scope();
 
         Ok(())
     }
 
     #[inline]
-    fn compile_store_impl(&mut self, base: Reg, off: i32, ty: CType, keep: bool) -> CResult<()> {
-        if !ty.is_float() {
+    fn compile_store_impl(&mut self, base: Reg, off: i32, ty: TypeRef, keep: bool) -> CResult<()> {
+        if !self.is_float(ty) {
             let (r, _) = self.pop_reg()?;
-            self.buf.mov_store(base, off, r, ty.is64());
+
+            self.emit_int_store(base, off, r, ty);
 
             if keep {
                 self.vstack.push(CValue::gp(ty, r));
@@ -2722,17 +3594,24 @@ impl Compiler {
     }
 
     #[inline]
-    fn compile_store(&mut self, base: Reg, off: i32, ty: CType) -> CResult<()> {
+    fn compile_store(&mut self, base: Reg, off: i32, ty: TypeRef) -> CResult<()> {
         self.compile_store_impl(base, off, ty, false)
     }
 
     #[inline]
-    fn compile_store_keep(&mut self, base: Reg, off: i32, ty: CType) -> CResult<()> {
+    fn compile_store_keep(&mut self, base: Reg, off: i32, ty: TypeRef) -> CResult<()> {
         self.compile_store_impl(base, off, ty, true)
     }
 
     #[inline]
-    fn compile_global_decl(&mut self, ty: CType, name: &str, hash: u64, is_extern: bool) -> CResult<()> {
+    fn compile_global_decl(
+        &mut self,
+        ty_ref: TypeRef,
+        name: &str,
+        hash: u64,
+        is_extern: bool,
+        is_static: bool,
+    ) -> CResult<()> {
         if is_extern {
             //
             // @Incomplete
@@ -2746,69 +3625,76 @@ impl Compiler {
             return Ok(());
         }
 
-        if self.current_token.kind == TK::Eq {  // @Refactor
-            self.next();
-            // Constant initializer only
-            let (is_bss, data_off) = match ty {
-                CType::Int | CType::Long | CType::Char => {
-                    let v = self.parse_const_int()?;
-                    if v == 0 {
-                        let off = self.bss_size;
-                        self.bss_size += ty.size() as usize;
-                        (true, off as u32)
-                    } else {
-                        let off = self.data.len() as u32;
-                        match ty {
-                            CType::Char => self.data.push(v as u8),
-                            CType::Int  => self.data.extend_from_slice(&(v as i32).to_le_bytes()),
-                            _           => self.data.extend_from_slice(&v.to_le_bytes()),
-                        }
-                        (false, off)
-                    }
-                }
+        let size = self.size_of(ty_ref) as usize;
 
-                CType::Float => {
-                    let v = self.parse_const_float()?;
-                    if v == 0.0 {
-                        let off = self.bss_size;
-                        self.bss_size += 4;
-                        (true, off as u32)
-                    } else {
-                        let off = self.data.len() as u32;
-                        self.data.extend_from_slice(&(v as f32).to_bits().to_le_bytes());
-                        (false, off)
-                    }
-                }
-
-                CType::Double => {
-                    let v = self.parse_const_float()?;
-                    if v == 0.0 {
-                        let off = self.bss_size;
-                        self.bss_size += 8;
-                        (true, off as u32)
-                    } else {
-                        let off = self.data.len() as u32;
-                        self.data.extend_from_slice(&v.to_bits().to_le_bytes());
-                        (false, off)
-                    }
-                }
-
-                _ => {
-                    while !matches!(self.current_token.kind, TK::SemiColon | TK::Eof) {
-                        self.next();
-                    }
-                    self.expect(TK::SemiColon, "';'")?;
-                    return Ok(());
-                }
-            };
-
-            self.globals.insert(name, hash, ty, data_off, is_bss);
-        } else {
-            // no initializer - goes in .bss
+        let has_initializer = self.current_token.kind == TK::Eq;
+        if !has_initializer {
+            // No initializer - goes into .bss
             let off = self.bss_size;
-            self.bss_size += ty.size() as usize;
-            self.globals.insert(name, hash, ty, off as u32, true);
+
+            self.bss_size += size;
+            self.globals.insert(name, hash, ty_ref, off as u32, true, is_static);
+
+            self.expect(TK::SemiColon, "';'")?;
+            return Ok(())
         }
+
+        self.next();
+
+        let ty = self.get_kind(ty_ref);
+
+        //
+        // Constant initializer only (@Incomplete: Check that)
+        //
+
+        let (is_bss, data_off) = match ty {
+            TypeKind::Int | TypeKind::Short | TypeKind::Long |
+            TypeKind::LLong | TypeKind::Char => {
+                let v = self.parse_const_int()?;
+                if v == 0 {
+                    let off = self.bss_size;
+                    self.bss_size += size;
+
+                    (true, off as u32)
+                } else {
+                    let off = self.data.len() as u32;
+                    match ty {
+                        TypeKind::Char => self.data.push(v as u8),
+                        TypeKind::Short => self.data.extend_from_slice(&(v as i16).to_le_bytes()),
+                        TypeKind::Int  => self.data.extend_from_slice(&(v as i32).to_le_bytes()),
+                        _               => self.data.extend_from_slice(&v.to_le_bytes()),
+                    }
+
+                    (false, off)
+                }
+            }
+
+            TypeKind::Float | TypeKind::Double => {
+                let v = self.parse_const_float()?;
+                if v == 0.0 {
+                    let off = self.bss_size;
+                    self.bss_size += self.type_table.size_of(ty_ref) as usize;
+                    (true, off as u32)
+                } else {
+                    let off = self.data.len() as u32;
+                    match ty {
+                        TypeKind::Float => self.data.extend_from_slice(&(v as f32).to_bits().to_le_bytes()),
+                        _               => self.data.extend_from_slice(&v.to_bits().to_le_bytes()),
+                    }
+                    (false, off)
+                }
+            }
+
+            _ => {  // @Incomplete
+                while !matches!(self.current_token.kind, TK::SemiColon | TK::Eof) {
+                    self.next();
+                }
+                self.expect(TK::SemiColon, "';'")?;
+                return Ok(());
+            }
+        };
+
+        self.globals.insert(name, hash, ty_ref, data_off, is_bss, is_static);
 
         self.expect(TK::SemiColon, "';'")?;
         Ok(())
@@ -2819,7 +3705,7 @@ impl Compiler {
         let ty       = self.compile_type()?;
         let name_tok = self.eat_ident("variable name")?;
         let hash     = name_tok.hash;
-        let off      = self.locals.alloc(hash, ty);
+        let off      = self.locals.alloc(hash, ty, &self.type_table);
         if self.current_token.kind == TK::Eq {
             self.next();
             self.compile_expr()?;
@@ -2848,17 +3734,6 @@ impl Compiler {
             }
         }
     }
-
-    // -- Expressions -------------------------------------------
-    //
-    // prec table (low -> high):
-    //   1  = += -= *= /= &= |=  (right-assoc)
-    //   2  == !=
-    //   3  < > <= >=
-    //   4  + -
-    //   5  * /
-    //   prefix:  - & *
-    //   primary: NUMBER IDENT CALL STRING ( expr )
 
     #[inline]
     fn compile_expr(&mut self) -> CResult<()> {
@@ -2893,7 +3768,7 @@ impl Compiler {
             _ => self.compile_primary()?,
         }
 
-        loop {
+        loop {  // @Refactor
             let (prec, right) = match Self::op_prec(self.current_token.kind) {
                 Some(p) if p.0 >= min_prec => p,
                 _ => break,
@@ -2919,13 +3794,13 @@ impl Compiler {
                     let rhs = self.vstack.pop();
                     let base = lhs.reg.as_gp();
 
-                    if lhs.ty.is_float() {
+                    if self.is_float(lhs.ty) {
                         let tmp = self.xmms.alloc(span)?;
                         self.emit_float_load(tmp, base, lhs.offset, lhs.ty);
                         self.vstack.push(CValue::xmm(lhs.ty, tmp));
                     } else {
                         let tmp = self.regs.alloc(span)?;
-                        self.buf.mov_load(tmp, base, lhs.offset, lhs.ty.is64());
+                        self.emit_int_load(tmp, base, lhs.offset, lhs.ty);
                         self.vstack.push(CValue::gp(lhs.ty, tmp));
                     }
 
@@ -2985,7 +3860,7 @@ impl Compiler {
                 }
 
                 self.buf.patch_rel32(done, self.buf.pos());
-                self.vstack.push(CValue::gp(CType::Int, result));
+                self.vstack.push(CValue::gp(TYPE_INT, result));
             } else {
                 self.compile_expr_impl(if right { prec } else { prec + 1 })?;
                 self.compile_binop(op, span)?;
@@ -3002,12 +3877,16 @@ impl Compiler {
                 let rhs = self.vstack.pop();
                 let lhs = self.vstack.pop();
 
-                if lhs.ty.is_float() {
-                    let target_ty = if lhs.ty == CType::Double || rhs.ty == CType::Double {
-                        CType::Double
+                if self.is_float(lhs.ty) {
+                    let lhs_or_rhs_is_double = self.get_kind(lhs.ty) == TypeKind::Double ||
+                        self.get_kind(rhs.ty) == TypeKind::Double;
+
+                    let target_ty = if lhs_or_rhs_is_double {
+                        TYPE_DOUBLE
                     } else {
-                        CType::Float
+                        TYPE_FLOAT
                     };
+
                     let l = self.coerce_to_xmm(lhs, target_ty)?;
                     let r = self.coerce_to_xmm(rhs, target_ty)?;
 
@@ -3060,6 +3939,7 @@ impl Compiler {
                     TK::Xor    => self.buf.xor_rr(lhs, rhs),
                     _ => unreachable!(),
                 }
+
                 self.regs.free(rhs);
                 self.vstack.push(CValue::gp(ty, lhs));
             }
@@ -3075,14 +3955,14 @@ impl Compiler {
 
     // Promote float->double if types differ. Returns the common type.
     #[inline]
-    fn normalize_xmm(&mut self, l: XmmReg, lty: CType, r: XmmReg, rty: CType) -> CType {
+    fn normalize_xmm(&mut self, l: XmmReg, lty: TypeRef, r: XmmReg, rty: TypeRef) -> TypeRef {
         if lty == rty { return lty; }
 
         // One is float, one is double - promote float to double
-        if lty == CType::Float { self.buf.cvtss2sd(l, l); }
-        if rty == CType::Float { self.buf.cvtss2sd(r, r); }
+        if self.get_kind(lty) == TypeKind::Float { self.buf.cvtss2sd(l, l); }
+        if self.get_kind(rty) == TypeKind::Float { self.buf.cvtss2sd(r, r); }
 
-        CType::Double
+        TYPE_DOUBLE
     }
 
     #[inline]
@@ -3090,11 +3970,14 @@ impl Compiler {
         let rhs = self.vstack.pop();
         let lhs = self.vstack.pop();
 
-        if lhs.ty.is_float() || rhs.ty.is_float() {
-            let target_ty = if lhs.ty == CType::Double || rhs.ty == CType::Double {
-                CType::Double
+        let lhs_ty = self.get_kind(lhs.ty);
+        let rhs_ty = self.get_kind(rhs.ty);
+
+        if self.is_float(lhs.ty) || self.is_float(rhs.ty) {
+            let target_ty = if lhs_ty == TypeKind::Double || rhs_ty == TypeKind::Double {
+                TYPE_DOUBLE
             } else {
-                CType::Float
+                TYPE_FLOAT
             };
             let l = self.coerce_to_xmm(lhs, target_ty)?;
             let r = self.coerce_to_xmm(rhs, target_ty)?;
@@ -3117,7 +4000,7 @@ impl Compiler {
             self.buf.setcc(dst, setcc);
 
             self.buf.movzx_rr(dst, dst);
-            self.vstack.push(CValue::gp(CType::Int, dst));
+            self.vstack.push(CValue::gp(TYPE_INT, dst));
         } else {
             let r = self.force_gp(rhs)?;
             let l = self.force_gp(lhs)?;
@@ -3136,7 +4019,7 @@ impl Compiler {
             self.buf.movzx_rr(l, l);
 
             self.regs.free(r);
-            self.vstack.push(CValue::gp(CType::Int, l));
+            self.vstack.push(CValue::gp(TYPE_INT, l));
         }
 
         Ok(())
@@ -3150,7 +4033,7 @@ impl Compiler {
                 self.compile_unary()?;
 
                 let v = self.vstack.peek();
-                if !v.ty.is_float() {
+                if !self.is_float(v.ty) {
                     let (r, ty) = self.pop_reg()?;
                     self.buf.neg_r(r);
                     self.vstack.push(CValue::gp(ty, r));
@@ -3159,11 +4042,11 @@ impl Compiler {
 
                 let (r, ty) = self.pop_xmm()?;
 
-                // xorpd xmm, [rip + sign_mask]  - flip sign bit
+                // xorpd xmm, [rip + sign_mask] - flip sign bit
                 let rodata_off = self.rodata.len() as u32;
-                match ty {
-                    CType::Float  => self.rodata.extend_from_slice(&0x80000000u32.to_le_bytes()),
-                    _             => self.rodata.extend_from_slice(&0x8000000000000000u64.to_le_bytes()),
+                match self.get_kind(ty) {
+                    TypeKind::Float => self.rodata.extend_from_slice(&0x80000000u32.to_le_bytes()),
+                    _               => self.rodata.extend_from_slice(&0x8000000000000000u64.to_le_bytes()),
                 }
 
                 let text_off = self.emit_float_xor_rip(r, ty) as _;
@@ -3184,7 +4067,9 @@ impl Compiler {
                 let dst = self.regs.alloc(span)?;
                 self.buf.lea(dst, base, v.offset);
                 if v.kind == VK::RegInd { self.regs.free(base); }
-                self.vstack.push(CValue::gp(CType::Ptr(1), dst));
+
+                let new_type = self.type_table.ptr_to(v.ty);
+                self.vstack.push(CValue::gp(new_type, dst));
             }
 
             TK::BitNot => {
@@ -3207,13 +4092,13 @@ impl Compiler {
                 let base = v.reg.as_gp();
                 let (r, ty) = (self.regs.alloc(Span::POISONED)?, v.ty);
 
-                self.buf.mov_load(r, base, v.offset, ty.is64());
+                self.emit_int_load(r, base, v.offset, ty);
                 match op {
                     TK::PlusPlus  => self.buf.add_ri8(r, 1),
                     _             => self.buf.add_ri8(r, -1),
                 }
 
-                self.buf.mov_store(base, v.offset, r, ty.is64());
+                self.buf.mov_store(base, v.offset, r, self.is64(ty));
                 if v.kind == VK::RegInd { self.regs.free(base); }  // free address reg
                 self.vstack.push(CValue::gp(ty, r));
             }
@@ -3225,11 +4110,7 @@ impl Compiler {
                 let v  = self.vstack.pop();
                 let r  = self.force_gp(v)?;
 
-                let ty = match v.ty {
-                    CType::Ptr(d) if d > 1 => CType::Ptr(d-1),
-                    CType::Ptr(_)          => CType::Long,
-                    other => other
-                };
+                let ty = self.type_table.deref(v.ty);
 
                 self.vstack.push(CValue::regind(ty, r, 0));
             }
@@ -3241,65 +4122,88 @@ impl Compiler {
     }
 
     #[inline]
-    fn emit_float_load(&mut self, dst: XmmReg, base: Reg, off: i32, ty: CType) {
-        match ty {
-            CType::Float => self.buf.movss_load(dst, base, off),
-            _            => self.buf.movsd_load(dst, base, off),
+    fn emit_int_load(&mut self, dst: Reg, base: Reg, off: i32, ty: TypeRef) {
+        let unsigned = self.type_table.is_unsigned(ty);
+        match self.type_table.size_of(ty) {
+            1 => if unsigned { self.buf.movzx8_load(dst, base, off) }
+                 else        { self.buf.movsx8_load(dst, base, off) },
+            2 => if unsigned { self.buf.movzx16_load(dst, base, off) }
+                 else        { self.buf.movsx16_load(dst, base, off) },
+            4 => self.buf.mov_load(dst, base, off, false),
+            _ => self.buf.mov_load(dst, base, off, true),
         }
     }
 
     #[inline]
-    fn emit_float_store(&mut self, base: Reg, off: i32, src: XmmReg, ty: CType) {
-        match ty {
-            CType::Float => self.buf.movss_store(base, off, src),
+    fn emit_int_store(&mut self, base: Reg, off: i32, src: Reg, ty: TypeRef) {
+        match self.type_table.size_of(ty) {
+            1 => self.buf.mov_store8(base, off, src),
+            2 => self.buf.mov_store16(base, off, src),
+            4 => self.buf.mov_store(base, off, src, false),
+            _ => self.buf.mov_store(base, off, src, true),
+        }
+    }
+
+    #[inline]
+    fn emit_float_load(&mut self, dst: XmmReg, base: Reg, off: i32, ty: TypeRef) {
+        match self.get_kind(ty) {
+            TypeKind::Float => self.buf.movss_load(dst, base, off),
+            _               => self.buf.movsd_load(dst, base, off),
+        }
+    }
+
+    #[inline]
+    fn emit_float_store(&mut self, base: Reg, off: i32, src: XmmReg, ty: TypeRef) {
+        match self.get_kind(ty) {
+            TypeKind::Float => self.buf.movss_store(base, off, src),
             _            => self.buf.movsd_store(base, off, src),
         }
     }
 
     #[inline]
-    fn emit_float_mov(&mut self, dst: XmmReg, src: XmmReg, ty: CType) {
+    fn emit_float_mov(&mut self, dst: XmmReg, src: XmmReg, ty: TypeRef) {
         if dst == src { return; }
-        match ty {
-            CType::Float => self.buf.movss_rr(dst, src),
+        match self.get_kind(ty) {
+            TypeKind::Float => self.buf.movss_rr(dst, src),
             _            => self.buf.movsd_rr(dst, src),
         }
     }
 
     #[inline]
-    fn emit_float_load_rip(&mut self, dst: XmmReg, ty: CType) -> usize {
-        match ty {
-            CType::Float => self.buf.movss_load_rip(dst),
+    fn emit_float_load_rip(&mut self, dst: XmmReg, ty: TypeRef) -> usize {
+        match self.get_kind(ty) {
+            TypeKind::Float => self.buf.movss_load_rip(dst),
             _            => self.buf.movsd_load_rip(dst),
         }
     }
 
     #[inline]
-    fn emit_float_xor_rip(&mut self, dst: XmmReg, ty: CType) -> usize {
-        match ty {
-            CType::Float => self.buf.xorps_rip(dst),
+    fn emit_float_xor_rip(&mut self, dst: XmmReg, ty: TypeRef) -> usize {
+        match self.get_kind(ty) {
+            TypeKind::Float => self.buf.xorps_rip(dst),
             _            => self.buf.xorpd_rip(dst),
         }
     }
 
     #[inline]
-    fn emit_float_arith(&mut self, op: TK, dst: XmmReg, src: XmmReg, ty: CType) {
-        match (op, ty) {
-            (TK::Plus,  CType::Float) => self.buf.addss(dst, src),
+    fn emit_float_arith(&mut self, op: TK, dst: XmmReg, src: XmmReg, ty: TypeRef) {
+        match (op, self.get_kind(ty)) {
+            (TK::Plus,  TypeKind::Float) => self.buf.addss(dst, src),
             (TK::Plus,  _)            => self.buf.addsd(dst, src),
-            (TK::Minus, CType::Float) => self.buf.subss(dst, src),
+            (TK::Minus, TypeKind::Float) => self.buf.subss(dst, src),
             (TK::Minus, _)            => self.buf.subsd(dst, src),
-            (TK::Star,  CType::Float) => self.buf.mulss(dst, src),
+            (TK::Star,  TypeKind::Float) => self.buf.mulss(dst, src),
             (TK::Star,  _)            => self.buf.mulsd(dst, src),
-            (TK::Slash, CType::Float) => self.buf.divss(dst, src),
+            (TK::Slash, TypeKind::Float) => self.buf.divss(dst, src),
             (TK::Slash, _)            => self.buf.divsd(dst, src),
             _ => unreachable!()
         }
     }
 
     #[inline]
-    fn emit_float_cmp(&mut self, lhs: XmmReg, rhs: XmmReg, ty: CType) {
-        match ty {
-            CType::Float => self.buf.ucomiss(lhs, rhs),
+    fn emit_float_cmp(&mut self, lhs: XmmReg, rhs: XmmReg, ty: TypeRef) {
+        match self.get_kind(ty) {
+            TypeKind::Float => self.buf.ucomiss(lhs, rhs),
             _            => self.buf.ucomisd(lhs, rhs),
         }
     }
@@ -3324,10 +4228,13 @@ impl Compiler {
 
     #[inline]
     fn parse_number_int(s: &str) -> i64 {
+        let s = s.trim_end_matches(|c| matches!(c, 'u'|'U'|'l'|'L'));  // @Incomplete
         if s.starts_with("0x") || s.starts_with("0X") {
-            i64::from_str_radix(&s[2..], 16).unwrap_or(0)
+            u64::from_str_radix(&s[2..], 16).unwrap_or(0) as i64
         } else {
-            s.parse().unwrap_or(0)
+            s.parse::<u64>().map(|v| v as i64)
+                .or_else(|_| s.parse::<i64>())
+                .unwrap_or(0)
         }
     }
 
@@ -3348,7 +4255,7 @@ impl Compiler {
 
                 if !is_float_literal {
                     let v = Self::parse_number_int(s);
-                    self.vstack.push(CValue::imm(CType::Int, v));
+                    self.vstack.push(CValue::imm(TYPE_INT, v));
                     return Ok(())
                 }
 
@@ -3358,7 +4265,7 @@ impl Compiler {
 
                 let is_float = s.ends_with('f');
                 let v = Self::parse_number_float(s);
-                let ty = if is_float { CType::Float } else { CType::Double };
+                let ty = if is_float { TYPE_FLOAT } else { TYPE_DOUBLE };
 
                 let rodata_off = self.rodata.len() as u32;
                 if is_float {
@@ -3410,7 +4317,33 @@ impl Compiler {
                 let patch = self.buf.lea_rip(dst);
                 self.rodata_relocs.push(RodataReloc { text_off: patch as _, rodata_off });
 
-                self.vstack.push(CValue::gp(CType::Ptr(1), dst));
+                let new_type = self.type_table.ptr_to(TYPE_CHAR);
+                self.vstack.push(CValue::gp(new_type, dst));
+            }
+
+            TK::CharLit => {
+                let t = self.next();
+
+                let raw = t.s(&self.pp.src_arena);
+                let s = &raw[1..raw.len()-1];
+
+                let val = if s.starts_with('\\') {
+                    match s.as_bytes().get(1) {
+                        Some(b'n')  => b'\n' as i64,
+                        Some(b't')  => b'\t' as i64,
+                        Some(b'r')  => b'\r' as i64,
+                        Some(b'0')  => b'\0' as i64,
+                        Some(b'\\') => b'\\' as i64,
+                        Some(b'\'') => b'\'' as i64,
+                        Some(b'"')  => b'"'  as i64,
+                        Some(&b)    => b as i64,
+                        None        => 0,
+                    }
+                } else {
+                    s.as_bytes()[0] as i64
+                };
+
+                self.vstack.push(CValue::imm(TYPE_INT, val));
             }
 
             TK::Ident => {
@@ -3433,7 +4366,8 @@ impl Compiler {
 
                         // return OLD value, but store incremented
                         let old = self.regs.alloc(Span::POISONED)?;
-                        self.buf.mov_load(old, base, v.offset, v.ty.is64());
+
+                        self.emit_int_load(old, base, v.offset, v.ty);
                         let tmp = self.regs.alloc(Span::POISONED)?;
 
                         self.buf.mov_rr(tmp, old);
@@ -3442,7 +4376,7 @@ impl Compiler {
                             _             => self.buf.add_ri8(tmp, -1),
                         }
 
-                        self.buf.mov_store(base, v.offset, tmp, v.ty.is64());
+                        self.emit_int_store(base, v.offset, tmp, v.ty);
                         self.regs.free(tmp);
                         if v.kind == VK::RegInd { self.regs.free(base); }  // free address reg
                         self.vstack.push(CValue::gp(v.ty, old));
@@ -3495,9 +4429,9 @@ impl Compiler {
                 VK::Reg | VK::RegInd => {}
             }
 
-            let spill_off = self.locals.alloc(0, v.ty);
+            let spill_off = self.locals.alloc(0, v.ty, &self.type_table);
 
-            if v.ty.is_float() {
+            if self.is_float(v.ty) {
                 let xmm = if v.kind == VK::RegInd {
                     let tmp = self.xmms.alloc(Span::POISONED)?;
                     self.emit_float_load(tmp, v.reg.as_gp(), v.offset, v.ty);
@@ -3514,14 +4448,14 @@ impl Compiler {
             } else {
                 let gp = if v.kind == VK::RegInd {
                     let tmp = self.regs.alloc(Span::POISONED)?;
-                    self.buf.mov_load(tmp, v.reg.as_gp(), v.offset, v.ty.is64());
+                    self.emit_int_load(tmp, v.reg.as_gp(), v.offset, v.ty);
                     self.regs.free(v.reg.as_gp());
                     tmp
                 } else {
                     v.reg.as_gp()
                 };
 
-                self.buf.mov_store(Reg::Rbp, spill_off, gp, v.ty.is64());
+                self.emit_int_store(Reg::Rbp, spill_off, gp, v.ty);
 
                 if v.kind == VK::RegInd { self.regs.free(gp); }
                 // VK::Reg gp is freed by clobber_caller_save - don't free here
@@ -3542,7 +4476,13 @@ impl Compiler {
                 name: self.s(name_tok).to_owned()
             });
         };
+
         let sym = self.syms[sym_index];
+
+        let func_type_entry = self.type_table.get(sym.func_ty);
+        let param_count = func_type_entry.param_count();
+        let ret_ty = func_type_entry.ret_ty();
+
         let is_variadic = sym.flags.contains(SymFlags::VARIADIC);
 
         //
@@ -3550,7 +4490,7 @@ impl Compiler {
         // This ensures nested calls don't clobber already-evaluated args
         //
         //                             off   ty
-        let mut arg_spills: SmallVec<[(i32, CType); 8]> = SmallVec::new();
+        let mut arg_spills: SmallVec<[(i32, TypeRef); 8]> = SmallVec::new();
 
         while self.current_token.kind != TK::RParen && !self.at_eof() {
             //
@@ -3561,15 +4501,15 @@ impl Compiler {
             self.compile_expr()?;
             let v = self.vstack.pop();
 
-            let spill_off = self.locals.alloc(0, v.ty);
+            let spill_off = self.locals.alloc(0, v.ty, &self.type_table);
 
-            if v.ty.is_float() {
+            if self.is_float(v.ty) {
                 let xmm = self.coerce_to_xmm(v, v.ty)?;
                 self.emit_float_store(Reg::Rbp, spill_off, xmm, v.ty);
                 self.xmms.free(xmm);
             } else {
                 let gp = self.force_gp(v)?;
-                self.buf.mov_store(Reg::Rbp, spill_off, gp, v.ty.is64());
+                self.emit_int_store(Reg::Rbp, spill_off, gp, v.ty);
                 self.regs.free(gp);
             }
 
@@ -3586,17 +4526,17 @@ impl Compiler {
         //
         let total_argc = arg_spills.len();
         if sym.flags.contains(SymFlags::VARIADIC) {
-            if total_argc < sym.param_count as usize {
+            if total_argc < param_count as usize {
                 return Err(CError::ArgumentCountMismatch {
                     span: call_span,
-                    expected: sym.param_count as _,
+                    expected: param_count as _,
                     name: name_tok.s(&self.src_arena).to_owned()
                 });
             }
-        } else if total_argc != sym.param_count as usize {
+        } else if total_argc != param_count as usize {
             return Err(CError::ArgumentCountMismatch {
                 span: call_span,
-                expected: sym.param_count as _,
+                expected: param_count as _,
                 name: name_tok.s(&self.src_arena).to_owned()
             });
         }
@@ -3614,7 +4554,8 @@ impl Compiler {
         let mut xmm_argc = 0usize;
 
         for &(spill_off, ty) in &arg_spills {
-            if ty.is_float() {
+            let kind = self.get_kind(ty);
+            if kind.is_float() {
                 if xmm_argc >= XMM_ARG_REGS.len() {
                     return Err(CError::ArgumentCountMismatch {
                         span: call_span,
@@ -3624,7 +4565,7 @@ impl Compiler {
                 }
 
                 let dst = XMM_ARG_REGS[xmm_argc];
-                if is_variadic && ty == CType::Float {
+                if is_variadic && kind == TypeKind::Float {
                     //
                     // Load as float then promote to double (SYSV)
                     //
@@ -3644,7 +4585,7 @@ impl Compiler {
                     });
                 }
 
-                self.buf.mov_load(ARG_REGS[argc], Reg::Rbp, spill_off, ty.is64());
+                self.emit_int_load(ARG_REGS[argc], Reg::Rbp, spill_off, ty);
                 argc += 1;
             }
         }
@@ -3674,12 +4615,12 @@ impl Compiler {
         self.regs.clobber_caller_save();
         self.xmms.clobber_caller_save();
 
-        if sym.ret_ty.is_float() {
+        if self.is_float(ret_ty) {
             self.xmms.mark(XmmReg::Xmm0);
-            self.vstack.push(CValue::xmm(sym.ret_ty, XmmReg::Xmm0));
+            self.vstack.push(CValue::xmm(ret_ty, XmmReg::Xmm0));
         } else {
             self.regs.mark(Reg::Rax);
-            self.vstack.push(CValue::gp(sym.ret_ty, Reg::Rax));
+            self.vstack.push(CValue::gp(ret_ty, Reg::Rax));
         }
 
         Ok(())
@@ -3737,9 +4678,9 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
     //   [1]  STT_SECTION .rodata
     //   [2]  STT_SECTION .data
     //   [3]  STT_SECTION .bss
-    //   [4+] defined functions (global)
-    //   [..] global variables (STT_OBJECT)
-    //   [..] extern functions (undefined)
+    //   [4+] defined functions (static, global)
+    //   [..] global variables  (STT_OBJECT)
+    //   [..] extern functions  (undefined)
     //
     const SHN_UNDEF:   u16 = 0;
     const SHN_TEXT:    u16 = 1;
@@ -3770,25 +4711,48 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
     const RODATA_SYM: u64 = 1;
     const DATA_SYM:   u64 = 2;
     const BSS_SYM:    u64 = 3;
+
+    //
+    // First go static functions and globals
+    //
+    for (i, sym) in c.syms.iter().enumerate() {
+        if !sym.flags.contains(SymFlags::DEFINED) { continue; }
+
+        if !sym.flags.contains(SymFlags::STATIC)  { continue; }
+
+        push_sym(&mut symtab, sym_name_index[i], (STB_LOCAL<<4)|STT_FUNC, SHN_TEXT, sym.code_off as u64, sym.code_len as u64);
+    }
+    for (i, gv) in c.globals.vars.iter().enumerate() {
+        if !gv.is_static { continue; }
+
+        let shndx = if gv.is_bss { SHN_BSS } else { SHN_DATA };
+        push_sym(&mut symtab, gvar_name_index[i], (STB_LOCAL<<4)|STT_OBJECT, shndx, gv.data_off as u64, c.size_of(gv.ty) as u64);
+    }
+
+    //
+    // Now go global functions and globals
+    //
+
     let first_global_sym = symtab.len() / 24; // sh_info = this
 
     for (i, sym) in c.syms.iter().enumerate() {
         if !sym.flags.contains(SymFlags::DEFINED) { continue; }
-        push_sym(&mut symtab, sym_name_index[i], (STB_GLOBAL<<4)|STT_FUNC,
-            SHN_TEXT, sym.code_off as u64, sym.code_len as u64);
+        if sym.flags.contains(SymFlags::STATIC)  { continue; }
+
+        push_sym(&mut symtab, sym_name_index[i], (STB_GLOBAL<<4)|STT_FUNC, SHN_TEXT, sym.code_off as u64, sym.code_len as u64);
     }
     for (i, gv) in c.globals.vars.iter().enumerate() {
+        if gv.is_static { continue; }
+
         let shndx = if gv.is_bss { SHN_BSS } else { SHN_DATA };
-        push_sym(&mut symtab, gvar_name_index[i], (STB_GLOBAL<<4)|STT_OBJECT,
-            shndx, gv.data_off as u64, gv.ty.size() as u64);
+        push_sym(&mut symtab, gvar_name_index[i], (STB_GLOBAL<<4)|STT_OBJECT, shndx, gv.data_off as u64, c.size_of(gv.ty) as u64);
     }
 
     let mut elf_sym_index = vec![0u32; nsyms];
     for (i, sym) in c.syms.iter().enumerate() {
         if !sym.flags.contains(SymFlags::EXTERN) { continue; }
         elf_sym_index[i] = (symtab.len() / 24) as u32;
-        push_sym(&mut symtab, sym_name_index[i], (STB_GLOBAL<<4)|STT_NOTYPE,
-            SHN_UNDEF, 0, 0);
+        push_sym(&mut symtab, sym_name_index[i], (STB_GLOBAL<<4)|STT_NOTYPE, SHN_UNDEF, 0, 0);
     }
 
     //
@@ -3928,6 +4892,11 @@ fn main() {
     let mut c = Compiler::new(pp);
     c.compile();
 
+    #[cfg(debug_assertions)]
+    for (i, e) in c.type_table.entries.iter() {
+        eprintln!("  [{i:?}] {:?} quals={:?} ref_={:?} extra={}", e.kind, e.quals, e.ref_, e.extra);
+    }
+
     if args.contains(&"-run".into()) {
         run_main(c);
         return;
@@ -4013,7 +4982,7 @@ fn run_main(mut c: Compiler) {
     //
     // Find main
     //
-    let main_hash = fnv1a_str("main");
+    let main_hash = hash_str("main");
     let Some(main_idx) = c.syms.find(main_hash) else {
         eprintln!("no main function"); std::process::exit(1);
     };
