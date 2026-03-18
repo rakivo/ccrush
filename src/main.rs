@@ -1,7 +1,7 @@
 // TODO(#2): Structs
 // TODO(#4): Enums
 // TODO(#1): sizeof
-// TODO: Function pointers
+// TODO(#3): Function pointers
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -5678,4 +5678,3 @@ fn run_main(mut c: Compiler) {
     let result = f(argc, argv.as_ptr(), envp.as_ptr());
     std::process::exit(result);
 }
-    
