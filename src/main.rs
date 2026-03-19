@@ -3,17 +3,28 @@
 // TODO(#3): Function pointers
 // TODO(#7): __attribute__
 // TODO(#9): Global extern symbols
+// TODO: Stringify, __VA_ARGS__ and concat in macros
+// TODO: String interning for .rodata
+
+//
+// @Cleanup: There's lots of unnecessary std::process::exit calls.
+//
+
+#[cfg(all(feature = "mimalloc"))]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::io;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::ops::{Deref, DerefMut};
 
+use smallstr::SmallString;
 use thiserror::Error;
 use smallvec::{SmallVec, smallvec};
 use nohash_hasher::IntMap;
 use memmap2::{Mmap, MmapMut, MmapOptions};
-use cranelift_entity::{PrimaryMap, entity_impl};
+use cranelift_entity::{PrimaryMap, SparseMap, SparseMapValue, entity_impl};
 
 #[inline(always)]
 const fn hash_str(s: &str) -> u64 {
@@ -33,8 +44,8 @@ const fn align(x: usize, a: usize) -> usize {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct FileId(pub u32);
-entity_impl!(FileId);
+pub struct FileRef(pub u32);
+entity_impl!(FileRef);
 
 pub struct FileInfo {
     pub path: Box<str>,
@@ -61,7 +72,7 @@ impl FileData {
 }
 
 pub struct SrcArena {
-    pub files: PrimaryMap<FileId, FileInfo>,
+    pub files: PrimaryMap<FileRef, FileInfo>,
 }
 
 impl SrcArena {
@@ -72,7 +83,7 @@ impl SrcArena {
 
     // for real files - mmap'd, no copy
     #[inline]
-    pub fn add_path(&mut self, path: &Path) -> io::Result<FileId> {
+    pub fn add_path(&mut self, path: &Path) -> io::Result<FileRef> {
         let file    = File::open(path)?;
         let mapping = unsafe { MmapOptions::new().map(&file)? };
 
@@ -86,7 +97,7 @@ impl SrcArena {
 
     // for tests / PP::from_bytes - owned vec, no mmap
     #[inline]
-    pub fn add_bytes(&mut self, path: &Path, src: impl Into<Box<[u8]>>) -> FileId {
+    pub fn add_bytes(&mut self, path: &Path, src: impl Into<Box<[u8]>>) -> FileRef {
         let src = src.into();
 
         self.files.push(FileInfo {
@@ -96,14 +107,14 @@ impl SrcArena {
     }
 
     #[inline]
-    pub fn slice(&self, fid: FileId) -> &[u8] {
+    pub fn slice(&self, fid: FileRef) -> &[u8] {
         self.files[fid].data.slice()
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
-    pub file: FileId,
+    pub file: FileRef,
     pub start: u32,
     pub len: u16
 }
@@ -440,7 +451,7 @@ const HASHES_THAT_START_TYPES: &[u64] = &[
     HASH_CONST, HASH_STATIC, HASH_RESTRICT, HASH_VOLATILE, HASH_AUTO, HASH_REGISTER
 ];
 
-fn lex(src: &[u8], pos: &mut usize, fid: FileId) -> Token {
+fn lex(src: &[u8], pos: &mut usize, fid: FileRef) -> Token {
     // Skip spaces, tabs, carriage returns.  Written as an iterator so LLVM
     // can auto-vectorise the scan rather than emitting a byte-at-a-time loop.
     let skip = src[*pos..].iter().position(|&b| !matches!(b, b' '|b'\t'|b'\r')).unwrap_or(src.len() - *pos);
@@ -719,7 +730,7 @@ impl MacroTable {
 //
 
 struct FileFrame {
-    fid: FileId,
+    fid: FileRef,
     pos: usize
 }
 
@@ -810,7 +821,7 @@ impl PP {
     }
 
     #[inline]
-    fn init(arena: SrcArena, fid: FileId) -> Self {
+    fn init(arena: SrcArena, fid: FileRef) -> Self {
         let mut pp = Self {
             src_arena: arena,
             ifdef_stack:        Vec::new(),
@@ -1345,7 +1356,7 @@ impl PP {
         self.skip_line();
 
         let cur_dir = {
-            let fid  = self.file_stack.last().map(|f| f.fid).unwrap_or(FileId(0));
+            let fid  = self.file_stack.last().map(|f| f.fid).unwrap_or(FileRef(0));
             let parent_dir_opt = Path::new(self.src_arena.files[fid].path.as_ref()).parent();
             parent_dir_opt.unwrap_or(Path::new(".")).to_owned()
         };
@@ -2191,6 +2202,11 @@ impl TypeKind {
     }
 
     #[inline]
+    pub fn is_array(self) -> bool {
+        self == TypeKind::Array
+    }
+
+    #[inline]
     pub fn is_scalar(self) -> bool {
         self.is_integer() || self.is_float() || self.is_ptr()
     }
@@ -2242,6 +2258,7 @@ impl DerefMut for TypeEntry {
 impl TypeEntry {
     // Typed accessors with debug assertions
     #[inline]
+    #[track_caller]
     pub fn pointee(&self) -> TypeRef {
         debug_assert!(self.kind == TypeKind::Ptr);
         self.ref_
@@ -2310,46 +2327,58 @@ impl TypeEntry {
     }
 }
 
-pub const TYPE_VOID:   TypeRef = TypeRef(0);
-pub const TYPE_BOOL:   TypeRef = TypeRef(1);
-pub const TYPE_CHAR:   TypeRef = TypeRef(2);
-pub const TYPE_UCHAR:  TypeRef = TypeRef(3);
-pub const TYPE_SHORT:  TypeRef = TypeRef(4);
-pub const TYPE_USHORT: TypeRef = TypeRef(5);
-pub const TYPE_INT:    TypeRef = TypeRef(6);
-pub const TYPE_UINT:   TypeRef = TypeRef(7);
-pub const TYPE_LONG:   TypeRef = TypeRef(8);
-pub const TYPE_ULONG:  TypeRef = TypeRef(9);
-pub const TYPE_LLONG:  TypeRef = TypeRef(10);
-pub const TYPE_ULLONG: TypeRef = TypeRef(11);
-pub const TYPE_FLOAT:  TypeRef = TypeRef(12);
-pub const TYPE_DOUBLE: TypeRef = TypeRef(13);
+pub const TYPE_VOID:    TypeRef = TypeRef(0);
+pub const TYPE_BOOL:    TypeRef = TypeRef(1);
+pub const TYPE_CHAR:    TypeRef = TypeRef(2);
+pub const TYPE_UCHAR:   TypeRef = TypeRef(3);
+pub const TYPE_SHORT:   TypeRef = TypeRef(4);
+pub const TYPE_USHORT:  TypeRef = TypeRef(5);
+pub const TYPE_INT:     TypeRef = TypeRef(6);
+pub const TYPE_UINT:    TypeRef = TypeRef(7);
+pub const TYPE_LONG:    TypeRef = TypeRef(8);
+pub const TYPE_ULONG:   TypeRef = TypeRef(9);
+pub const TYPE_LLONG:   TypeRef = TypeRef(10);
+pub const TYPE_ULLONG:  TypeRef = TypeRef(11);
+pub const TYPE_FLOAT:   TypeRef = TypeRef(12);
+pub const TYPE_DOUBLE:  TypeRef = TypeRef(13);
+pub const TYPE_LDOUBLE: TypeRef = TypeRef(14);
 
 #[inline(always)]
 pub const fn is_type_builtin(ty: TypeRef) -> bool {
-    ty.0 <= 13
+    ty.0 <= 14
 }
 
 #[inline(always)]
 pub const fn unsign_a_builtin_type(ty: TypeRef) -> TypeRef {
     match ty {
-        TYPE_VOID => TYPE_VOID,
-        TYPE_BOOL => TYPE_BOOL,
-        TYPE_CHAR => TYPE_UCHAR,
-        TYPE_UCHAR => TYPE_UCHAR,
-        TYPE_SHORT => TYPE_USHORT,
-        TYPE_USHORT => TYPE_USHORT,
-        TYPE_INT => TYPE_UINT,
-        TYPE_UINT => TYPE_UINT,
-        TYPE_LONG => TYPE_ULONG,
-        TYPE_ULONG => TYPE_ULONG,
-        TYPE_LLONG => TYPE_ULLONG,
-        TYPE_ULLONG => TYPE_ULLONG,
-        TYPE_FLOAT => TYPE_FLOAT,
-        TYPE_DOUBLE => TYPE_DOUBLE,
+        TYPE_VOID    => TYPE_VOID,
+        TYPE_BOOL    => TYPE_BOOL,
+        TYPE_CHAR    => TYPE_UCHAR,
+        TYPE_UCHAR   => TYPE_UCHAR,
+        TYPE_SHORT   => TYPE_USHORT,
+        TYPE_USHORT  => TYPE_USHORT,
+        TYPE_INT     => TYPE_UINT,
+        TYPE_UINT    => TYPE_UINT,
+        TYPE_LONG    => TYPE_ULONG,
+        TYPE_ULONG   => TYPE_ULONG,
+        TYPE_LLONG   => TYPE_ULLONG,
+        TYPE_ULLONG  => TYPE_ULLONG,
+        TYPE_FLOAT   => TYPE_FLOAT,
+        TYPE_DOUBLE  => TYPE_DOUBLE,
+        TYPE_LDOUBLE => TYPE_DOUBLE,
 
         _ => unsafe { std::hint::unreachable_unchecked() }
     }
+}
+
+pub struct TypeName {
+    ty: TypeRef,
+    s: SmallString<[u8; 23]>
+}
+
+impl SparseMapValue<TypeRef> for TypeName {
+    #[inline(always)]
+    fn key(&self) -> TypeRef { self.ty }
 }
 
 pub struct TypeTable {
@@ -2363,8 +2392,19 @@ pub struct TypeTable {
     map_used: usize,
 
     // Sub-pools
-    pub field_pool:  Vec<FieldEntry>,
-    pub param_pool:  Vec<TypeRef>,    // Func param types
+    pub field_pool: Vec<FieldEntry>,
+    pub param_pool: Vec<TypeRef>,    // Func param types
+
+    //
+    // Typenames @Note:
+    //
+    // Since all types are deduplicated, and typedefs
+    // like: `typedef unsigned u32` do NOT produce a new TypeRef,
+    // the only way for type names to be correct (without false associations
+    // with scalars for example), they need to be associated ONLY with struct/enum/union types,
+    // since those can introduce new names, i.e. `typedef struct { ref: u32; } TypeRef`
+    //
+    pub type_names: SparseMap<TypeRef, TypeName>
 }
 
 impl TypeTable {
@@ -2384,6 +2424,7 @@ impl TypeTable {
             map_used:   0,
             field_pool: Vec::with_capacity(256),
             param_pool: Vec::with_capacity(256),
+            type_names: SparseMap::new()
         };
 
         // Pre-intern primitives so their TypeRefs are stable constants
@@ -2411,6 +2452,7 @@ impl TypeTable {
             (LLong, Q::UNSIGNED),   // 11
             (Float, Q::empty()),    // 12
             (Double,Q::empty()),    // 13
+            (LDouble,Q::empty()),   // 14
         ] {
             self.intern(
                 kind,
@@ -2539,8 +2581,30 @@ impl TypeTable {
     #[inline]
     pub fn qualify(&mut self, ty: TypeRef, quals: QualFlags) -> TypeRef {
         if quals.is_empty() { return ty; }
+
         let e = *self.get(ty);
         self.intern(e.kind, e.quals | quals, e.flags, e.ref_, e.extra, e.extra2)
+    }
+
+    #[inline]
+    pub fn set_type_name(&mut self, ty: TypeRef, name: impl Into<SmallString<[u8; 23]>>) {
+        if is_type_builtin(ty) { return; }   // Just reject it....
+
+        self.type_names.insert(TypeName { ty, s: name.into() });
+    }
+
+    #[inline]
+    pub fn get_type_name(&self, ty: TypeRef) -> Option<&str> {
+        self.type_names.get(ty).map(|e| e.s.as_str())
+    }
+
+    #[inline]
+    pub fn associate_type_name(&mut self, parent: TypeRef, child: TypeRef) {   // @Memory
+        if is_type_builtin(parent) || is_type_builtin(child) { return; }   // Just reject it....
+
+        let Some(s) = self.get_type_name(parent) else { return; };
+
+        self.type_names.insert(TypeName { ty: child, s: s.into() });
     }
 
     #[inline]
@@ -2805,6 +2869,165 @@ impl TypeTable {
     pub fn param_slice(&self, start: u32, count: u32) -> &[TypeRef] {
         let s = start as usize;
         &self.param_pool[s..s + count as usize]
+    }
+
+    //
+    //
+    //
+    // The biggest sigh in history, because WHO THE FUCK CAME UP WITH THIS FUCKING GRAMMAR???????
+    //
+    // Sigh......................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    // ..........................................................................
+    //
+    //
+    //
+
+    fn build_type_parts(&self, id: TypeRef, left: &mut String, right: &mut String) {
+        use core::fmt::Write as _;
+        use TypeKind::*;
+
+        let e = self.get(id);
+
+        if let Some(type_name) = self.get_type_name(id) {
+            // @Cutnpaste from below
+            if e.quals.contains(QualFlags::CONST)    { left.push_str("const ");    }
+            if e.quals.contains(QualFlags::VOLATILE) { left.push_str("volatile "); }
+            if e.quals.contains(QualFlags::UNSIGNED) { left.push_str("unsigned "); }
+
+            left.push_str(type_name);
+
+            return;
+        }
+
+        match e.kind {
+            Void  | Bool   | Char    | Int    | Short | Long | LLong |
+            Float | Double | LDouble | Struct | Union | Enum => {
+                if e.quals.contains(QualFlags::CONST)    { left.push_str("const ");    }
+                if e.quals.contains(QualFlags::VOLATILE) { left.push_str("volatile "); }
+                if e.quals.contains(QualFlags::UNSIGNED) { left.push_str("unsigned "); }
+
+                left.push_str(match e.kind {
+                    Void    => "void",
+                    Bool    => "bool",
+                    Char    => "char",
+                    Int     => "int",
+                    Short   => "short",
+                    Long    => "long",
+                    LLong   => "long long",
+                    Float   => "float",
+                    Double  => "double",
+                    LDouble => "long double",
+                    Struct  => self.get_type_name(id).unwrap_or("struct <anonymous>"),
+                    Union   => self.get_type_name(id).unwrap_or("union <anonymous>"),
+                    Enum    => self.get_type_name(id).unwrap_or("enum <anonymous>"),
+                    _       => unsafe { std::hint::unreachable_unchecked() }
+                });
+            }
+
+            Ptr => {
+                let mut ptr_tok = "*".to_owned();
+                if e.quals.contains(QualFlags::CONST)    { ptr_tok.push_str(" const");    }
+                if e.quals.contains(QualFlags::VOLATILE) { ptr_tok.push_str(" volatile"); }
+                if e.quals.contains(QualFlags::RESTRICT) { ptr_tok.push_str(" restrict"); }
+
+                let pointee = e.pointee();
+                if matches!(self.get(pointee).kind, Array | Func) {
+                    //
+                    // Pointer to array/func - needs parens: int (*)[10]
+                    //
+
+                    let mut inner_left  = String::new();
+                    let mut inner_right = String::new();
+                    self.build_type_parts(pointee, &mut inner_left, &mut inner_right);
+
+                    _ = write!(left, "{inner_left} ({ptr_tok}");
+                    right.insert_str(0, &format!("){inner_right}"));
+                } else {
+                    self.build_type_parts(pointee, left, right);
+                    _ = write!(left, " {ptr_tok}");
+                }
+            }
+
+            Array => {
+                let len = e.array_len();
+                let arr_tok = if len > 0 { format!("[{len}]") } else { String::from("[]") };
+                right.insert_str(0, &arr_tok);
+                self.build_type_parts(e.elem(), left, right);
+            }
+
+            Func => {
+                //
+                // Build param list into right: (int, float, ...)
+                //
+
+                let mut params = "(".to_owned();
+
+                let start = e.param_start() as usize;
+                let count = e.param_count() as usize;
+                for i in 0..count {
+                    if i > 0 { params.push_str(", "); }
+                    let param_ty = self.param_pool[start + i];
+                    let mut pl = String::new();
+                    let mut pr = String::new();
+                    self.build_type_parts(param_ty, &mut pl, &mut pr);
+                    params.push_str(&pl);
+                    params.push_str(&pr);
+                }
+
+                if e.flags.contains(TypeFlags::VARIADIC) {
+                    if count > 0 { params.push_str(", "); }
+                    params.push_str("...");
+                }
+
+                params.push(')');
+
+                right.insert_str(0, &params);
+                self.build_type_parts(e.ret_ty(), left, right);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn display_type(&self, id: TypeRef, f: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        let mut left  = String::new();
+        let mut right = String::new();
+        self.build_type_parts(id, &mut left, &mut right);
+        write!(f, "{left}{right}")
+    }
+
+    #[inline]
+    pub fn to_string(&self, id: TypeRef) -> String {
+        let mut s = String::new();
+        self.display_type(id, &mut s).unwrap();
+        s
     }
 }
 
@@ -3898,6 +4121,7 @@ impl Compiler {  // TypeTable helpers
     #[inline] fn is_float(&self, id: TypeRef) -> bool { self.type_table.get(id).is_float() }
     #[inline] fn is_integer(&self, id: TypeRef) -> bool { self.type_table.get(id).is_integer() }
     #[inline] fn is_ptr(&self, id: TypeRef) -> bool { self.type_table.get(id).is_ptr() }
+    #[inline] fn is_array(&self, id: TypeRef) -> bool { self.type_table.get(id).is_array() }
     #[inline] fn size_of(&self, id: TypeRef) -> u32 { self.type_table.size_of(id) }
     #[inline] fn align_of(&self, id: TypeRef) -> u32 { self.type_table.align_of(id) }
     #[inline] fn is64(&self, id: TypeRef) -> bool { self.type_table.size_of(id) == 8 }
@@ -4338,7 +4562,7 @@ impl Compiler {
         while self.current_token.kind != TK::RCurly && !self.at_eof() {
             if let Err(e) = self.compile_stmt() {
                 e.emit(&self.pp.src_arena);
-                self.recover();
+                std::process::exit(1);
             }
         }
         self.expect(TK::RCurly, "'}'")?;
@@ -4429,7 +4653,8 @@ impl Compiler {
 
         while self.current_token.kind != TK::RCurly && !self.at_eof() {
             if let Err(e) = self.compile_stmt() {
-                e.emit(&self.pp.src_arena); self.recover();
+                e.emit(&self.pp.src_arena);
+                std::process::exit(1);
             }
         }
 
@@ -4790,6 +5015,18 @@ impl Compiler {
 
         self.expect(TK::SemiColon, "';'")?;
         self.typedefs.insert(name.hash, ty);
+
+        if matches!(
+            self.get_kind(ty),
+            TypeKind::Struct | TypeKind::Union | TypeKind::Enum
+        ) {
+            //
+            // @Note: See typenames note in TypeTable's struct definition.
+            //
+
+            let name: SmallString<_> = name.s(&self.src_arena).into();
+            self.type_table.set_type_name(ty, name);
+        }
 
         Ok(())
     }
@@ -5297,17 +5534,6 @@ impl Compiler {
     }
 
     #[inline]
-    fn recover(&mut self) {
-        loop {
-            match self.current_token.kind {
-                TK::Eof | TK::RCurly => break,
-                TK::SemiColon => { self.next(); break; }
-                _ => { self.next(); }
-            }
-        }
-    }
-
-    #[inline]
     const fn op_prec(k: TK) -> Option<(u8, bool)> {
         match k {
             TK::Eq     | TK::PlusEq  | TK::MinusEq  |
@@ -5460,13 +5686,40 @@ impl Compiler {
     }
 
     #[inline]
+    fn decay_array_type(&mut self, ty: TypeRef) -> TypeRef {
+        if self.type_table.get_kind(ty) != TypeKind::Array {
+            return ty;
+        }
+
+        let arr     = self.type_table.get(ty);
+        let elem_ty = arr.elem();
+
+        //
+        // Array-level quals (const/volatile) transfer to the pointee
+        // while restrict is dropped.
+        //
+        let inherited = arr.quals - QualFlags::RESTRICT;
+        let elem_ty = if inherited.is_empty() {
+            elem_ty
+        } else {
+            // Merge with any quals already on the element type
+            let existing = self.type_table.get(elem_ty).quals;
+            self.type_table.qualify(elem_ty, existing | inherited)
+        };
+
+        let ptr_ty = self.type_table.ptr_to(elem_ty);
+        self.type_table.associate_type_name(ty, ptr_ty);
+
+        ptr_ty
+    }
+
+    #[inline]
     fn decay_array(&mut self, v: CValue) -> CResult<CValue> {
         if self.type_table.get_kind(v.ty) != TypeKind::Array {
             return Ok(v);
         }
 
-        let elem_ty = self.type_table.get(v.ty).elem();
-        let ptr_ty  = self.type_table.ptr_to(elem_ty);
+        let ptr_ty = self.decay_array_type(v.ty);
 
         match v.kind {
             VK::Local | VK::RegInd => {
@@ -5905,10 +6158,18 @@ impl Compiler {
             }
 
             TK::Star => {
-                self.next();
+                let star = self.next();
                 self.compile_unary()?;
 
-                let v  = self.pop_vstack_and_decay_array()?;
+                let v = self.pop_vstack_and_decay_array()?;
+                if !(self.is_ptr(v.ty) || self.is_array(v.ty)) {
+                    return Err(CError::Expected {
+                        span: star.span,
+                        expected: "array or pointer",
+                        got: self.type_table.to_string(v.ty)
+                    })
+                }
+
                 let r  = self.force_gp(v)?;
                 let ty = self.type_table.deref(v.ty);
 
@@ -6262,8 +6523,7 @@ impl Compiler {
                         self.type_table.get_kind(gv.ty) == TypeKind::Array
                     {
                         // Array: push as Reg (already have the address from lea_rip)
-                        let elem_ty = self.type_table.get(gv.ty).elem();
-                        let ptr_ty  = self.type_table.ptr_to(elem_ty);
+                        let ptr_ty = self.decay_array_type(gv.ty);
                         self.vstack.push(CValue::gp(ptr_ty, dst));
                     } else {
                         self.vstack.push(CValue::regind(gv.ty, dst, 0));
@@ -6312,7 +6572,7 @@ impl Compiler {
                 _ => return Err(CError::Expected {
                     span: self.current_token.span,
                     expected: "array or pointer",
-                    got: format!("{:?}", self.type_table.get_kind(ptr.ty))
+                    got: self.type_table.to_string(ptr.ty)
                 })
             };
 
