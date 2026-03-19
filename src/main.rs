@@ -3,7 +3,6 @@
 // TODO(#1): sizeof
 // TODO(#6): typedef
 // TODO(#3): Function pointers
-// TODO(#8): ifdef, ifndef, if defined, etc
 // TODO(#7): __attribute__
 // TODO(#9): Global extern symbols
 
