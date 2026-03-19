@@ -4,7 +4,7 @@
 // TODO(#7): __attribute__
 // TODO(#9): Global extern symbols
 // TODO(#10): Stringify, __VA_ARGS__ and concat in macros
-// TODO: String interning for .rodata
+// TODO(#11): String interning for .rodata
 
 //
 // @Cleanup: There's lots of unnecessary std::process::exit calls.
@@ -7213,4 +7213,3 @@ fn run_main(mut c: Compiler) {
     let result = f(argc, argv_ptr, envp_ptr);
     std::process::exit(result);
 }
-     
