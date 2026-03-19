@@ -422,6 +422,8 @@ const HASH_WARNING:  u64 = hash_str("warning");
 const HASH_IF:       u64 = hash_str("if");
 const HASH_FOR:      u64 = hash_str("for");
 const HASH_WHILE:    u64 = hash_str("while");
+const HASH_SIZEOF:   u64 = hash_str("sizeof");
+const HASH_TYPEOF:   u64 = hash_str("typeof");
 const HASH_ELSE:     u64 = hash_str("else");
 const HASH_ELIF:     u64 = hash_str("elif");
 const HASH_ENDIF:    u64 = hash_str("endif");
@@ -433,6 +435,7 @@ const HASHES_THAT_START_TYPES: &[u64] = &[
     HASH_FLOAT, HASH_DOUBLE, HASH_SHORT,
 
     HASH_STRUCT,
+    HASH_TYPEOF,
     HASH_TYPEDEF,
 
     // Qualifiers can start a type too...... Sigh.............
@@ -3875,6 +3878,8 @@ pub struct Compiler {
     pub rodata:        Vec<u8>,
     pub rodata_relocs: Vec<RodataReloc>,
 
+    pub dont_decay_types_of_array_globals_to_pointers: bool,   // @KindaHack, used in sizeof
+
     pub pp:            PP,
 }
 
@@ -3918,6 +3923,7 @@ impl Compiler {
             syms: SymTable::new(), relocs: Vec::new(),
             rodata: Vec::new(), rodata_relocs: Vec::new(),
             locals: LocalTable::new(), ret_ty: TYPE_VOID,
+            dont_decay_types_of_array_globals_to_pointers: false
         }
     }
 
@@ -3954,6 +3960,16 @@ impl Compiler {
             i   += 1;
         }
         len
+    }
+
+    #[inline]
+    fn parse_expr_and_get_its_type(&mut self) -> CResult<TypeRef> {
+        self.with_rollback(|c| {
+            c.dont_decay_types_of_array_globals_to_pointers = true;
+            c.compile_expr()?;
+            c.dont_decay_types_of_array_globals_to_pointers = false;
+            Ok(c.vstack.pop().ty)
+        })
     }
 
     #[inline]
@@ -3994,6 +4010,17 @@ impl Compiler {
                 HASH_AUTO     => { self.next(); } // default storage, no-op
                 HASH_INLINE   => { self.next(); } // handled in compile_top_level
                 HASH_STATIC   => { self.next(); } // handled in compile_top_level
+
+                HASH_TYPEOF => {
+                    self.next(); // typeof
+
+                    let mut has_parens = false;
+                    if self.current_token.kind == TK::LParen { self.next(); has_parens = true }
+
+                    ty = Some(self.parse_expr_and_get_its_type()?);
+
+                    if has_parens { self.expect(TK::RParen, "')'")?; }
+                }
 
                 //
                 // Only try typedef lookup if we haven't seen a base type yet,
@@ -4417,6 +4444,9 @@ impl Compiler {
     fn compile_return(&mut self) -> CResult<()> {
         self.next(); // return
 
+        let mut has_parens = false;
+        if self.current_token.kind == TK::LParen { self.next(); has_parens = true }
+
         if self.current_token.kind != TK::SemiColon {
             self.compile_expr()?;
 
@@ -4435,6 +4465,8 @@ impl Compiler {
                 self.regs.free(r);
             }
         }
+
+        if has_parens { self.expect(TK::RParen, "')'")?; }
 
         self.expect(TK::SemiColon, "';'")?;
         self.buf.mov_rr(Reg::Rsp, Reg::Rbp);
@@ -6169,7 +6201,22 @@ impl Compiler {
             TK::Ident => {
                 let name_tok = self.next();
                 let hash     = name_tok.hash;
-                if self.current_token.kind == TK::LParen {
+
+                if hash == HASH_SIZEOF {
+                    let mut has_parens = false;
+                    if self.current_token.kind == TK::LParen { self.next(); has_parens = true }
+
+                    let ty = if self.can_hash_start_a_type(self.current_token.hash) {
+                        self.compile_type()?
+                    } else {
+                        self.parse_expr_and_get_its_type()?
+                    };
+
+                    if has_parens { self.expect(TK::RParen, "')'")?; }
+
+                    let size = self.type_table.size_of(ty);
+                    self.vstack.push(CValue::imm(TYPE_INT, size as _));
+                } else if self.current_token.kind == TK::LParen {
                     self.compile_call(hash, name_tok)?;
                 } else if let Some(lv) = self.locals.find(hash) {
                     self.vstack.push(CValue::local(lv.ty, lv.rbp_off));
@@ -6214,7 +6261,9 @@ impl Compiler {
                         is_bss:   gv.is_bss,
                     });
 
-                    if self.type_table.get_kind(gv.ty) == TypeKind::Array {
+                    if !self.dont_decay_types_of_array_globals_to_pointers &&
+                        self.type_table.get_kind(gv.ty) == TypeKind::Array
+                    {
                         // Array: push as Reg (already have the address from lea_rip)
                         let elem_ty = self.type_table.get(gv.ty).elem();
                         let ptr_ty  = self.type_table.ptr_to(elem_ty);
