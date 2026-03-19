@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::ops::{Deref, DerefMut};
 
 use thiserror::Error;
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 use nohash_hasher::IntMap;
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use cranelift_entity::{PrimaryMap, entity_impl};
@@ -2325,6 +2325,33 @@ pub const TYPE_ULLONG: TypeRef = TypeRef(11);
 pub const TYPE_FLOAT:  TypeRef = TypeRef(12);
 pub const TYPE_DOUBLE: TypeRef = TypeRef(13);
 
+#[inline(always)]
+pub const fn is_type_builtin(ty: TypeRef) -> bool {
+    ty.0 <= 13
+}
+
+#[inline(always)]
+pub const fn unsign_a_builtin_type(ty: TypeRef) -> TypeRef {
+    match ty {
+        TYPE_VOID => TYPE_VOID,
+        TYPE_BOOL => TYPE_BOOL,
+        TYPE_CHAR => TYPE_UCHAR,
+        TYPE_UCHAR => TYPE_UCHAR,
+        TYPE_SHORT => TYPE_USHORT,
+        TYPE_USHORT => TYPE_USHORT,
+        TYPE_INT => TYPE_UINT,
+        TYPE_UINT => TYPE_UINT,
+        TYPE_LONG => TYPE_ULONG,
+        TYPE_ULONG => TYPE_ULONG,
+        TYPE_LLONG => TYPE_ULLONG,
+        TYPE_ULLONG => TYPE_ULLONG,
+        TYPE_FLOAT => TYPE_FLOAT,
+        TYPE_DOUBLE => TYPE_DOUBLE,
+
+        _ => unsafe { std::hint::unreachable_unchecked() }
+    }
+}
+
 pub struct TypeTable {
     // Flat pool - index is TypeRef
     entries: PrimaryMap<TypeRef, TypeEntry>,
@@ -2507,6 +2534,13 @@ impl TypeTable {
     ) -> TypeRef {
         let e = TypeEntry { kind, quals, flags, ref_, _pad: 0, extra, extra2 };
         self.intern_raw(e)
+    }
+
+    #[inline]
+    pub fn qualify(&mut self, ty: TypeRef, quals: QualFlags) -> TypeRef {
+        if quals.is_empty() { return ty; }
+        let e = *self.get(ty);
+        self.intern(e.kind, e.quals | quals, e.flags, e.ref_, e.extra, e.extra2)
     }
 
     #[inline]
@@ -3825,6 +3859,7 @@ pub struct Compiler {
     pub ret_ty:        TypeRef,
 
     pub type_table:    TypeTable,
+    pub typedefs:      IntMap<u64, TypeRef>,
 
     pub globals:       GlobalTable,
 
@@ -3875,6 +3910,7 @@ impl Compiler {
             pp,
             loop_stack: Vec::new(),
             type_table: TypeTable::new(),
+            typedefs: Default::default(),
             data: Vec::new(), globals: GlobalTable::new(),
             bss_size: 0, data_relocs: Vec::new(),
             buf: CodeBuf::new(), vstack: ValueStack::new(),
@@ -3923,91 +3959,91 @@ impl Compiler {
     #[inline]
     fn compile_type(&mut self) -> CResult<TypeRef> {
         let mut quals = QualFlags::empty();
-        let mut kind  = None;
+        let mut ty = None;
 
         //
         // Consume qualifiers and type keywords in any order.... Sigh.......
         //
+
         loop {
-            if self.current_token.hash == HASH_CONST    { quals |= QualFlags::CONST;    self.next(); }
-            if self.current_token.hash == HASH_UNSIGNED { quals |= QualFlags::UNSIGNED; self.next(); }
-            if self.current_token.hash == HASH_VOLATILE { quals |= QualFlags::VOLATILE; self.next(); }
-            if self.current_token.hash == HASH_RESTRICT { quals |= QualFlags::RESTRICT; self.next(); }
-            if self.current_token.hash == HASH_SIGNED   { self.next(); } // default, ignore
-            if self.current_token.hash == HASH_REGISTER { self.next(); } // no-op, hint only
-            if self.current_token.hash == HASH_AUTO     { self.next(); } // no-op, default storage
-            if self.current_token.hash == HASH_INLINE   { self.next(); } // handle in compile_top_level
-            if self.current_token.hash == HASH_STATIC   { self.next(); } // handle in compile_top_level
-
-            if self.current_token.kind != TK::Ident {
-                break;
-            }
-
             let t = self.current_token;
+            if t.kind != TK::Ident { break; }
             match t.hash {
-                HASH_INT    => { kind = Some(TypeKind::Int);    self.next(); }
-                HASH_CHAR   => { kind = Some(TypeKind::Char);   self.next(); }
-                HASH_SHORT  => { kind = Some(TypeKind::Short);  self.next(); }
-                HASH_VOID   => { kind = Some(TypeKind::Void);   self.next(); }
-                HASH_FLOAT  => { kind = Some(TypeKind::Float);  self.next(); }
-                HASH_DOUBLE => { kind = Some(TypeKind::Double); self.next(); }
-                HASH_LONG   => {
+                HASH_INT      => { ty = Some(TYPE_INT);    self.next(); }
+                HASH_CHAR     => { ty = Some(TYPE_CHAR);   self.next(); }
+                HASH_SHORT    => { ty = Some(TYPE_SHORT);  self.next(); }
+                HASH_VOID     => { ty = Some(TYPE_VOID);   self.next(); }
+                HASH_FLOAT    => { ty = Some(TYPE_FLOAT);  self.next(); }
+                HASH_DOUBLE   => { ty = Some(TYPE_DOUBLE); self.next(); }
+                HASH_LONG => {
                     self.next();
-                    if self.current_token.hash == HASH_LONG {
-                        self.next();
-                        kind = Some(TypeKind::LLong); // long long
-                    } else {
-                        kind = Some(TypeKind::Long);
-                    }
+                    ty = Some(match self.current_token.hash {
+                        HASH_LONG   => { self.next(); TYPE_LLONG   }    // long long
+                        HASH_INT    => { self.next(); TYPE_LONG    }    // long int (explicit)
+                        // @Incomplete
+                        // HASH_DOUBLE => { self.next(); TYPE_LDOUBLE } // long double
+                        _           =>                TYPE_LONG         // bare long
+                    });
                 }
-                _ => {
-                    if kind.is_none() {
+                HASH_CONST    => { quals |= QualFlags::CONST;    self.next(); }
+                HASH_VOLATILE => { quals |= QualFlags::VOLATILE; self.next(); }
+                HASH_RESTRICT => { quals |= QualFlags::RESTRICT; self.next(); }
+                HASH_UNSIGNED => { quals |= QualFlags::UNSIGNED; self.next(); }
+                HASH_SIGNED   => { self.next(); } // default, ignore
+                HASH_REGISTER => { self.next(); } // hint only, no-op
+                HASH_AUTO     => { self.next(); } // default storage, no-op
+                HASH_INLINE   => { self.next(); } // handled in compile_top_level
+                HASH_STATIC   => { self.next(); } // handled in compile_top_level
+
+                //
+                // Only try typedef lookup if we haven't seen a base type yet,
+                // otherwise this is just the next token after the type.
+                //
+                _ => if ty.is_none() {
+                    if let Some(&typedef) = self.typedefs.get(&t.hash) {
+                        self.next();
+                        ty = Some(typedef);
+                    } else {
                         return Err(CError::UnknownType {
                             span: t.span,
-                            name: t.s(&self.pp.src_arena).to_owned()
+                            name: t.s(&self.pp.src_arena).to_owned(),
                         });
                     }
-
-                    break;  // Next token is not a type keyword, stop
+                } else {
+                    break;
                 }
             }
         }
 
-        let kind = kind.unwrap_or(TypeKind::Int); // Default to int if only qualifiers seen... Sigh....
+        let ty = ty.unwrap_or(TYPE_INT); // Implicit int..................... Sigh...........
+        let mut ty = if quals.is_empty() {
+            ty
+        } else if is_type_builtin(ty) && quals.difference(QualFlags::UNSIGNED).is_empty() {
+            unsign_a_builtin_type(ty)
+        } else {
+            self.type_table.qualify(ty, quals)
+        };
 
         //
-        // Intern the base type
-        //
-        let mut id = self.type_table.intern(
-            kind,
-            quals,
-            TypeFlags::empty(),
-            TypeRef(0),
-            0,
-            0,
-        );
-
-        //
-        // Pointer declarators
+        // Pointer declarators - const/volatile/restrict are all valid on pointers
         //
         while self.current_token.kind == TK::Star {
             self.next();
+
             let mut ptr_quals = QualFlags::empty();
-            if self.current_token.hash == HASH_CONST {
-                ptr_quals |= QualFlags::CONST;
-                self.next();
+            loop {
+                match self.current_token.hash {
+                    HASH_CONST    => { ptr_quals |= QualFlags::CONST;    self.next(); }
+                    HASH_VOLATILE => { ptr_quals |= QualFlags::VOLATILE; self.next(); }
+                    HASH_RESTRICT => { ptr_quals |= QualFlags::RESTRICT; self.next(); }
+                    _             => break,
+                }
             }
-            id = self.type_table.intern(
-                TypeKind::Ptr,
-                ptr_quals,
-                TypeFlags::empty(),
-                id,
-                0,
-                0,
-            );
+
+            ty = self.type_table.intern(TypeKind::Ptr, ptr_quals, TypeFlags::empty(), ty, 0, 0);
         }
 
-        Ok(id)
+        Ok(ty)
     }
 
     // Materialize a CValue into a register
@@ -4154,6 +4190,10 @@ impl Compiler {
             }
         }
 
+        if self.current_token.hash == HASH_TYPEDEF {
+            return self.compile_typedef();
+        }
+
         let mut top_flags = TopLevelFlags::empty();
 
         //
@@ -4178,7 +4218,7 @@ impl Compiler {
             // @Cold
             //
 
-            let ret_ty = if self.current_token.kind == TK::LSquare {
+            let ty = if self.current_token.kind == TK::LSquare {
                 self.next(); // [
                 if self.current_token.kind == TK::RSquare {
                     self.next(); // ]
@@ -4186,14 +4226,14 @@ impl Compiler {
                 } else {
                     let len = self.try_parse_and_eval_const_int()? as u32;
                     self.expect(TK::RSquare, "']'")?;
-                    self.type_table.array_of(ret_ty, len)
+                    self.parse_array_dims(ret_ty, len)?
                 }
             } else {
                 ret_ty
             };
 
             self.compile_global_decl(
-                ret_ty,
+                ty,
                 &name, hash,
                 top_flags.contains(TopLevelFlags::EXTERN),
                 top_flags.contains(TopLevelFlags::STATIC),
@@ -4333,6 +4373,11 @@ impl Compiler {
     }
 
     #[inline]
+    fn can_hash_start_a_type(&self, h: u64) -> bool {
+        HASHES_THAT_START_TYPES.contains(&h) || self.typedefs.contains_key(&h)
+    }
+
+    #[inline]
     fn compile_stmt(&mut self) -> CResult<()> {
         match self.current_token.kind {
             TK::Ident => {
@@ -4343,7 +4388,7 @@ impl Compiler {
                 else if h == HASH_WHILE         { self.compile_while()      }
                 else if h == HASH_BREAK         { self.compile_break(self.current_token.span)    }
                 else if h == HASH_CONTINUE      { self.compile_continue(self.current_token.span) }
-                else if HASHES_THAT_START_TYPES.contains(&h) { self.compile_local_decl() }
+                else if self.can_hash_start_a_type(h) { self.compile_local_decl() }
                 else                            { self.compile_expr_stmt()  }
             }
 
@@ -4537,7 +4582,7 @@ impl Compiler {
 
         if self.current_token.kind != TK::SemiColon {
             let h = self.current_token.hash;
-            if HASHES_THAT_START_TYPES.contains(&h) {
+            if self.can_hash_start_a_type(h) {
                 self.compile_local_decl()?;
             } else {
                 self.compile_expr()?;
@@ -4696,6 +4741,28 @@ impl Compiler {
     #[inline]
     fn compile_store_keep(&mut self, base: Reg, off: i32, ty: TypeRef) -> CResult<()> {
         self.compile_store_impl(base, off, ty, true)
+    }
+
+    #[inline]
+    fn compile_typedef(&mut self) -> CResult<()> {
+        self.next(); // typedef
+
+        let base_ty = self.compile_type()?;
+        let name = self.eat_ident("ident")?;
+
+        let ty = if self.current_token.kind == TK::LSquare {
+            self.next(); // [
+            let len = self.try_parse_and_eval_const_int()? as u32;
+            self.expect(TK::RSquare, "']'")?;
+            self.parse_array_dims(base_ty, len)?
+        } else {
+            base_ty
+        };
+
+        self.expect(TK::SemiColon, "';'")?;
+        self.typedefs.insert(name.hash, ty);
+
+        Ok(())
     }
 
     #[inline]
@@ -5078,6 +5145,16 @@ impl Compiler {
         self.compile_expr()?;
         self.expect(TK::RSquare, "']'")?;
 
+        // Handle trailing constant dimensions: int vla[n][4][8]
+        // elem_ty becomes array(4, array(8, orig_elem_ty)) so size_of is correct
+        let elem_ty = if self.current_token.kind == TK::LSquare {
+            let first_len = { self.next(); self.try_parse_and_eval_const_int()? as u32 };
+            self.expect(TK::RSquare, "']'")?;
+            self.parse_array_dims(elem_ty, first_len)?
+        } else {
+            elem_ty
+        };
+
         // VLAs cannot have initializers
         if self.current_token.kind == TK::Eq {
             return Err(CError::VlaWithInitializer { span: self.current_token.span });
@@ -5113,6 +5190,27 @@ impl Compiler {
 
     }
 
+    /// Parse `[len][len]...` dimensions (all must be constant expressions).
+    /// Caller has already consumed the first `[` and verified it's not `[]` or VLA.
+    #[inline]
+    fn parse_array_dims(&mut self, base_ty: TypeRef, first_len: u32) -> CResult<TypeRef> {
+        let mut dims: SmallVec<[_; 4]> = smallvec![first_len];
+        while self.current_token.kind == TK::LSquare {
+            self.next(); // [
+            let len = self.try_parse_and_eval_const_int()? as u32;
+            self.expect(TK::RSquare, "']'")?;
+            dims.push(len);
+        }
+
+        // Build inside-out: rightmost is innermost
+        let mut ty = base_ty;
+        for &len in dims.iter().rev() {
+            ty = self.type_table.array_of(ty, len);
+        }
+
+        Ok(ty)
+    }
+
     #[inline]
     fn compile_local_decl(&mut self) -> CResult<()> {
         let ty       = self.compile_type()?;
@@ -5130,10 +5228,10 @@ impl Compiler {
                 self.expect(TK::Eq, "'='")?;
 
                 return self.compile_inferred_array_length_local_decl(ty, name_tok);
-            } else if self.current_token.kind == TK::Number {
+            } else if self.current_token.kind == TK::Number || !self.is_hash_a_local_or_a_global(self.current_token.hash) {
                 let len = self.try_parse_and_eval_const_int()? as u32;
                 self.expect(TK::RSquare, "']'")?;
-                self.type_table.array_of(ty, len)
+                self.parse_array_dims(ty, len)?
             } else {
                 //
                 // VLA!
@@ -5925,6 +6023,11 @@ impl Compiler {
                 got: format!("{:?}", v.kind),
             })
         }
+    }
+
+    #[inline]
+    fn is_hash_a_local_or_a_global(&self, h: u64) -> bool {
+        self.locals.find(h).is_some() || self.globals.find(h).is_some()
     }
 
     #[inline]
