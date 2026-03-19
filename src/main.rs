@@ -1,7 +1,6 @@
 // TODO(#2): Structs
 // TODO(#4): Enums
 // TODO(#1): sizeof
-// TODO(#6): typedef
 // TODO(#3): Function pointers
 // TODO(#7): __attribute__
 // TODO(#9): Global extern symbols
