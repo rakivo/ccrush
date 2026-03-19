@@ -7,6 +7,7 @@
 // TODO(#7): __attribute__
 // TODO(#9): Global extern symbols
 
+use std::io;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::ops::{Deref, DerefMut};
@@ -18,7 +19,7 @@ use memmap2::{Mmap, MmapMut, MmapOptions};
 use cranelift_entity::{PrimaryMap, entity_impl};
 
 #[inline(always)]
-pub const fn hash_str(s: &str) -> u64 {
+const fn hash_str(s: &str) -> u64 {
     let b = s.as_bytes();
     let mut h = 0xcbf29ce484222325u64;
     let mut i = 0;
@@ -35,7 +36,8 @@ const fn align(x: usize, a: usize) -> usize {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct FileId(pub u16);
+pub struct FileId(pub u32);
+entity_impl!(FileId);
 
 pub struct FileInfo {
     pub path: Box<str>,
@@ -62,25 +64,26 @@ impl FileData {
 }
 
 pub struct SrcArena {
-    pub files: Vec<FileInfo>,
+    pub files: PrimaryMap<FileId, FileInfo>,
 }
 
 impl SrcArena {
     #[inline]
     pub fn new() -> Self {
-        Self { files: Vec::with_capacity(64) }
+        Self { files: PrimaryMap::with_capacity(64) }
     }
 
     // for real files - mmap'd, no copy
     #[inline]
-    pub fn add_path(&mut self, path: &Path) -> std::io::Result<FileId> {
-        let file    = std::fs::File::open(path)?;
+    pub fn add_path(&mut self, path: &Path) -> io::Result<FileId> {
+        let file    = File::open(path)?;
         let mapping = unsafe { MmapOptions::new().map(&file)? };
-        let id      = FileId(self.files.len() as u16);
-        self.files.push(FileInfo {
+
+        let id = self.files.push(FileInfo {
             path: path.to_string_lossy().into(),
             data: FileData::Mapped(mapping),
         });
+
         Ok(id)
     }
 
@@ -88,18 +91,16 @@ impl SrcArena {
     #[inline]
     pub fn add_bytes(&mut self, path: &Path, src: impl Into<Box<[u8]>>) -> FileId {
         let src = src.into();
-        let id   = FileId(self.files.len() as u16);
+
         self.files.push(FileInfo {
             path: path.to_string_lossy().into(),
             data: FileData::Owned(src),
-        });
-
-        id
+        })
     }
 
     #[inline]
     pub fn slice(&self, fid: FileId) -> &[u8] {
-        self.files[fid.0 as usize].data.slice()
+        self.files[fid].data.slice()
     }
 }
 
@@ -131,15 +132,30 @@ impl Span {
     }
 }
 
+#[inline]
 pub fn emit_diag(msg: &str, span: Span, arena: &SrcArena) {
-    const R: &str = "\x1b[1;31m"; const C: &str = "\x1b[36m";
-    const B: &str = "\x1b[1m";   const X: &str = "\x1b[0m";
+    emit_diag_impl(msg, span, arena, false)
+}
 
-    eprintln!("{R}error{X}{B}: {msg}{X}");
+#[inline]
+pub fn emit_diag_warning(msg: &str, span: Span, arena: &SrcArena) {
+    emit_diag_impl(msg, span, arena, true)
+}
+
+pub fn emit_diag_impl(msg: &str, span: Span, arena: &SrcArena, is_warning: bool) {
+    const R: &str = "\x1b[1;31m"; const C: &str = "\x1b[36m";
+    const B: &str = "\x1b[1m";    const X: &str = "\x1b[0m";
+    const Y: &str = "\x1b[0;33m";
+
+    eprintln!(
+        "{color}{what}{X}{B}: {msg}{X}",
+        color = if is_warning { Y }         else { R },
+        what  = if is_warning { "warning" } else { "error" }
+    );
     if span == Span::POISONED { return; }
 
     let src    = arena.slice(span.file);
-    let path   = &arena.files[span.file.0 as usize].path;
+    let path   = &arena.files[span.file].path;
     let before = &src[..span.start as usize];
 
     let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
@@ -195,10 +211,28 @@ pub fn emit_diag(msg: &str, span: Span, arena: &SrcArena) {
     eprintln!("{pad} {C}|{X}");
 }
 
+fn debug_tokens(path: &Path) {
+    let mut pp = match PP::from_path(path) {
+        Ok(pp) => pp,
+        Err(e) => { eprintln!("{e}"); return; }
+    };
+
+    loop {
+        let t = pp.current_token;
+        if t.kind == TK::Eof { break; }
+        let s = t.s(&pp.src_arena);
+        eprintln!("{:?} {:?}", t.kind, s);
+        pp.next();
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PPError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("#error: {msg}")]
+    Error { span: Span, msg: String },
 
     #[error("file not found: '{path}'")]
     NotFound  { span: Span, path: String },
@@ -221,6 +255,7 @@ impl PPError {
     fn span(&self) -> Span {
         match self {
             PPError::Io(_)                     => Span::POISONED,
+            PPError::Error       { span, .. }  => *span,
             PPError::NotFound    { span, .. }  => *span,
             PPError::Unterminated{ span, .. }  => *span,
             PPError::ArgumentCountMismatch { span, .. }  => *span,
@@ -298,14 +333,16 @@ pub enum TK {
     Comma, SemiColon, TripleDot,
     Plus, PlusPlus, Minus, MinusMinus,
     PlusEq,         MinusEq,
+    Less, LessLess, Greater, GreaterGreater,
+    LessEq,         GreaterEq,
     Star,   Slash,
     StarEq, SlashEq,
     Eq, EqEq, NotEq,
     Xor, XorEq, Not, BitNot,
     And, Or,
     Dot,
-    Less, Greater, LessEq, GreaterEq, BinAnd,   BinOr,
-                                      BinAndEq, BinOrEq,
+    BinAnd,   BinOr,
+    BinAndEq, BinOrEq,
 
     // PP-internal - never escapes cooked stream
     Hash, Newline,
@@ -365,16 +402,23 @@ const HASH_REGISTER: u64 = hash_str("register");
 const HASH_AUTO:     u64 = hash_str("auto");
 const HASH_INLINE:   u64 = hash_str("inline");
 const HASH_CONST:    u64 = hash_str("const");
+const HASH_DEFINED:  u64 = hash_str("defined");
 const HASH_DOUBLE:   u64 = hash_str("double");
 const HASH_SHORT:    u64 = hash_str("short");
 const HASH_ONCE:     u64 = hash_str("once");
 const HASH_EXTERN:   u64 = hash_str("extern");
 const HASH_DEFINE:   u64 = hash_str("define");
+const HASH_TYPEDEF:  u64 = hash_str("typedef");
+const HASH_STRUCT:   u64 = hash_str("struct");
+const HASH_UNION:    u64 = hash_str("union");
+const HASH_ENUM:     u64 = hash_str("enum");
 const HASH_INCLUDE:  u64 = hash_str("include");
 const HASH_PRAGMA:   u64 = hash_str("pragma");
 const HASH_UNDEF:    u64 = hash_str("undef");
 const HASH_IFNDEF:   u64 = hash_str("ifndef");
 const HASH_IFDEF:    u64 = hash_str("ifdef");
+const HASH_ERROR:    u64 = hash_str("error");
+const HASH_WARNING:  u64 = hash_str("warning");
 const HASH_IF:       u64 = hash_str("if");
 const HASH_FOR:      u64 = hash_str("for");
 const HASH_WHILE:    u64 = hash_str("while");
@@ -384,9 +428,12 @@ const HASH_ENDIF:    u64 = hash_str("endif");
 const HASH_BREAK:    u64 = hash_str("break");
 const HASH_CONTINUE: u64 = hash_str("continue");
 
-const HASH_TYPES: &[u64] = &[
+const HASHES_THAT_START_TYPES: &[u64] = &[
     HASH_INT, HASH_LONG, HASH_CHAR, HASH_VOID,
     HASH_FLOAT, HASH_DOUBLE, HASH_SHORT,
+
+    HASH_STRUCT,
+    HASH_TYPEDEF,
 
     // Qualifiers can start a type too...... Sigh.............
     HASH_UNSIGNED, HASH_SIGNED,
@@ -423,9 +470,18 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileId) -> Token {
         b'*'  => tok2!(b'=', TK::StarEq,    TK::Star),
         b'^'  => tok2!(b'=', TK::XorEq,     TK::Xor),
         b'!'  => tok2!(b'=', TK::NotEq,     TK::Not),
-        b'<'  => tok2!(b'=', TK::LessEq,    TK::Less),
-        b'>'  => tok2!(b'=', TK::GreaterEq, TK::Greater),
         b'='  => tok2!(b'=', TK::EqEq,      TK::Eq),
+
+        b'<' => {
+            if *pos < src.len() && src[*pos] == b'<' { *pos += 1; tok!(TK::LessLess) }
+            else if *pos < src.len() && src[*pos] == b'=' { *pos += 1; tok!(TK::LessEq) }
+            else { tok!(TK::Less) }
+        }
+        b'>' => {
+            if *pos < src.len() && src[*pos] == b'>' { *pos += 1; tok!(TK::GreaterGreater) }
+            else if *pos < src.len() && src[*pos] == b'=' { *pos += 1; tok!(TK::GreaterEq) }
+            else { tok!(TK::Greater) }
+        }
 
         b'&' => {
             if *pos < src.len() && src[*pos] == b'&' { *pos += 1; tok!(TK::And) }
@@ -515,6 +571,17 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileId) -> Token {
             tok!(TK::StrLit)
         }
 
+        b'\\' => {
+            // Line continuation
+            if *pos < src.len() && src[*pos] == b'\n' {
+                *pos += 1;
+                return lex(src, pos, fid);
+            }
+
+            // Otherwise skip unknown character
+            lex(src, pos, fid)
+        }
+
         b'0'..=b'9' => {
             while *pos < src.len() && (src[*pos].is_ascii_alphanumeric() || src[*pos]==b'.') { *pos += 1; }
             tok!(TK::Number)
@@ -527,6 +594,24 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileId) -> Token {
 
         _ => lex(src, pos, fid), // Skip unknown byte
     }
+}
+
+#[inline]
+fn parse_number_int(s: &str) -> i64 {
+    let s = s.trim_end_matches(|c| matches!(c, 'u'|'U'|'l'|'L'));  // @Incomplete
+    if s.starts_with("0x") || s.starts_with("0X") {
+        u64::from_str_radix(&s[2..], 16).unwrap_or(0) as i64
+    } else {
+        s.parse::<u64>().map(|v| v as i64)
+            .or_else(|_| s.parse::<i64>())
+            .unwrap_or(0)
+    }
+}
+
+#[inline]
+fn parse_number_float(s: &str) -> f64 {
+    let s = if s.ends_with('f') { &s[..s.len()-1] } else { s };
+    s.parse().unwrap_or(0.0)
 }
 
 const MAX_PARAMS: usize = 8;
@@ -679,15 +764,28 @@ fn exp_push_body(exp: &mut Expansions, body: &[Token]) {
     exp.frames.push((start, end, start));
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SkipResult { Elif, Else, Endif }
+
+#[derive(Clone, Copy, Debug)]
+enum IfdefState {
+    Active,        // Currently emitting tokens
+    Inactive,      // Skipping - condition was false
+    Done,          // seen a True branch, skip remaining elif/else
+}
+
 pub struct PP {
     src_arena:         SrcArena,
 
     current_token:     Token,
     next_token:        Token,
 
+    ifdef_stack:       Vec<IfdefState>,
     file_stack:        Vec<FileFrame>,
+
     exp:               Expansions,
     at_bol:            bool,  // At beginning of line - gate for # directives
+    stop_at_newline:   bool,  // For # directives as well
 
     pragma_once_paths: Vec<PathBuf>,
 
@@ -715,18 +813,31 @@ impl PP {
     fn init(arena: SrcArena, fid: FileId) -> Self {
         let mut pp = Self {
             src_arena: arena,
+            ifdef_stack:        Vec::new(),
             file_stack:         vec![FileFrame { fid, pos: 0 }],
             exp:                Expansions::new(),
             macros:             MacroTable::new(),
-            include_dirs:       vec![
-                PathBuf::from("/usr/include").into(),
-                PathBuf::from("/usr/local/include").into()
-            ],
+            include_dirs:       [
+                "/usr/include",
+                "/usr/local/include",
+                "/usr/include/linux",
+                "/usr/include/x86_64-linux-gnu",
+                "/usr/lib/gcc/x86_64-linux-gnu/12/include",
+                "/usr/lib/gcc/x86_64-linux-gnu/11/include",
+                "/usr/lib/gcc/x86_64-linux-gnu/10/include",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/include",
+                "/usr/lib/gcc/x86_64-linux-gnu/14/include",
+                "/usr/lib/gcc/x86_64-pc-linux-gnu/12/include",
+                "/usr/lib/gcc/x86_64-pc-linux-gnu/13/include",
+                "/usr/lib/gcc/x86_64-pc-linux-gnu/14/include",
+            ].into_iter().map(PathBuf::from).collect(),
             pragma_once_paths: Vec::new(),
             at_bol:             true,
+            stop_at_newline:    false,
             current_token:      Token::EOF,
             next_token:         Token::EOF,
         };
+        pp.init_predefined_macros();
         pp.current_token  = pp.cook();
         pp.next_token = pp.cook();
         pp
@@ -750,6 +861,235 @@ impl PP {
     pub fn s(&self, t: Token) -> &str { t.s(&self.src_arena) }
 
     #[inline]
+    fn init_predefined_macros(&mut self) {
+        let predefs: &[(&str, &str)] = &[
+            // Standard
+            ("__STDC__",                    "1"),
+            ("__STDC_VERSION__",            "201112L"),  // C11
+            ("__STDC_HOSTED__",             "1"),
+
+            // GNU dialect
+            ("__GNUC__",                    "12"),
+            ("__GNUC_MINOR__",              "0"),
+            ("__GNUC_PATCHLEVEL__",         "0"),
+            ("__GNUC_STDC_INLINE__",        "1"),
+            ("__GNU_LIBRARY__",             "6"),
+
+            // Architecture
+            ("__x86_64__",                  "1"),
+            ("__x86_64",                    "1"),
+            ("__amd64__",                   "1"),
+            ("__amd64",                     "1"),
+            ("__k8__",                      "1"),
+            ("__k8",                        "1"),
+            ("__code_model_small__",        "1"),
+
+            // OS
+            ("__linux__",                   "1"),
+            ("__linux",                     "1"),
+            ("linux",                       "1"),
+            ("__unix__",                    "1"),
+            ("__unix",                      "1"),
+            ("unix",                        "1"),
+            ("__ELF__",                     "1"),
+            ("__gnu_linux__",               "1"),
+
+            // ABI / sizes
+            ("__LP64__",                    "1"),
+            ("_LP64",                       "1"),
+            ("__SIZEOF_INT__",              "4"),
+            ("__SIZEOF_LONG__",             "8"),
+            ("__SIZEOF_LONG_LONG__",        "8"),
+            ("__SIZEOF_SHORT__",            "2"),
+            ("__SIZEOF_POINTER__",          "8"),
+            ("__SIZEOF_PTRDIFF_T__",        "8"),
+            ("__SIZEOF_SIZE_T__",           "8"),
+            ("__SIZEOF_WCHAR_T__",          "4"),
+            ("__SIZEOF_WINT_T__",           "4"),
+            ("__SIZEOF_FLOAT__",            "4"),
+            ("__SIZEOF_DOUBLE__",           "8"),
+            ("__SIZEOF_LONG_DOUBLE__",      "16"),
+
+            // Types
+            ("__SIZE_TYPE__",               "long unsigned int"),
+            ("__PTRDIFF_TYPE__",            "long int"),
+            ("__WCHAR_TYPE__",              "int"),
+            ("__WINT_TYPE__",               "unsigned int"),
+            ("__INTMAX_TYPE__",             "long int"),
+            ("__UINTMAX_TYPE__",            "long unsigned int"),
+            ("__SIG_ATOMIC_TYPE__",         "int"),
+            ("__INT8_TYPE__",               "signed char"),
+            ("__INT16_TYPE__",              "short int"),
+            ("__INT32_TYPE__",              "int"),
+            ("__INT64_TYPE__",              "long int"),
+            ("__UINT8_TYPE__",              "unsigned char"),
+            ("__UINT16_TYPE__",             "short unsigned int"),
+            ("__UINT32_TYPE__",             "unsigned int"),
+            ("__UINT64_TYPE__",             "long unsigned int"),
+            ("__INTPTR_TYPE__",             "long int"),
+            ("__UINTPTR_TYPE__",            "long unsigned int"),
+
+            // Limits
+            ("__CHAR_BIT__",                "8"),
+            ("__INT_MAX__",                 "2147483647"),
+            ("__LONG_MAX__",                "9223372036854775807L"),
+            ("__LONG_LONG_MAX__",           "9223372036854775807LL"),
+            ("__SHRT_MAX__",                "32767"),
+            ("__SCHAR_MAX__",               "127"),
+            ("__UCHAR_MAX__",               "255"),
+            ("__USHRT_MAX__",               "65535"),
+            ("__UINT_MAX__",                "4294967295U"),
+            ("__ULONG_MAX__",               "18446744073709551615UL"),
+            ("__SIZE_MAX__",                "18446744073709551615UL"),
+            ("__PTRDIFF_MAX__",             "9223372036854775807L"),
+
+            // Byte order
+            ("__BYTE_ORDER__",              "1234"),
+            ("__ORDER_LITTLE_ENDIAN__",     "1234"),
+            ("__ORDER_BIG_ENDIAN__",        "4321"),
+            ("__ORDER_PDP_ENDIAN__",        "3412"),
+            ("__FLOAT_WORD_ORDER__",        "1234"),
+
+            // Misc GCC
+            ("__FINITE_MATH_ONLY__",        "0"),
+            ("__NO_INLINE__",               "1"),   // we don't inline
+            ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1", "1"),
+            ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2", "1"),
+            ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4", "1"),
+            ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8", "1"),
+            ("__ATOMIC_RELAXED",            "0"),
+            ("__ATOMIC_SEQ_CST",            "5"),
+            ("__ATOMIC_ACQUIRE",            "2"),
+            ("__ATOMIC_RELEASE",            "3"),
+            ("__ATOMIC_CONSUME",            "1"),
+            ("__ATOMIC_ACQ_REL",            "4"),
+
+            // glibc feature test helpers
+            ("__USE_ISOC11",                "1"),
+            ("__USE_ISOC99",                "1"),
+            ("__USE_ISOC95",                "1"),
+            ("__USE_POSIX_IMPLICITLY",      "1"),
+            ("__USE_POSIX",                 "1"),
+            ("__USE_POSIX2",                "1"),
+            ("__USE_POSIX199309",           "1"),
+            ("__USE_POSIX199506",           "1"),
+            ("__USE_XOPEN2K",               "1"),
+            ("__USE_XOPEN2K8",              "1"),
+            ("__USE_MISC",                  "1"),
+            ("__USE_ATFILE",                "1"),
+            ("__USE_FORTIFY_LEVEL",         "0"),
+            ("_DEFAULT_SOURCE",             "1"),
+            ("_POSIX_C_SOURCE",             "200809L"),
+            ("_XOPEN_SOURCE",               "700"),
+            ("__GLIBC_USE_ISOC2X",          "0"),
+        ];
+
+        for &(name, val) in predefs {
+            self.define_simple(name, val);
+        }
+
+        // These are used in glibc headers as no-ops or type hints
+        // Define them as empty or simple expansions
+        let builtins = &[
+            ("__attribute__",           ""),  // ignore attributes
+            ("__attribute",             ""),
+            ("__extension__",           ""),  // ignore gcc extensions
+            ("__inline__",              ""),
+            ("__inline",                ""),
+            ("__restrict",              ""),
+            ("__restrict__",            ""),
+            ("__volatile__",            "volatile"),
+            ("__signed__",              "signed"),
+            ("__const",                 "const"),
+            ("__const__",               "const"),
+        ];
+        for &(name, val) in builtins {
+            self.define_simple(name, val);
+        }
+
+        // @Incomplete
+        // @Incomplete
+        // @Incomplete
+        self.define_noop_func_macro("__attribute__", &["x"]);
+        self.define_noop_func_macro("__attribute",   &["x"]);
+        self.define_noop_func_macro("__asm__",       &["x"]);
+        self.define_noop_func_macro("__asm",         &["x"]);
+
+        self.define_func_macro("__glibc_clang_prereq",        &["maj", "min"], *b"0");
+        self.define_func_macro("__glibc_has_attribute",       &["attr"],       *b"0");
+        self.define_func_macro("__glibc_has_builtin",         &["b"],          *b"0");
+        self.define_func_macro("__GLIBC_USE",                 &["f"],          *b"0");
+        self.define_func_macro("__glibc_clang_has_extension", &["ext"],        *b"0");
+    }
+
+    #[inline]
+    pub fn define_simple(&mut self, name: &str, val: &str) {
+        let name_hash = hash_str(name);
+
+        let val = self.src_arena.add_bytes(
+            &PathBuf::from("<builtin>"),
+            val.as_bytes()
+        );
+        let mut pos  = 0usize;
+        let data     = self.src_arena.slice(val);
+        let mut body = Vec::new();
+        loop {
+            let t = lex(data, &mut pos, val);
+            if t.kind == TK::Eof { break; }
+            body.push(t);
+        }
+
+        let def = MacroDef {
+            name_hash,
+            def_span:     Span::POISONED,
+            body_start:   0,
+            body_len:     0,
+            param_count:  0,
+            param_hashes: [0; MAX_PARAMS],
+        };
+        self.macros.define(def, &body);
+    }
+
+    #[inline]
+    fn define_noop_func_macro(&mut self, name: &str, params: &[&str]) {
+        self.define_func_macro(name, params, *b"");
+    }
+
+    #[inline]
+    fn define_func_macro(&mut self, name: &str, params: &[&str], body: impl Into<Box<[u8]>>) {
+        // @Cutnpaste from define_simple
+
+        let name_hash = hash_str(name);
+        let val_fid = self.src_arena.add_bytes(
+            &PathBuf::from("<builtin>"),
+            body
+        );
+        let mut pos = 0usize;
+        let data = self.src_arena.slice(val_fid);
+        let mut body_toks = Vec::new();
+        loop {
+            let t = lex(data, &mut pos, val_fid);
+            if t.kind == TK::Eof { break; }
+            body_toks.push(t);
+        }
+
+        let mut param_hashes = [0u64; MAX_PARAMS];
+        for (i, &p) in params.iter().enumerate() {
+            param_hashes[i] = hash_str(p);
+        }
+
+        let def = MacroDef {
+            name_hash,
+            def_span:     Span::POISONED,
+            body_start:   0,
+            body_len:     0,
+            param_count:  params.len() as u8,
+            param_hashes,
+        };
+        self.macros.define(def, &body_toks);
+    }
+
+    #[inline]
     fn raw(&mut self) -> Token {
         // Fast path: expansion frames active
         while let Some(frame) = self.exp.frames.last_mut() {
@@ -765,7 +1105,7 @@ impl PP {
         // Slow path: read from file stack
         // Most tokens come from here - inline the common case
         if let Some(ff) = self.file_stack.last_mut() {
-            let data = self.src_arena.files[ff.fid.0 as usize].data.slice();
+            let data = self.src_arena.files[ff.fid].data.slice();
             if ff.pos < data.len() {
                 return lex(data, &mut ff.pos, ff.fid);
             }
@@ -781,10 +1121,11 @@ impl PP {
                 return Token::EOF;
             };
 
-            let data = self.src_arena.files[ff.fid.0 as usize].data.slice();
+            let data = self.src_arena.files[ff.fid].data.slice();
             if ff.pos < data.len() {
                 return lex(data, &mut ff.pos, ff.fid);
             }
+
             self.file_stack.pop();
         }
     }
@@ -794,13 +1135,21 @@ impl PP {
         loop {
             let t = self.raw();
             match t.kind {
-                TK::Newline => self.at_bol = true,
+                TK::Newline => {
+                    self.at_bol = true;
+                    if self.stop_at_newline { return t; }
+                }
 
                 TK::Hash if self.at_bol => {
                     if let Err(e) = self.directive() {
                         e.emit(&self.src_arena);
                         std::process::exit(1);
                     }
+                }
+
+                TK::Hash => {
+                    self.at_bol = false;
+                    return t;
                 }
 
                 TK::Ident => {
@@ -824,7 +1173,11 @@ impl PP {
                 }
 
                 TK::Eof => return t,
-                _       => { self.at_bol = false; return t; }
+
+                _ => {
+                    self.at_bol = false;
+                    return t;
+                }
             }
         }
     }
@@ -844,10 +1197,30 @@ impl PP {
             HASH_INCLUDE => self.pp_include(name.span),
             HASH_PRAGMA  => { self.pp_pragma(); Ok(()) }
             HASH_UNDEF   => { self.pp_undef();  Ok(()) }
+            HASH_IFDEF   => self.pp_ifdef(false),
+            HASH_IFNDEF  => self.pp_ifdef(true),
+            HASH_ELIF    => self.pp_elif(),
+            HASH_ELSE    => { self.pp_else(); Ok(()) }
+            HASH_ENDIF   => { self.pp_endif(); Ok(()) }
+            HASH_ERROR   => self.pp_error(name),
+            HASH_WARNING => self.pp_warning(name),
+            HASH_IF      => {
+                self.ifdef_stack.push(IfdefState::Inactive);
 
-            HASH_IFNDEF | HASH_IFDEF | HASH_IF | HASH_ELSE | HASH_ELIF | HASH_ENDIF => {
-                // @Incomplete
-                self.skip_line(); Ok(())
+                let val = self.pp_eval_expr()?;
+                if val != 0 {
+                    *self.ifdef_stack.last_mut().unwrap() = IfdefState::Active;
+                } else {
+                    match self.skip_branch() {
+                        SkipResult::Endif => { self.ifdef_stack.pop(); }
+                        SkipResult::Else  => {
+                            *self.ifdef_stack.last_mut().unwrap() = IfdefState::Active;
+                        }
+                        SkipResult::Elif  => { self.pp_elif()?; }
+                    }
+                }
+
+                Ok(())
             }
 
             _ => {
@@ -858,14 +1231,6 @@ impl PP {
                 self.skip_line();
                 Err(e)
             }
-        }
-    }
-
-    #[inline]
-    fn skip_line(&mut self) {
-        loop {
-            let t = self.raw();
-            if matches!(t.kind, TK::Newline|TK::Eof) { break; }
         }
     }
 
@@ -918,16 +1283,24 @@ impl PP {
 
             loop {
                 let t = self.raw();
-                if matches!(t.kind, TK::Newline|TK::Eof) { break; }
+                if matches!(t.kind, TK::Newline | TK::Eof) {
+                    self.at_bol = true;
+                    break;
+                }
                 body.push(try_param_subst(t, &def, &self.src_arena));
             }
-        } else if !matches!(next.kind, TK::Newline|TK::Eof) {
+        } else if !matches!(next.kind, TK::Newline | TK::Eof) {
             body.push(try_param_subst(next, &def, &self.src_arena));
             loop {
                 let t = self.raw();
-                if matches!(t.kind, TK::Newline|TK::Eof) { break; }
+                if matches!(t.kind, TK::Newline | TK::Eof) {
+                    self.at_bol = true;
+                    break;
+                }
                 body.push(try_param_subst(t, &def, &self.src_arena));
             }
+        } else {
+            self.at_bol = true;
         }
 
         self.macros.define(def, &body);
@@ -941,6 +1314,7 @@ impl PP {
         if t.kind == TK::Ident {
             self.macros.undef(hash_str(t.s(&self.src_arena)));
         }
+
         self.skip_line();
     }
 
@@ -972,7 +1346,7 @@ impl PP {
 
         let cur_dir = {
             let fid  = self.file_stack.last().map(|f| f.fid).unwrap_or(FileId(0));
-            let parent_dir_opt = Path::new(self.src_arena.files[fid.0 as usize].path.as_ref()).parent();
+            let parent_dir_opt = Path::new(self.src_arena.files[fid].path.as_ref()).parent();
             parent_dir_opt.unwrap_or(Path::new(".")).to_owned()
         };
 
@@ -992,12 +1366,11 @@ impl PP {
         let file = File::open(&resolved)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
 
-        let id = FileId(self.src_arena.files.len() as u16);
-        self.src_arena.files.push(FileInfo {
+        let fid = self.src_arena.files.push(FileInfo {
             path: resolved.to_string_lossy().into(),
             data: FileData::Mapped(mmap),
         });
-        self.file_stack.push(FileFrame { fid: id, pos: 0 });
+        self.file_stack.push(FileFrame { fid, pos: 0 });
 
         Ok(())
     }
@@ -1010,9 +1383,9 @@ impl PP {
     #[inline]
     fn pp_pragma(&mut self) {
         let t = self.raw();
-        if t.kind == TK::Ident && hash_str(t.s(&self.src_arena)) == HASH_ONCE {
+        if hash_str(t.s(&self.src_arena)) == HASH_ONCE {
             if let Some(ff) = self.file_stack.last() {
-                let path = Path::new(self.src_arena.files[ff.fid.0 as usize].path.as_ref());
+                let path = Path::new(self.src_arena.files[ff.fid].path.as_ref());
                 if let Ok(canonical) = path.canonicalize() {
                     if !self.pragma_once_paths.contains(&canonical) {
                         self.pragma_once_paths.push(canonical);
@@ -1087,7 +1460,7 @@ impl PP {
 
         //
         // Expand each arg from scratch into macros.arg_pool.
-        // arg_pool and arg_ends are reset here; expand_slice_into appends to arg_pool.
+        // arg_pool and arg_ends are reset here;
         //
 
         let arg_pool_base = self.macros.arg_pool.len() as u32;
@@ -1096,11 +1469,28 @@ impl PP {
         for &(start, len) in &arg_ranges {
             let s = start as usize;
             let e = s + len as usize;
-            // expand_slice_into cooks the scratch slice into macros.arg_pool
-            self.expand_slice_into(s, e);
+            if s == e { continue; }
+
+            //
+            // Copy the arg tokens + EOF sentinel into exp.pool as a temporary frame.
+            // We use exp.push so the cook() loop drains it normally.
+            //
+
+            let tmp_start = self.exp.pool.len() as u32;
+            self.exp.pool.extend_from_slice(&self.macros.scratch[s..e]);
+            self.exp.pool.push(Token::EOF);
+            let tmp_end = self.exp.pool.len() as u32;
+
+            self.exp.frames.push((tmp_start, tmp_end, tmp_start));
+
+            loop {
+                let t = self.cook();
+                if t.kind == TK::Eof { break; }
+                self.macros.arg_pool.push(t);
+            }
+
             self.macros.arg_ends.push(self.macros.arg_pool.len() as u32);
         }
-
         self.macros.scratch.truncate(scratch_base as usize);
 
         //
@@ -1140,24 +1530,594 @@ impl PP {
         Ok(())
     }
 
-    // Cook a slice of raw tokens (indices into macros.scratch) and append the
-    // result directly into macros.arg_pool.  No heap allocation.
     #[inline]
-    fn expand_slice_into(&mut self, scratch_start: usize, scratch_end: usize) {
-        if scratch_start == scratch_end { return; }
+    fn skip_line(&mut self) {
+        loop {
+            let t = self.raw();
+            if matches!(t.kind, TK::Newline | TK::Eof) {
+                self.at_bol = true;
+                break;
+            }
+        }
+    }
 
-        // Copy the arg tokens + EOF sentinel into exp.pool as a temporary frame.
-        // We use exp.push so the cook() loop drains it normally.
-        let tmp_start = self.exp.pool.len() as u32;
-        self.exp.pool.extend_from_slice(&self.macros.scratch[scratch_start..scratch_end]);
-        self.exp.pool.push(Token::EOF);
-        let tmp_end = self.exp.pool.len() as u32;
-        self.exp.frames.push((tmp_start, tmp_end, tmp_start));
+    fn skip_branch(&mut self) -> SkipResult {
+        let mut depth = 0usize;
 
         loop {
-            let t = self.cook();
-            if t.kind == TK::Eof { break; }
-            self.macros.arg_pool.push(t);
+            let t = self.raw();
+
+            match t.kind {
+                TK::Eof => return SkipResult::Endif,
+                TK::Newline => { self.at_bol = true; continue; }
+
+                TK::Hash if self.at_bol => {
+                    self.at_bol = false;
+
+                    let name = self.raw();
+                    if name.kind != TK::Ident { self.skip_line(); continue; }
+
+                    let h = hash_str(name.s(&self.src_arena));
+                    match h {
+                        HASH_IF | HASH_IFDEF | HASH_IFNDEF => {
+                            depth += 1;
+                            self.skip_line();
+                        }
+
+                        HASH_ENDIF => {
+                            if depth == 0 {
+                                self.skip_line();
+                                return SkipResult::Endif;
+                            }
+                            depth -= 1;
+                            self.skip_line();
+                        }
+
+                        HASH_ELIF if depth == 0 => {
+                            return SkipResult::Elif;
+                        }
+
+                        HASH_ELSE if depth == 0 => {
+                            self.skip_line();
+                            return SkipResult::Else;
+                        }
+
+                        _ => self.skip_line(),
+                    }
+                }
+
+                _ => self.at_bol = false,
+            }
+        }
+    }
+
+    #[inline]
+    fn pp_ifdef(&mut self, is_ifndef: bool) -> PPResult<()> {
+        let name = self.raw();
+        if name.kind != TK::Ident { self.skip_line(); return Ok(()); }
+
+        let hash = hash_str(name.s(&self.src_arena));
+        self.skip_line();
+
+        let defined = self.macros.find(hash).is_some();
+        let active  = if is_ifndef { !defined } else { defined };
+
+        if active {
+            self.ifdef_stack.push(IfdefState::Active);
+        } else {
+            self.ifdef_stack.push(IfdefState::Done);
+            match self.skip_branch() {
+                SkipResult::Endif => { self.ifdef_stack.pop(); }
+                SkipResult::Else  => {
+                    // Else branch is active
+                    *self.ifdef_stack.last_mut().unwrap() = IfdefState::Active;
+                }
+                SkipResult::Elif  => {
+                    // Evaluate elif condition
+                    self.pp_elif()?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn pp_else(&mut self) {
+        self.skip_line();
+        match self.ifdef_stack.last() {
+            Some(IfdefState::Active) => {
+                // We were active (#if was true), now skip the else branch
+                *self.ifdef_stack.last_mut().unwrap() = IfdefState::Done;
+                self.skip_branch();
+                self.ifdef_stack.pop();
+            }
+
+            Some(IfdefState::Done) | Some(IfdefState::Inactive) => {
+                // Else branch is active
+                *self.ifdef_stack.last_mut().unwrap() = IfdefState::Active;
+            }
+
+            None => {} // #else without #if - ignore
+        }
+    }
+
+    #[inline]
+    fn pp_elif(&mut self) -> PPResult<()> {
+        match self.ifdef_stack.last().copied() {
+            Some(IfdefState::Active) => {
+                *self.ifdef_stack.last_mut().unwrap() = IfdefState::Done;
+                match self.skip_branch() {
+                    SkipResult::Endif => { self.ifdef_stack.pop(); }
+                    SkipResult::Else  => { self.pp_else(); }
+                    SkipResult::Elif  => { self.pp_elif()?; }
+                }
+            }
+
+            Some(IfdefState::Done) => {
+                self.skip_line();
+                match self.skip_branch() {
+                    SkipResult::Endif => { self.ifdef_stack.pop(); }
+                    SkipResult::Else  => { self.pp_else(); }
+                    SkipResult::Elif  => { self.pp_elif()?; }
+                }
+            }
+
+            Some(IfdefState::Inactive) => {
+                let val = self.pp_eval_expr()?;
+                if val != 0 {
+                    *self.ifdef_stack.last_mut().unwrap() = IfdefState::Active;
+                } else {
+                    match self.skip_branch() {
+                        SkipResult::Endif => { self.ifdef_stack.pop(); }
+                        SkipResult::Else  => { self.pp_else(); }
+                        SkipResult::Elif  => { self.pp_elif()?; }
+                    }
+                }
+            }
+
+            None => {
+                // Orphaned #elif - skip the condition line and the branch
+                self.skip_line();
+                match self.skip_branch() {
+                    SkipResult::Endif => {}
+                    SkipResult::Else  => { self.skip_branch(); }
+                    SkipResult::Elif  => { self.pp_elif()?; }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn pp_endif(&mut self) {
+        self.skip_line();
+        self.ifdef_stack.pop();
+    }
+
+    #[inline]
+    fn pp_error(&mut self, error_token: Token) -> PPResult<()> {
+        let mut msg = String::new();
+        loop {
+            let t = self.raw();
+            if matches!(t.kind, TK::Newline | TK::Eof) { break; }
+
+            msg.push_str(t.s(&self.src_arena));
+            msg.push(' ');
+        }
+
+        Err(PPError::Error { span: error_token.span, msg: msg.trim().to_owned() })
+    }
+
+    #[inline]
+    fn pp_warning(&mut self, warning_token: Token) -> PPResult<()> {
+        let mut msg = String::new();
+        loop {
+            let t = self.raw();
+            if matches!(t.kind, TK::Newline | TK::Eof) { break; }
+
+            msg.push_str(t.s(&self.src_arena));
+            msg.push(' ');
+        }
+
+        emit_diag_warning(&msg, warning_token.span, &self.src_arena);
+
+        Ok(())
+    }
+
+    fn pp_eval_expr(&mut self) -> PPResult<i64> {
+        //
+        // Collect raw line - stops at newline
+        //
+        let mut raw_line = Vec::new();
+        loop {
+            let t = self.raw();
+            match t.kind {
+                TK::Newline | TK::Eof => { self.at_bol = true; break; }
+                _ => raw_line.push(t),
+            }
+        }
+
+        // Replace defined(X) / defined X with synthetic 0/1 tokens
+        let mut processed = self.pp_replace_defined(raw_line);
+        processed.push(Token::EOF);
+
+        // Expand macros using frame-only reads, collect tokens
+        let frame_depth_before = self.exp.frames.len();
+        exp_push_body(&mut self.exp, &processed);
+
+        let toks = self.pp_eval_collect(frame_depth_before);
+        Ok(self.eval_const_expr(&toks, &mut 0))
+    }
+
+    // Uses pp_eval_raw (frame-only) to avoid consuming real source tokens.
+    // Regular raw() would fall through to the file stack if frames are exhausted.
+    #[inline]
+    fn pp_eval_expand_func(&mut self, index: usize, toks: &mut Vec<Token>, min_depth: usize) {
+        let def = self.macros.defs[index];
+
+        // Check for '(' in frames
+        let next = self.pp_eval_raw(min_depth);
+        if next.kind != TK::LParen {
+            toks.push(Token { kind: TK::Number, span: Span::POISONED, hash: 0 });
+            return;
+        }
+
+        //
+        // Collect args from frames only
+        //
+        let mut args = SmallVec::<[_; 8]>::new();
+        let mut current = Vec::new();
+        let mut depth = 0usize;
+        loop {
+            let t = self.pp_eval_raw(min_depth);
+            match t.kind {
+                TK::Eof => break,
+                TK::LParen => { depth += 1; current.push(t); }
+                TK::RParen if depth > 0 => { depth -= 1; current.push(t); }
+                TK::RParen => { args.push(current.clone()); break; }
+                TK::Comma if depth == 0 => { args.push(current.clone()); current.clear(); }
+                _ => current.push(t),
+            }
+        }
+
+        //
+        // Substitute and push result as new frame
+        //
+
+        let body_start = def.body_start as usize;
+        let body_len   = def.body_len   as usize;
+
+        let mut expanded = Vec::new();
+        for i in body_start..body_start + body_len {
+            let bt = self.macros.tok_pool[i];
+            match bt.kind {
+                TK::Param(pi) => if (pi as usize) < args.len() {
+                    expanded.extend_from_slice(&args[pi as usize]);
+                }
+
+                _ => expanded.push(bt),
+            }
+        }
+
+        expanded.push(Token::EOF);
+        exp_push_body(&mut self.exp, &expanded);
+    }
+
+    #[inline]
+    fn pp_replace_defined(&self, raw_line: Vec<Token>) -> Vec<Token> {
+        let mut out = Vec::with_capacity(raw_line.len());
+
+        let mut i = 0;
+        while i < raw_line.len() {
+            let t = raw_line[i];
+            i += 1;
+
+            let t = if t.kind == TK::Ident && t.s(&self.src_arena) == "defined" {
+                let has_paren = i < raw_line.len() && raw_line[i].kind == TK::LParen;
+                if has_paren { i += 1 }
+
+                let name_hash = if i < raw_line.len() {
+                    hash_str(raw_line[i].s(&self.src_arena))
+                } else {
+                    0
+                };
+
+                if i < raw_line.len() { i += 1 }
+                if has_paren && i < raw_line.len() && raw_line[i].kind == TK::RParen { i += 1 }
+
+                let val = self.macros.find(name_hash).is_some() as u64;
+                Token { kind: TK::Number, span: Span::POISONED, hash: val }
+            } else {
+                t
+            };
+
+            out.push(t);
+        }
+
+        out
+    }
+
+    #[inline]
+    fn pp_eval_collect(&mut self, frame_depth_before: usize) -> Vec<Token> {
+        let mut toks = Vec::new();
+        loop {
+            let Some(frame) = self.exp.frames.last_mut() else { break; };
+
+            let (_, end, cursor) = frame;
+            if *cursor >= *end {
+                self.exp.pop();
+                if self.exp.frames.len() < frame_depth_before { break; }
+
+                continue;
+            }
+
+            let t = self.exp.pool[*cursor as usize];
+            *cursor += 1;
+
+            match t.kind {
+                TK::Eof => {
+                    self.exp.pop();
+
+                    if self.exp.frames.len() < frame_depth_before { break; }
+                }
+
+                TK::Ident => {
+                    let h = hash_str(t.s(&self.src_arena));
+                    if let Some(index) = self.macros.find(h) {
+                        let def = self.macros.defs[index];
+                        if def.param_count == 0 {
+                            exp_push_body(&mut self.exp, self.macros.body(index));
+                        } else {
+                            self.pp_eval_expand_func(index, &mut toks, frame_depth_before);
+                        }
+
+                        continue;
+                    }
+
+                    toks.push(Token { kind: TK::Number, span: Span::POISONED, hash: 0 });
+                }
+
+                _ => toks.push(t),
+            }
+        }
+
+        toks
+    }
+
+    // Read one token from frames only, never file stack
+    #[inline]
+    fn pp_eval_raw(&mut self, min_depth: usize) -> Token {
+        loop {
+            let Some(frame) = self.exp.frames.last_mut() else {
+                return Token::EOF;
+            };
+
+            let (_, end, cursor) = frame;
+            if *cursor < *end {
+                let t = self.exp.pool[*cursor as usize];
+                *cursor += 1;
+                return t;
+            }
+
+            self.exp.pop();
+            if self.exp.frames.len() < min_depth {
+                return Token::EOF;
+            }
+        }
+    }
+
+    #[inline]
+    fn eval_const_expr(&self, toks: &[Token], pos: &mut usize) -> i64 {
+        self.eval_or(toks, pos)
+    }
+
+    #[inline]
+    fn eval_or(&self, toks: &[Token], pos: &mut usize) -> i64 {
+        let mut v = self.eval_and(toks, pos);
+        while *pos < toks.len() && toks[*pos].kind == TK::Or {
+            *pos += 1;
+            let r = self.eval_and(toks, pos);
+            v = if v != 0 || r != 0 { 1 } else { 0 };
+        }
+
+        v
+    }
+
+    #[inline]
+    fn eval_and(&self, toks: &[Token], pos: &mut usize) -> i64 {
+        let mut v = self.eval_bitor(toks, pos);
+        while *pos < toks.len() && toks[*pos].kind == TK::And {
+            *pos += 1;
+            let r = self.eval_bitor(toks, pos);
+            v = if v != 0 && r != 0 { 1 } else { 0 };
+        }
+
+        v
+    }
+
+    #[inline]
+    fn eval_bitor(&self, toks: &[Token], pos: &mut usize) -> i64 {
+        let mut v = self.eval_bitxor(toks, pos);
+        while *pos < toks.len() && toks[*pos].kind == TK::BinOr {
+            *pos += 1;
+            v |= self.eval_bitxor(toks, pos);
+        }
+
+        v
+    }
+
+    #[inline]
+    fn eval_bitxor(&self, toks: &[Token], pos: &mut usize) -> i64 {
+        let mut v = self.eval_bitand(toks, pos);
+        while *pos < toks.len() && toks[*pos].kind == TK::Xor {
+            *pos += 1;
+            v ^= self.eval_bitand(toks, pos);
+        }
+
+        v
+    }
+
+    #[inline]
+    fn eval_bitand(&self, toks: &[Token], pos: &mut usize) -> i64 {
+        let mut v = self.eval_eq(toks, pos);
+        while *pos < toks.len() && toks[*pos].kind == TK::BinAnd {
+            *pos += 1;
+            v &= self.eval_eq(toks, pos);
+        }
+
+        v
+    }
+
+    #[inline]
+    fn eval_eq(&self, toks: &[Token], pos: &mut usize) -> i64 {
+        let mut v = self.eval_cmp(toks, pos);
+        loop {
+            if *pos >= toks.len() { break; }
+
+            match toks[*pos].kind {
+                TK::EqEq  => { *pos += 1; v = (v == self.eval_cmp(toks, pos)) as i64; }
+                TK::NotEq => { *pos += 1; v = (v != self.eval_cmp(toks, pos)) as i64; }
+                _ => break,
+            }
+        }
+
+        v
+    }
+
+    #[inline]
+    fn eval_cmp(&self, toks: &[Token], pos: &mut usize) -> i64 {
+        let mut v = self.eval_shift(toks, pos);
+        loop {
+            if *pos >= toks.len() { break; }
+
+            match toks[*pos].kind {
+                TK::Less      => { *pos += 1; v = (v <  self.eval_add(toks, pos)) as i64; }
+                TK::Greater   => { *pos += 1; v = (v >  self.eval_add(toks, pos)) as i64; }
+                TK::LessEq    => { *pos += 1; v = (v <= self.eval_add(toks, pos)) as i64; }
+                TK::GreaterEq => { *pos += 1; v = (v >= self.eval_add(toks, pos)) as i64; }
+                _ => break,
+            }
+        }
+
+        v
+    }
+
+    #[inline]
+    fn eval_shift(&self, toks: &[Token], pos: &mut usize) -> i64 {
+        let mut v = self.eval_add(toks, pos);
+        loop {
+            if *pos >= toks.len() { break; }
+
+            match toks[*pos].kind {
+                TK::LessLess       => { *pos += 1; let r = self.eval_add(toks, pos); v = v << r; }
+                TK::GreaterGreater => { *pos += 1; let r = self.eval_add(toks, pos); v = v >> r; }
+                _ => break,
+            }
+        }
+
+        v
+    }
+
+    #[inline]
+    fn eval_add(&self, toks: &[Token], pos: &mut usize) -> i64 {
+        let mut v = self.eval_mul(toks, pos);
+        loop {
+            if *pos >= toks.len() { break; }
+
+            match toks[*pos].kind {
+                TK::Plus  => { *pos += 1; v += self.eval_mul(toks, pos); }
+                TK::Minus => { *pos += 1; v -= self.eval_mul(toks, pos); }
+                _ => break,
+            }
+        }
+
+        v
+    }
+
+    #[inline]
+    fn eval_mul(&self, toks: &[Token], pos: &mut usize) -> i64 {
+        let mut v = self.eval_unary(toks, pos);
+        loop {
+            if *pos >= toks.len() { break; }
+
+            match toks[*pos].kind {
+                TK::Star  => { *pos += 1; v *= self.eval_unary(toks, pos); }
+                TK::Slash => { *pos += 1; let r = self.eval_unary(toks, pos); v = if r != 0 { v / r } else { 0 }; }
+                _ => break,
+            }
+        }
+
+        v
+    }
+
+    #[inline]
+    fn eval_unary(&self, toks: &[Token], pos: &mut usize) -> i64 {
+        if *pos >= toks.len() { return 0; }
+
+        match toks[*pos].kind {
+            TK::Minus  => { *pos += 1; -self.eval_unary(toks, pos) }
+            TK::Not    => { *pos += 1; (self.eval_unary(toks, pos) == 0) as i64 }
+            TK::BitNot => { *pos += 1; !self.eval_unary(toks, pos) }
+            _          => self.eval_primary(toks, pos),
+        }
+    }
+
+    #[inline]
+    fn eval_primary(&self, toks: &[Token], pos: &mut usize) -> i64 {
+        if *pos >= toks.len() { return 0; }
+
+        match toks[*pos].kind {
+            TK::Number => {
+                let t = toks[*pos];
+                *pos += 1;
+                if t.span == Span::POISONED {
+                    return t.hash as i64;  // Synthetic defined() result from pp_eval_expr
+                }
+
+                let s = t.s(&self.src_arena);
+                parse_number_int(s)
+            }
+
+            TK::Ident => {
+                let hash = toks[*pos].hash;
+                *pos += 1;
+
+                if hash != HASH_DEFINED {
+                    // Undefined identifier = 0 in #if context
+                    return 0;
+                }
+
+                //
+                // `defined(FOO)` or `defined FOO`
+                //
+
+                let name_hash = if *pos < toks.len() && toks[*pos].kind == TK::LParen {
+                    *pos += 1; // '('
+                    let h = if *pos < toks.len() { toks[*pos].hash } else { 0 };
+                    *pos += 1; // name
+                    if *pos < toks.len() && toks[*pos].kind == TK::RParen { *pos += 1; }
+                    h
+                } else {
+                    let h = if *pos < toks.len() { toks[*pos].hash } else { 0 };
+                    *pos += 1;
+                    h
+                };
+
+                self.macros.find(name_hash).is_some() as i64
+            }
+
+            TK::LParen => {
+                *pos += 1;
+
+                let v = self.eval_const_expr(toks, pos);
+                if *pos < toks.len() && toks[*pos].kind == TK::RParen { *pos += 1; }
+
+                v
+            }
+
+            _ => 0,
         }
     }
 }
@@ -2969,49 +3929,47 @@ impl Compiler {
         // Consume qualifiers and type keywords in any order.... Sigh.......
         //
         loop {
-            match self.current_token.kind {
-                TK::Ident if self.current_token.hash == HASH_CONST    => { quals |= QualFlags::CONST;    self.next(); }
-                TK::Ident if self.current_token.hash == HASH_UNSIGNED => { quals |= QualFlags::UNSIGNED; self.next(); }
-                TK::Ident if self.current_token.hash == HASH_VOLATILE => { quals |= QualFlags::VOLATILE; self.next(); }
-                TK::Ident if self.current_token.hash == HASH_RESTRICT => { quals |= QualFlags::RESTRICT; self.next(); }
-                TK::Ident if self.current_token.hash == HASH_SIGNED   => { self.next(); } // default, ignore
-                TK::Ident if self.current_token.hash == HASH_REGISTER => { self.next(); } // no-op, hint only
-                TK::Ident if self.current_token.hash == HASH_AUTO     => { self.next(); } // no-op, default storage
-                TK::Ident if self.current_token.hash == HASH_INLINE   => { self.next(); } // handle in compile_top_level
-                TK::Ident if self.current_token.hash == HASH_STATIC   => { self.next(); } // handle in compile_top_level
+            if self.current_token.hash == HASH_CONST    { quals |= QualFlags::CONST;    self.next(); }
+            if self.current_token.hash == HASH_UNSIGNED { quals |= QualFlags::UNSIGNED; self.next(); }
+            if self.current_token.hash == HASH_VOLATILE { quals |= QualFlags::VOLATILE; self.next(); }
+            if self.current_token.hash == HASH_RESTRICT { quals |= QualFlags::RESTRICT; self.next(); }
+            if self.current_token.hash == HASH_SIGNED   { self.next(); } // default, ignore
+            if self.current_token.hash == HASH_REGISTER { self.next(); } // no-op, hint only
+            if self.current_token.hash == HASH_AUTO     { self.next(); } // no-op, default storage
+            if self.current_token.hash == HASH_INLINE   { self.next(); } // handle in compile_top_level
+            if self.current_token.hash == HASH_STATIC   { self.next(); } // handle in compile_top_level
 
-                TK::Ident  => {
-                    let t = self.current_token;
-                    match t.hash {
-                        HASH_INT    => { kind = Some(TypeKind::Int);    self.next(); }
-                        HASH_CHAR   => { kind = Some(TypeKind::Char);   self.next(); }
-                        HASH_SHORT  => { kind = Some(TypeKind::Short);  self.next(); }
-                        HASH_VOID   => { kind = Some(TypeKind::Void);   self.next(); }
-                        HASH_FLOAT  => { kind = Some(TypeKind::Float);  self.next(); }
-                        HASH_DOUBLE => { kind = Some(TypeKind::Double); self.next(); }
-                        HASH_LONG   => {
-                            self.next();
-                            if self.current_token.kind == TK::Ident && self.current_token.hash == HASH_LONG {
-                                self.next();
-                                kind = Some(TypeKind::LLong); // long long
-                            } else {
-                                kind = Some(TypeKind::Long);
-                            }
-                        }
-                        _ => {
-                            if kind.is_none() {
-                                return Err(CError::UnknownType {
-                                    span: t.span,
-                                    name: t.s(&self.pp.src_arena).to_owned()
-                                });
-                            }
+            if self.current_token.kind != TK::Ident {
+                break;
+            }
 
-                            break;  // Next token is not a type keyword, stop
-                        }
+            let t = self.current_token;
+            match t.hash {
+                HASH_INT    => { kind = Some(TypeKind::Int);    self.next(); }
+                HASH_CHAR   => { kind = Some(TypeKind::Char);   self.next(); }
+                HASH_SHORT  => { kind = Some(TypeKind::Short);  self.next(); }
+                HASH_VOID   => { kind = Some(TypeKind::Void);   self.next(); }
+                HASH_FLOAT  => { kind = Some(TypeKind::Float);  self.next(); }
+                HASH_DOUBLE => { kind = Some(TypeKind::Double); self.next(); }
+                HASH_LONG   => {
+                    self.next();
+                    if self.current_token.hash == HASH_LONG {
+                        self.next();
+                        kind = Some(TypeKind::LLong); // long long
+                    } else {
+                        kind = Some(TypeKind::Long);
                     }
                 }
+                _ => {
+                    if kind.is_none() {
+                        return Err(CError::UnknownType {
+                            span: t.span,
+                            name: t.s(&self.pp.src_arena).to_owned()
+                        });
+                    }
 
-                _ => break,
+                    break;  // Next token is not a type keyword, stop
+                }
             }
         }
 
@@ -3035,7 +3993,7 @@ impl Compiler {
         while self.current_token.kind == TK::Star {
             self.next();
             let mut ptr_quals = QualFlags::empty();
-            if self.current_token.kind == TK::Ident && self.current_token.hash == HASH_CONST {
+            if self.current_token.hash == HASH_CONST {
                 ptr_quals |= QualFlags::CONST;
                 self.next();
             }
@@ -3176,6 +4134,14 @@ impl Compiler {
                 std::process::exit(1);
             }
         }
+
+        if !self.pp.ifdef_stack.is_empty() {
+            eprintln!("warning: {} unclosed #if/#ifdef at end of file",
+                      self.pp.ifdef_stack.len());
+            for (i, s) in self.pp.ifdef_stack.iter().enumerate() {
+                eprintln!("  [{}] {:?}", i, s);
+            }
+        }
     }
 
     fn compile_top_level(&mut self) -> CResult<()> {
@@ -3194,10 +4160,10 @@ impl Compiler {
         // Consume specifiers
         //
         loop {
-            match self.current_token.kind {
-                TK::Ident if self.current_token.hash == HASH_EXTERN => { top_flags.insert(TopLevelFlags::EXTERN); self.next(); }
-                TK::Ident if self.current_token.hash == HASH_STATIC => { top_flags.insert(TopLevelFlags::STATIC); self.next(); }
-                TK::Ident if self.current_token.hash == HASH_INLINE => { top_flags.insert(TopLevelFlags::INLINE); self.next(); }
+            match self.current_token.hash {
+                HASH_EXTERN => { top_flags.insert(TopLevelFlags::EXTERN); self.next(); }
+                HASH_STATIC => { top_flags.insert(TopLevelFlags::STATIC); self.next(); }
+                HASH_INLINE => { top_flags.insert(TopLevelFlags::INLINE); self.next(); }
                 _ => break,
             }
         }
@@ -3218,7 +4184,7 @@ impl Compiler {
                     self.next(); // ]
                     self.type_table.array_of(ret_ty, 0) // Placeholder
                 } else {
-                    let len = self.parse_const_int()? as u32;
+                    let len = self.try_parse_and_eval_const_int()? as u32;
                     self.expect(TK::RSquare, "']'")?;
                     self.type_table.array_of(ret_ty, len)
                 }
@@ -3340,9 +4306,8 @@ impl Compiler {
             return Ok((params, false));
         }
 
-        if  self.current_token.kind == TK::Ident &&
-            self.current_token.hash == HASH_VOID &&
-            self.next_token.kind    == TK::RParen
+        if self.current_token.hash == HASH_VOID &&
+           self.next_token.kind    == TK::RParen
         {
             self.next(); return Ok((params, false));
         }
@@ -3378,7 +4343,7 @@ impl Compiler {
                 else if h == HASH_WHILE         { self.compile_while()      }
                 else if h == HASH_BREAK         { self.compile_break(self.current_token.span)    }
                 else if h == HASH_CONTINUE      { self.compile_continue(self.current_token.span) }
-                else if HASH_TYPES.contains(&h) { self.compile_local_decl() }
+                else if HASHES_THAT_START_TYPES.contains(&h) { self.compile_local_decl() }
                 else                            { self.compile_expr_stmt()  }
             }
 
@@ -3450,7 +4415,7 @@ impl Compiler {
 
         self.compile_stmt()?; // then
 
-        if self.current_token.kind == TK::Ident && self.current_token.hash == HASH_ELSE {
+        if self.current_token.hash == HASH_ELSE {
             self.next(); // else
             let jmp_patch = self.buf.jmp_rel32(); // jmp .end
             self.buf.patch_rel32(je_patch, self.buf.pos());
@@ -3572,7 +4537,7 @@ impl Compiler {
 
         if self.current_token.kind != TK::SemiColon {
             let h = self.current_token.hash;
-            if HASH_TYPES.contains(&h) {
+            if HASHES_THAT_START_TYPES.contains(&h) {
                 self.compile_local_decl()?;
             } else {
                 self.compile_expr()?;
@@ -3788,7 +4753,7 @@ impl Compiler {
         let (is_bss, data_off) = match ty {
             TypeKind::Int | TypeKind::Short | TypeKind::Long |
             TypeKind::LLong | TypeKind::Char => {
-                let v = self.parse_const_int()?;
+                let v = self.try_parse_and_eval_const_int()?;
                 if v == 0 {
                     let off = self.bss_size;
                     self.bss_size += size;
@@ -3808,7 +4773,7 @@ impl Compiler {
             }
 
             TypeKind::Float | TypeKind::Double => {
-                let v = self.parse_const_float()?;
+                let v = self.try_parse_eval_const_float()?;
                 if v == 0.0 {
                     let off = self.bss_size;
                     self.bss_size += self.type_table.size_of(ty_ref) as usize;
@@ -3884,7 +4849,7 @@ impl Compiler {
                             self.compile_expr()?;
                             self.vstack.pop();
                         } else {
-                            let v = self.parse_const_int()?;
+                            let v = self.try_parse_and_eval_const_int()?;
                             match self.type_table.get_kind(elem_ty) {  // @Cutnpaste from above
                                 TypeKind::Char  => self.data.push(v as u8),
                                 TypeKind::Short => self.data.extend_from_slice(&(v as i16).to_le_bytes()),
@@ -4166,7 +5131,7 @@ impl Compiler {
 
                 return self.compile_inferred_array_length_local_decl(ty, name_tok);
             } else if self.current_token.kind == TK::Number {
-                let len = self.parse_const_int()? as u32;
+                let len = self.try_parse_and_eval_const_int()? as u32;
                 self.expect(TK::RSquare, "']'")?;
                 self.type_table.array_of(ty, len)
             } else {
@@ -4416,10 +5381,26 @@ impl Compiler {
     }
 
     #[inline]
-    fn compile_additive(&mut self, op: TK, _span: Span) -> CResult<()> {
+    fn compile_additive(&mut self, op: TK, span: Span) -> CResult<()> {
         let vrhs = self.pop_vstack_and_decay_array()?;
         let vlhs = self.pop_vstack_and_decay_array()?;
 
+        if vlhs.kind == VK::Imm && vrhs.kind == VK::Imm {
+            // Constant folding
+            let result = match op {
+                TK::Plus  => vlhs.imm.wrapping_add(vrhs.imm),
+                TK::Minus => vlhs.imm.wrapping_sub(vrhs.imm),
+                _ => { return self.compile_additive_impl(op, span, vlhs, vrhs); }
+            };
+            self.vstack.push(CValue::imm(vlhs.ty, result));
+            return Ok(());
+        }
+
+        self.compile_additive_impl(op, span, vlhs, vrhs)
+    }
+
+    #[inline]
+    fn compile_additive_impl(&mut self, op: TK, _span: Span, vlhs: CValue, vrhs: CValue) -> CResult<()> {
         // Float path
         if self.is_float(vlhs.ty) || self.is_float(vrhs.ty) {
             return self.compile_float_binop(op, vlhs, vrhs);
@@ -4449,10 +5430,7 @@ impl Compiler {
     }
 
     #[inline]
-    fn compile_multiplicative(&mut self, op: TK, span: Span) -> CResult<()> {
-        let vrhs = self.vstack.pop();
-        let vlhs = self.vstack.pop();
-
+    fn compile_multiplicative_impl(&mut self, op: TK, span: Span, vlhs: CValue, vrhs: CValue) -> CResult<()> {
         // Float path
         if self.is_float(vlhs.ty) || self.is_float(vrhs.ty) {
             return self.compile_float_binop(op, vlhs, vrhs);
@@ -4495,9 +5473,44 @@ impl Compiler {
     }
 
     #[inline]
+    fn compile_multiplicative(&mut self, op: TK, span: Span) -> CResult<()> {
+        let vrhs = self.vstack.pop();
+        let vlhs = self.vstack.pop();
+
+        if vlhs.kind == VK::Imm && vrhs.kind == VK::Imm && !self.is_float(vlhs.ty) {
+            let result = match op {
+                TK::Star  => vlhs.imm.wrapping_mul(vrhs.imm),
+                TK::Slash => if vrhs.imm != 0 { vlhs.imm / vrhs.imm } else { 0 },
+                _ => unreachable!(),
+            };
+            self.vstack.push(CValue::imm(vlhs.ty, result));
+            return Ok(());
+        }
+
+        self.compile_multiplicative_impl(op, span, vlhs, vrhs)
+    }
+
+    #[inline]
     fn compile_bitwise(&mut self, op: TK) -> CResult<()> {
-        let (rhs, _)  = self.pop_reg()?;
-        let (lhs, ty) = self.pop_reg()?;
+        let rhs = self.vstack.pop();
+        let lhs = self.vstack.pop();
+
+        if lhs.kind == VK::Imm && rhs.kind == VK::Imm {
+            let result = match op {
+                TK::BinAnd => lhs.imm & rhs.imm,
+                TK::BinOr  => lhs.imm | rhs.imm,
+                TK::Xor    => lhs.imm ^ rhs.imm,
+                _ => unreachable!(),
+            };
+            self.vstack.push(CValue::imm(lhs.ty, result));
+            return Ok(());
+        }
+
+        let ty = lhs.ty;
+
+        let rhs = self.force_gp(rhs)?;
+        let lhs = self.force_gp(lhs)?;
+
         match op {
             TK::BinAnd => self.buf.and_rr(lhs, rhs),
             TK::BinOr  => self.buf.or_rr(lhs, rhs),
@@ -4611,8 +5624,25 @@ impl Compiler {
 
     #[inline]
     fn compile_cmp(&mut self, op: TK) -> CResult<()> {
-        let rhs = self.pop_vstack_and_decay_array()?;
-        let lhs = self.pop_vstack_and_decay_array()?;
+        let rhs = self.vstack.pop();
+        let lhs = self.vstack.pop();
+
+        if lhs.kind == VK::Imm && rhs.kind == VK::Imm && !self.is_float(lhs.ty) {
+            let result = match op {
+                TK::EqEq      => (lhs.imm == rhs.imm) as i64,
+                TK::NotEq     => (lhs.imm != rhs.imm) as i64,
+                TK::Less      => (lhs.imm <  rhs.imm) as i64,
+                TK::Greater   => (lhs.imm >  rhs.imm) as i64,
+                TK::LessEq    => (lhs.imm <= rhs.imm) as i64,
+                TK::GreaterEq => (lhs.imm >= rhs.imm) as i64,
+                _ => unreachable!(),
+            };
+            self.vstack.push(CValue::imm(TYPE_INT, result));
+            return Ok(());
+        }
+
+        let rhs = self.decay_array(rhs)?;
+        let lhs = self.decay_array(lhs)?;
 
         let lhs_ty = self.get_kind(lhs.ty);
         let rhs_ty = self.get_kind(rhs.ty);
@@ -4852,39 +5882,83 @@ impl Compiler {
     }
 
     #[inline]
-    fn parse_const_int(&mut self) -> CResult<i64> {
-        let neg = self.current_token.kind == TK::Minus;
-        if neg { self.next(); }
-        let t = self.expect(TK::Number, "constant")?;
-        let v = Self::parse_number_int(self.s(t));
-        Ok(if neg { -v } else { v })
+    fn with_rollback<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let buf_pos           = self.buf.pos();
+        let rodata_pos        = self.rodata.len();
+        let rodata_relocs_len = self.rodata_relocs.len();
+        let data_relocs_len   = self.data_relocs.len();
+        let vstack_top        = self.vstack.top;
+        let regs_used         = self.regs.used;
+        let xmms_used         = self.xmms.used;
+
+        let result = f(self);
+
+        self.buf.bytes.truncate(buf_pos);
+        self.rodata.truncate(rodata_pos);
+        self.rodata_relocs.truncate(rodata_relocs_len);
+        self.data_relocs.truncate(data_relocs_len);
+        self.vstack.top = vstack_top;
+        self.regs.used  = regs_used;
+        self.xmms.used  = xmms_used;
+
+        result
     }
 
     #[inline]
-    fn parse_const_float(&mut self) -> CResult<f64> {
-        let neg = self.current_token.kind == TK::Minus;
-        if neg { self.next(); }
-        let t = self.expect(TK::Number, "constant")?;
-        let v = Self::parse_number_float(self.s(t));
-        Ok(if neg { -v } else { v })
+    fn try_eval_const_expr(&mut self) -> CResult<CValue> {
+        self.with_rollback(|c| {
+            c.compile_expr()?;
+            Ok(c.vstack.pop())
+        })
     }
 
     #[inline]
-    fn parse_number_int(s: &str) -> i64 {
-        let s = s.trim_end_matches(|c| matches!(c, 'u'|'U'|'l'|'L'));  // @Incomplete
-        if s.starts_with("0x") || s.starts_with("0X") {
-            u64::from_str_radix(&s[2..], 16).unwrap_or(0) as i64
+    fn try_parse_and_eval_const_int(&mut self) -> CResult<i64> {
+        let v = self.try_eval_const_expr()?;
+
+        if matches!(v.kind, VK::Imm) {
+            Ok(v.imm)
         } else {
-            s.parse::<u64>().map(|v| v as i64)
-                .or_else(|_| s.parse::<i64>())
-                .unwrap_or(0)
+            return Err(CError::Expected {
+                span: self.current_token.span,
+                expected: "constant integer expression",
+                got: format!("{:?}", v.kind),
+            })
         }
     }
 
     #[inline]
-    fn parse_number_float(s: &str) -> f64 {
-        let s = if s.ends_with('f') { &s[..s.len()-1] } else { s };
-        s.parse().unwrap_or(0.0)
+    fn try_parse_eval_const_float(&mut self) -> CResult<f64> {
+        let rodata_before = self.rodata.len();
+
+        self.with_rollback(|c| {
+            c.compile_expr()?;
+            let v = c.vstack.pop();
+
+            Ok(match v.kind {
+                VK::Imm => v.fimm,
+
+                VK::Reg => {
+                    let rodata_off = rodata_before;
+                    match c.type_table.get_kind(v.ty) {
+                        TypeKind::Float => {
+                            let bytes = &c.rodata[rodata_off..rodata_off+4];
+                            f32::from_bits(u32::from_le_bytes(bytes.try_into().unwrap())) as f64
+                        }
+                        _ => {
+                            let bytes = &c.rodata[rodata_off..rodata_off+8];
+                            f64::from_bits(u64::from_le_bytes(bytes.try_into().unwrap()))
+                        }
+                    }
+                }
+
+                _ => return Err(CError::Expected {
+                    span: c.current_token.span,
+                    expected: "constant float expression",
+                    got: format!("{:?}", v.kind),
+                })
+            })
+        })
     }
 
     fn compile_primary(&mut self) -> CResult<()> {
@@ -4897,7 +5971,7 @@ impl Compiler {
                 let is_float_literal = s.contains('.');
 
                 if !is_float_literal {
-                    let v = Self::parse_number_int(s);
+                    let v = parse_number_int(s);
                     self.vstack.push(CValue::imm(TYPE_INT, v));
                     return Ok(())
                 }
@@ -4907,7 +5981,7 @@ impl Compiler {
                 //
 
                 let is_float = s.ends_with('f');
-                let v = Self::parse_number_float(s);
+                let v = parse_number_float(s);
                 let ty = if is_float { TYPE_FLOAT } else { TYPE_DOUBLE };
 
                 let rodata_off = self.rodata.len() as u32;
@@ -5038,7 +6112,7 @@ impl Compiler {
                     });
 
                     if self.type_table.get_kind(gv.ty) == TypeKind::Array {
-                        // array: push as Reg (already have the address from lea_rip)
+                        // Array: push as Reg (already have the address from lea_rip)
                         let elem_ty = self.type_table.get(gv.ty).elem();
                         let ptr_ty  = self.type_table.ptr_to(elem_ty);
                         self.vstack.push(CValue::gp(ptr_ty, dst));
@@ -5566,14 +6640,32 @@ fn main() {
         eprintln!("usage: ccrush <file.c> [-o out.o]"); std::process::exit(1);
     }
 
+    if args.contains(&"-debug-tokens".into()) {
+        debug_tokens(Path::new(&args[1]));
+        return;
+    }
+
     let out_path = args.iter()
         .position(|s| s == "-o")
         .and_then(|i| args.get(i+1)).map(|s| s.as_str()).unwrap_or("out.o");
 
-    let pp = match PP::from_path(Path::new(&args[1])) {
+    let mut pp = match PP::from_path(Path::new(&args[1])) {
         Ok(pp) => pp,
         Err(e) => { e.emit(&SrcArena::new()); std::process::exit(1); }
     };
+
+    // parse -DFOO or -DFOO=BAR args before creating PP
+    for arg in &args {
+        if let Some(def) = arg.strip_prefix("-D") {
+            // define FOO or FOO=BAR
+            let (name, val) = if let Some(eq) = def.find('=') {
+                (&def[..eq], &def[eq+1..])
+            } else {
+                (def, "1")
+            };
+            pp.define_simple(name, val);
+        }
+    }
 
     let mut c = Compiler::new(pp);
     c.compile();
@@ -5706,6 +6798,9 @@ fn run_main(mut c: Compiler) {
     let f: extern "C" fn(i32, *const *const u8, *const *const u8) -> i32 = unsafe {
         std::mem::transmute(base as usize + main_off)
     };
-    let result = f(argc, argv.as_ptr(), envp.as_ptr());
+
+    let argv_ptr = argv.as_ptr();
+    let envp_ptr = envp.as_ptr();
+    let result = f(argc, argv_ptr, envp_ptr);
     std::process::exit(result);
 }
