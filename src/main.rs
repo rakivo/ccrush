@@ -4129,7 +4129,7 @@ pub struct Compiler {
 
     pub ret_ty:        TypeRef,
 
-    pub type_table:    TypeTable,
+    pub types:         TypeTable,
     pub typedefs:      IntMap<u64, TypeRef>,
 
     pub data:          Vec<u8>,
@@ -4163,16 +4163,16 @@ impl DerefMut for Compiler {
 
 #[allow(unused)]
 impl Compiler {  // TypeTable helpers
-    #[inline] fn ty(&self, id: TypeRef) -> &TypeEntry { self.type_table.get(id) }
-    #[inline] fn is_float(&self, id: TypeRef) -> bool { self.type_table.get(id).is_float() }
-    #[inline] fn is_integer(&self, id: TypeRef) -> bool { self.type_table.get(id).is_integer() }
-    #[inline] fn is_ptr(&self, id: TypeRef) -> bool { self.type_table.get(id).is_ptr() }
-    #[inline] fn is_array(&self, id: TypeRef) -> bool { self.type_table.get(id).is_array() }
-    #[inline] fn size_of(&self, id: TypeRef) -> u32 { self.type_table.size_of(id) }
-    #[inline] fn align_of(&self, id: TypeRef) -> u32 { self.type_table.align_of(id) }
-    #[inline] fn is64(&self, id: TypeRef) -> bool { self.type_table.size_of(id) == 8 }
-    #[inline] fn get(&self, id: TypeRef) -> &TypeEntry { self.type_table.get(id) }
-    #[inline] fn get_kind(&self, id: TypeRef) -> TypeKind { self.type_table.get_kind(id) }
+    #[inline] fn ty(&self, id: TypeRef) -> &TypeEntry { self.types.get(id) }
+    #[inline] fn is_float(&self, id: TypeRef) -> bool { self.types.get(id).is_float() }
+    #[inline] fn is_integer(&self, id: TypeRef) -> bool { self.types.get(id).is_integer() }
+    #[inline] fn is_ptr(&self, id: TypeRef) -> bool { self.types.get(id).is_ptr() }
+    #[inline] fn is_array(&self, id: TypeRef) -> bool { self.types.get(id).is_array() }
+    #[inline] fn size_of(&self, id: TypeRef) -> u32 { self.types.size_of(id) }
+    #[inline] fn align_of(&self, id: TypeRef) -> u32 { self.types.align_of(id) }
+    #[inline] fn is64(&self, id: TypeRef) -> bool { self.types.size_of(id) == 8 }
+    #[inline] fn get(&self, id: TypeRef) -> &TypeEntry { self.types.get(id) }
+    #[inline] fn get_kind(&self, id: TypeRef) -> TypeKind { self.types.get_kind(id) }
 }
 
 impl Compiler {
@@ -4182,7 +4182,7 @@ impl Compiler {
             pp,
             in_global_context: true,
             loop_stack: Vec::new(),
-            type_table: TypeTable::new(),
+            types: TypeTable::new(),
             typedefs: Default::default(),
             vla_sizes: Default::default(),
             data: Vec::new(), globals: GlobalTable::new(),
@@ -4249,12 +4249,12 @@ impl Compiler {
             if self.current_token.kind == TK::RSquare {
                 self.next();
 
-                ty = self.type_table.array_of(ty, 0);
+                ty = self.types.array_of(ty, 0);
             } else if self.current_token.kind == TK::Number || !self.is_hash_a_local_or_a_global(self.current_token.hash) {
                 let len = self.try_parse_and_eval_const_int()? as u32;
                 self.expect(TK::RSquare, "']'")?;
 
-                ty = self.type_table.array_of(ty, len);
+                ty = self.types.array_of(ty, len);
             } else {
                 if self.in_global_context {
                     return Err(CError::VlaInGlobalContext { span: self.current_token.span });
@@ -4268,7 +4268,7 @@ impl Compiler {
                 self.buf.mov_store(Reg::Rbp, dim_off, r, true);
                 self.regs.free(r);
 
-                ty = self.type_table.alloc_fresh(
+                ty = self.types.alloc_fresh(
                     TypeKind::Array, QualFlags::empty(), TypeFlags::empty(),
                     ty, 0, dim_off as u32
                 );
@@ -4354,7 +4354,7 @@ impl Compiler {
         } else if is_type_builtin(ty) && quals.difference(QualFlags::UNSIGNED).is_empty() {
             unsign_a_builtin_type(ty)
         } else {
-            self.type_table.qualify(ty, quals)
+            self.types.qualify(ty, quals)
         };
 
         //
@@ -4373,7 +4373,7 @@ impl Compiler {
                 }
             }
 
-            ty = self.type_table.intern(TypeKind::Ptr, ptr_quals, TypeFlags::empty(), ty, 0, 0);
+            ty = self.types.intern(TypeKind::Ptr, ptr_quals, TypeFlags::empty(), ty, 0, 0);
         }
 
         //
@@ -4581,9 +4581,9 @@ impl Compiler {
         if top_flags.contains(TopLevelFlags::EXTERN) { flags.insert(SymFlags::EXTERN) };
 
         let param_types = params.iter().map(|(ty, _)| *ty).collect::<SmallVec<[_; MAX_PARAMS]>>();
-        let param_start = self.type_table.alloc_params(&param_types);
+        let param_start = self.types.alloc_params(&param_types);
 
-        let func_ty = self.type_table.make_func(ret_ty, param_start, params.len() as _, is_variadic);
+        let func_ty = self.types.make_func(ret_ty, param_start, params.len() as _, is_variadic);
 
         if flags.contains(SymFlags::EXTERN) || self.current_token.kind == TK::SemiColon {
             self.expect(TK::SemiColon, "';'")?;
@@ -4637,7 +4637,7 @@ impl Compiler {
         // Spill args to stack (convenience, for pop_reg)
         //
         for (i, (ty, phash)) in params.iter().enumerate() {
-            let off = self.locals.alloc(*phash, *ty, &self.type_table);
+            let off = self.locals.alloc(*phash, *ty, &self.types);
             self.emit_int_store(Reg::Rbp, off, ARG_REGS[i], *ty);
         }
 
@@ -5115,7 +5115,7 @@ impl Compiler {
             //
 
             let name: SmallString<_> = name.s(&self.src_arena).into();
-            self.type_table.set_type_name(ty, name);
+            self.types.set_type_name(ty, name);
         }
 
         Ok(())
@@ -5140,7 +5140,7 @@ impl Compiler {
                 self.next(); // [
                 if self.current_token.kind == TK::RSquare {
                     self.next();
-                    self.type_table.array_of(base_ty, 0)
+                    self.types.array_of(base_ty, 0)
                 } else {
                     let len = self.try_parse_and_eval_const_int()? as u32;
                     self.expect(TK::RSquare, "']'")?;
@@ -5193,7 +5193,7 @@ impl Compiler {
             //
 
             if ty == TypeKind::Array {
-                let arr_len = self.type_table.get(ty_ref).array_len() as usize;
+                let arr_len = self.types.get(ty_ref).array_len() as usize;
                 let inferred = arr_len == 0;  // @Note: Shouldn't be a VLA since its a global..?
 
                 if inferred {
@@ -5241,7 +5241,7 @@ impl Compiler {
                 let v = self.try_parse_eval_const_float()?;
                 if v == 0.0 {
                     let off = self.bss_size;
-                    self.bss_size += self.type_table.size_of(ty_ref) as usize;
+                    self.bss_size += self.types.size_of(ty_ref) as usize;
                     (true, off as u32)
                 } else {
                     let off = self.data.len() as u32;
@@ -5257,13 +5257,13 @@ impl Compiler {
                 // Has initializer
                 let off = self.data.len() as u32;
 
-                let elem_ty = self.type_table.get(ty_ref).elem();
-                let elem_sz = self.type_table.size_of(elem_ty) as usize;
-                let arr_len = self.type_table.get(ty_ref).array_len() as usize;
+                let elem_ty = self.types.get(ty_ref).elem();
+                let elem_sz = self.types.size_of(elem_ty) as usize;
+                let arr_len = self.types.get(ty_ref).array_len() as usize;
                 let inferred = arr_len == 0;  // @Note: Shouldn't be a VLA since its a global..?
 
                 let actual_len = if self.current_token.kind == TK::StrLit &&
-                    self.type_table.get_kind(elem_ty) == TypeKind::Char
+                    self.types.get_kind(elem_ty) == TypeKind::Char
                 {
                     //
                     // Initialized global array of bytes (string)
@@ -5315,7 +5315,7 @@ impl Compiler {
                             self.vstack.pop();
                         } else {
                             let v = self.try_parse_and_eval_const_int()?;
-                            match self.type_table.get_kind(elem_ty) {  // @Cutnpaste from above
+                            match self.types.get_kind(elem_ty) {  // @Cutnpaste from above
                                 TypeKind::Char  => self.data.push(v as u8),
                                 TypeKind::Short => self.data.extend_from_slice(&(v as i16).to_le_bytes()),
                                 TypeKind::Int   => self.data.extend_from_slice(&(v as i32).to_le_bytes()),
@@ -5340,7 +5340,7 @@ impl Compiler {
                     actual_len
                 };
 
-                let array_ty = self.type_table.array_of(elem_ty, actual_len as _);
+                let array_ty = self.types.array_of(elem_ty, actual_len as _);
 
                 //
                 // Insert the global here, with our computed type in case the size was inferred: int arr[] = {..}
@@ -5392,12 +5392,12 @@ impl Compiler {
     }
 
     fn compile_array_initializer(&mut self, base_off: i32, arr_ty: TypeRef) -> CResult<u32> {
-        let elem_ty  = self.type_table.get(arr_ty).elem();
-        let elem_sz  = self.type_table.size_of(elem_ty) as i32;
-        let arr_len  = self.type_table.get(arr_ty).array_len() as i32;
+        let elem_ty  = self.types.get(arr_ty).elem();
+        let elem_sz  = self.types.size_of(elem_ty) as i32;
+        let arr_len  = self.types.get(arr_ty).array_len() as i32;
         let inferred = arr_len == 0;
 
-        if self.type_table.get_kind(elem_ty) == TypeKind::Char
+        if self.types.get_kind(elem_ty) == TypeKind::Char
             && self.current_token.kind == TK::StrLit
         {
             //
@@ -5489,7 +5489,7 @@ impl Compiler {
     #[inline]
     fn compile_inferred_array_length_local_decl(&mut self, ty: TypeRef, name_tok: Token) -> CResult<()> {
         if self.current_token.kind == TK::StrLit
-            && self.type_table.get_kind(ty) == TypeKind::Char
+            && self.types.get_kind(ty) == TypeKind::Char
         {
             //
             // Initialized global array of bytes (string)
@@ -5501,8 +5501,8 @@ impl Compiler {
             let s   = &raw[1..raw.len()-1];
             let len = Self::unescape_len(s) + 1;
 
-            let real_ty = self.type_table.array_of(ty, len as u32);
-            let off = self.locals.alloc(name_tok.hash, real_ty, &self.type_table);
+            let real_ty = self.types.array_of(ty, len as u32);
+            let off = self.locals.alloc(name_tok.hash, real_ty, &self.types);
             self.compile_array_initializer(off, real_ty)?;
 
             return Ok(());
@@ -5511,8 +5511,8 @@ impl Compiler {
         // Collect initializer tokens to count and replay
         let (elem_count, toks) = self.collect_brace_initializer()?;
 
-        let real_ty = self.type_table.array_of(ty, elem_count);
-        let off = self.locals.alloc(name_tok.hash, real_ty, &self.type_table);
+        let real_ty = self.types.array_of(ty, elem_count);
+        let off = self.locals.alloc(name_tok.hash, real_ty, &self.types);
 
         //
         // Replay tokens and compile initializer
@@ -5544,13 +5544,13 @@ impl Compiler {
 
     #[inline]
     fn accumulate_vla_size(&mut self, ty: TypeRef, acc: Reg, span: Span) -> CResult<()> {
-        if self.type_table.get_kind(ty) != TypeKind::Array {
-            let sz = self.type_table.size_of(ty) as i32;
+        if self.types.get_kind(ty) != TypeKind::Array {
+            let sz = self.types.size_of(ty) as i32;
             if sz > 1 { self.buf.imul_ri(acc, sz); }
             return Ok(());
         }
 
-        let e    = *self.type_table.get(ty);
+        let e    = *self.types.get(ty);
         let elem = e.elem();
         if e.is_vla() {
             //
@@ -5587,7 +5587,7 @@ impl Compiler {
         // Build inside-out: rightmost is innermost
         let mut ty = base_ty;
         for &len in dims.iter().rev() {
-            ty = self.type_table.array_of(ty, len);
+            ty = self.types.array_of(ty, len);
         }
 
         Ok(ty)
@@ -5669,7 +5669,7 @@ impl Compiler {
                 let len = self.try_parse_and_eval_const_int()? as u32;
                 self.expect(TK::RSquare, "']'")?;
 
-                let ty = self.type_table.array_of(base_ty, len);
+                let ty = self.types.array_of(base_ty, len);
                 self.compile_array_dim_loop(ty)?
             } else {
                 //
@@ -5684,7 +5684,7 @@ impl Compiler {
                 self.buf.mov_store(Reg::Rbp, dim_off, r, true);
                 self.regs.free(r);
 
-                let ty = self.type_table.alloc_fresh(
+                let ty = self.types.alloc_fresh(
                     TypeKind::Array, QualFlags::empty(), TypeFlags::empty(),
                     base_ty, 0, dim_off as u32
                 );
@@ -5695,15 +5695,15 @@ impl Compiler {
         };
 
         // VLA
-        if self.type_table.get(ty).is_vla() {
+        if self.types.get(ty).is_vla() {
             return self.finish_vla_local_decl(ty, name_tok);
         }
 
         let hash = name_tok.hash;
-        let off  = self.locals.alloc(hash, ty, &self.type_table);
+        let off  = self.locals.alloc(hash, ty, &self.types);
         if self.current_token.kind == TK::Eq {
             self.next();
-            if self.type_table.get_kind(ty) == TypeKind::Array {
+            if self.types.get_kind(ty) == TypeKind::Array {
                 self.compile_array_initializer(off, ty)?;
             } else {
                 self.compile_expr_no_comma()?;
@@ -5885,11 +5885,11 @@ impl Compiler {
 
     #[inline]
     fn decay_array_type(&mut self, ty: TypeRef) -> TypeRef {
-        if self.type_table.get_kind(ty) != TypeKind::Array {
+        if self.types.get_kind(ty) != TypeKind::Array {
             return ty;
         }
 
-        let arr     = self.type_table.get(ty);
+        let arr     = self.types.get(ty);
         let elem_ty = arr.elem();
 
         //
@@ -5901,28 +5901,28 @@ impl Compiler {
             elem_ty
         } else {
             // Merge with any quals already on the element type
-            let existing = self.type_table.get(elem_ty).quals;
-            self.type_table.qualify(elem_ty, existing | inherited)
+            let existing = self.types.get(elem_ty).quals;
+            self.types.qualify(elem_ty, existing | inherited)
         };
 
-        let ptr_ty = self.type_table.ptr_to(elem_ty);
-        self.type_table.associate_type_name(ty, ptr_ty);
+        let ptr_ty = self.types.ptr_to(elem_ty);
+        self.types.associate_type_name(ty, ptr_ty);
 
         ptr_ty
     }
 
     #[inline]
     fn decay_array(&mut self, v: CValue) -> CResult<CValue> {
-        if self.type_table.get_kind(v.ty) != TypeKind::Array {
+        if self.types.get_kind(v.ty) != TypeKind::Array {
             return Ok(v);
         }
 
-        if self.type_table.get(v.ty).is_vla() {
+        if self.types.get(v.ty).is_vla() {
             // rbp_off holds pointer to array base - load it
             let r = self.regs.alloc(Span::POISONED)?;
             self.buf.mov_load(r, Reg::Rbp, v.offset, true);
-            let elem_ty = self.type_table.get(v.ty).elem();
-            let ptr_ty  = self.type_table.ptr_to(elem_ty);
+            let elem_ty = self.types.get(v.ty).elem();
+            let ptr_ty  = self.types.ptr_to(elem_ty);
             return Ok(CValue::gp(ptr_ty, r));
         }
 
@@ -6148,8 +6148,8 @@ impl Compiler {
             (vrhs, vlhs, vrhs.ty)
         };
 
-        let elem_ty = self.type_table.deref(ptr_ty);
-        let elem_sz = self.type_table.size_of(elem_ty) as i32;
+        let elem_ty = self.types.deref(ptr_ty);
+        let elem_sz = self.types.size_of(elem_ty) as i32;
 
         let base  = self.force_gp(ptr_val)?;
         let idx_r = self.force_gp(idx_val)?;
@@ -6163,8 +6163,8 @@ impl Compiler {
 
     #[inline]
     fn compile_ptr_sub(&mut self, vlhs: CValue, vrhs: CValue) -> CResult<()> {
-        let elem_ty = self.type_table.deref(vlhs.ty);
-        let elem_sz = self.type_table.size_of(elem_ty) as i32;
+        let elem_ty = self.types.deref(vlhs.ty);
+        let elem_sz = self.types.size_of(elem_ty) as i32;
 
         if self.is_ptr(vrhs.ty) {
             // ptr - ptr = ptrdiff
@@ -6340,7 +6340,7 @@ impl Compiler {
                 self.buf.lea(dst, base, v.offset);
                 if v.kind == VK::RegInd { self.regs.free(base); }
 
-                let new_type = self.type_table.ptr_to(v.ty);
+                let new_type = self.types.ptr_to(v.ty);
                 self.vstack.push(CValue::gp(new_type, dst));
             }
 
@@ -6384,12 +6384,12 @@ impl Compiler {
                     return Err(CError::Expected {
                         span: star.span,
                         expected: "array or pointer",
-                        got: self.type_table.to_string(v.ty)
+                        got: self.types.to_string(v.ty)
                     })
                 }
 
                 let r  = self.force_gp(v)?;
-                let ty = self.type_table.deref(v.ty);
+                let ty = self.types.deref(v.ty);
 
                 self.vstack.push(CValue::regind(ty, r, 0));
             }
@@ -6402,8 +6402,8 @@ impl Compiler {
 
     #[inline]
     fn emit_int_load(&mut self, dst: Reg, base: Reg, off: i32, ty: TypeRef) {
-        let unsigned = self.type_table.is_unsigned(ty);
-        match self.type_table.size_of(ty) {
+        let unsigned = self.types.is_unsigned(ty);
+        match self.types.size_of(ty) {
             1 => if unsigned { self.buf.movzx8_load(dst, base, off) }
                  else        { self.buf.movsx8_load(dst, base, off) },
             2 => if unsigned { self.buf.movzx16_load(dst, base, off) }
@@ -6415,7 +6415,7 @@ impl Compiler {
 
     #[inline]
     fn emit_int_store(&mut self, base: Reg, off: i32, src: Reg, ty: TypeRef) {
-        match self.type_table.size_of(ty) {
+        match self.types.size_of(ty) {
             1 => self.buf.mov_store8(base, off, src),
             2 => self.buf.mov_store16(base, off, src),
             4 => self.buf.mov_store(base, off, src, false),
@@ -6552,7 +6552,7 @@ impl Compiler {
 
                 VK::Reg => {
                     let rodata_off = rodata_before;
-                    match c.type_table.get_kind(v.ty) {
+                    match c.types.get_kind(v.ty) {
                         TypeKind::Float => {
                             let bytes = &c.rodata[rodata_off..rodata_off+4];
                             f32::from_bits(u32::from_le_bytes(bytes.try_into().unwrap())) as f64
@@ -6646,7 +6646,7 @@ impl Compiler {
                 let patch = self.buf.lea_rip(dst);
                 self.rodata_relocs.push(RodataReloc { text_off: patch as _, rodata_off });
 
-                let new_type = self.type_table.ptr_to(TYPE_CHAR);
+                let new_type = self.types.ptr_to(TYPE_CHAR);
                 self.vstack.push(CValue::gp(new_type, dst));
             }
 
@@ -6691,7 +6691,7 @@ impl Compiler {
 
                     if has_parens { self.expect(TK::RParen, "')'")?; }
 
-                    if self.type_table.get(ty).is_vla() {
+                    if self.types.get(ty).is_vla() {
                         let r = if let Some(&size_off) = self.vla_sizes.get(&ty) {
                             //
                             // Named local VLA - single load from cached size
@@ -6710,7 +6710,7 @@ impl Compiler {
 
                         self.vstack.push(CValue::gp(TYPE_INT, r));
                     } else {
-                        let size = self.type_table.size_of(ty);
+                        let size = self.types.size_of(ty);
                         self.vstack.push(CValue::imm(TYPE_INT, size as _));
                     }
                 } else if self.current_token.kind == TK::LParen {
@@ -6759,7 +6759,7 @@ impl Compiler {
                     });
 
                     if !self.dont_decay_types_of_array_globals_to_pointers &&
-                        self.type_table.get_kind(gv.ty) == TypeKind::Array
+                        self.types.get_kind(gv.ty) == TypeKind::Array
                     {
                         // Array: push as Reg (already have the address from lea_rip)
                         let ptr_ty = self.decay_array_type(gv.ty);
@@ -6803,25 +6803,25 @@ impl Compiler {
             let idx = self.vstack.pop();
             let ptr = self.pop_vstack_and_decay_array()?;
 
-            let (elem_ty, base) = match self.type_table.get_kind(ptr.ty) {
+            let (elem_ty, base) = match self.types.get_kind(ptr.ty) {
                 TypeKind::Ptr => {
-                    let elem_ty = self.type_table.deref(ptr.ty);
+                    let elem_ty = self.types.deref(ptr.ty);
                     (elem_ty, self.force_gp(ptr)?)
                 }
                 _ => return Err(CError::Expected {
                     span: self.current_token.span,
                     expected: "array or pointer",
-                    got: self.type_table.to_string(ptr.ty)
+                    got: self.types.to_string(ptr.ty)
                 })
             };
 
             let idx_r = self.force_gp(idx)?;
-            if self.type_table.get(elem_ty).is_vla() {
+            if self.types.get(elem_ty).is_vla() {
                 let stride_r = self.compute_vla_flat_size(elem_ty, Span::POISONED)?;
                 self.buf.imul_rr(idx_r, stride_r);
                 self.regs.free(stride_r);
             } else {
-                let elem_sz = self.type_table.size_of(elem_ty) as i32;
+                let elem_sz = self.types.size_of(elem_ty) as i32;
                 self.scale_index(idx_r, elem_sz);
             }
             self.buf.add_rr(base, idx_r);
@@ -6840,7 +6840,7 @@ impl Compiler {
                 VK::Reg | VK::RegInd => {}
             }
 
-            let spill_off = self.locals.alloc(0, v.ty, &self.type_table);
+            let spill_off = self.locals.alloc(0, v.ty, &self.types);
 
             if self.is_float(v.ty) {
                 let xmm = if v.kind == VK::RegInd {
@@ -6890,7 +6890,7 @@ impl Compiler {
 
         let sym = self.syms[sym_index];
 
-        let func_type_entry = self.type_table.get(sym.func_ty);
+        let func_type_entry = self.types.get(sym.func_ty);
         let param_count = func_type_entry.param_count();
         let ret_ty = func_type_entry.ret_ty();
 
@@ -6915,7 +6915,7 @@ impl Compiler {
             self.compile_expr_no_comma()?;
             let v = self.pop_vstack_and_decay_array()?;
 
-            let spill_off = self.locals.alloc(0, v.ty, &self.type_table);
+            let spill_off = self.locals.alloc(0, v.ty, &self.types);
 
             if self.is_float(v.ty) {
                 let xmm = self.coerce_to_xmm(v, v.ty)?;
@@ -7325,7 +7325,7 @@ fn main() {
     c.compile();
 
     #[cfg(debug_assertions)]
-    for (i, e) in c.type_table.entries.iter() {
+    for (i, e) in c.types.entries.iter() {
         eprintln!("  [{i:?}] {:?} quals={:?} ref_={:?} extra={}", e.kind, e.quals, e.ref_, e.extra);
     }
 
