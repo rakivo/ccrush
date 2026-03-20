@@ -297,6 +297,9 @@ pub enum CError {
     #[error("argument count mismatch for '{name}' (expected {expected})")]
     ArgumentCountMismatch { span: Span, name: String, expected: usize },
 
+    #[error("VLA's can only exist in functions")]
+    VlaInGlobalContext { span: Span },
+
     #[error("variable-length array cannot have an initializer")]
     VlaWithInitializer { span: Span },
 
@@ -322,6 +325,7 @@ impl CError {
             CError::BreakOutsideLoop { span, .. } => *span,
             CError::ContinueOutsideLoop { span, .. } => *span,
             CError::VlaWithInitializer { span, .. } => *span,
+            CError::VlaInGlobalContext { span, .. } => *span,
             CError::RegSpill    { span, .. } => *span,
         }
     }
@@ -437,6 +441,8 @@ const HASH_ELIF:     u64 = hash_str("elif");
 const HASH_ENDIF:    u64 = hash_str("endif");
 const HASH_BREAK:    u64 = hash_str("break");
 const HASH_CONTINUE: u64 = hash_str("continue");
+
+const HASH_HIDDEN_LOCAL: u64 = 0;
 
 const HASHES_THAT_START_TYPES: &[u64] = &[
     HASH_INT, HASH_LONG, HASH_CHAR, HASH_VOID,
@@ -2136,6 +2142,7 @@ impl PP {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TypeRef(u32);
 entity_impl!(TypeRef);
+impl nohash_hasher::IsEnabled for TypeRef {}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct FieldRef(u32);
@@ -2324,6 +2331,17 @@ impl TypeEntry {
     #[inline]
     pub fn is_noreturn(&self) -> bool {
         self.flags.contains(TypeFlags::NORETURN)
+    }
+
+    #[inline]
+    pub fn is_vla(&self) -> bool {
+        self.kind == TypeKind::Array && self.extra == 0
+    }
+
+    #[inline]
+    pub fn vla_dim_off(&self) -> i32 {
+        debug_assert!(self.is_vla());
+        self.extra2 as i32
     }
 }
 
@@ -2576,6 +2594,17 @@ impl TypeTable {
     ) -> TypeRef {
         let e = TypeEntry { kind, quals, flags, ref_, _pad: 0, extra, extra2 };
         self.intern_raw(e)
+    }
+
+    #[inline(always)]
+    pub fn alloc_fresh(
+        &mut self, kind: TypeKind,
+        quals: QualFlags, flags: TypeFlags,
+        ref_: TypeRef,
+        extra: u32, extra2: u32
+    ) -> TypeRef {
+        let e = TypeEntry { kind, quals, flags, ref_, _pad: 0, extra, extra2 };
+        self.entries.push(e)
     }
 
     #[inline]
@@ -3825,8 +3854,8 @@ impl LocalTable {
     }
 
     #[inline]
-    pub fn alloc(&mut self, hash: u64, ty: TypeRef, type_table: &TypeTable) -> i32 {
-        self.frame_bytes += type_table.size_of(ty) as i32;
+    fn alloc_impl(&mut self, hash: u64, ty: TypeRef, size: i32) -> i32 {
+        self.frame_bytes += size;
         let rbp_off = -(self.frame_bytes);
 
         let idx = self.locals.len() as u32;
@@ -3841,6 +3870,16 @@ impl LocalTable {
         }
 
         rbp_off
+    }
+
+    #[inline]
+    pub fn alloc(&mut self, hash: u64, ty: TypeRef, type_table: &TypeTable) -> i32 {
+        self.alloc_impl(hash, ty, type_table.size_of(ty) as _)
+    }
+
+    #[inline]
+    pub fn alloc_vla(&mut self, hash: u64, vla_ty: TypeRef) -> i32 {
+        self.alloc_impl(hash, vla_ty, 8)
     }
 
     #[inline]
@@ -4079,12 +4118,15 @@ pub struct Compiler {
 
     // Reset per function
     pub locals:        LocalTable,
+    pub globals:       GlobalTable,
+
+    pub in_global_context:                             bool,   // @KindaHack, used in compile_type
+    pub dont_decay_types_of_array_globals_to_pointers: bool,   // @KindaHack, used in sizeof
+
     pub ret_ty:        TypeRef,
 
-    pub type_table:    TypeTable,
+    pub type_table:         TypeTable,
     pub typedefs:      IntMap<u64, TypeRef>,
-
-    pub globals:       GlobalTable,
 
     pub data:          Vec<u8>,
     pub data_relocs:   Vec<DataReloc>,
@@ -4098,7 +4140,7 @@ pub struct Compiler {
     pub rodata:        Vec<u8>,
     pub rodata_relocs: Vec<RodataReloc>,
 
-    pub dont_decay_types_of_array_globals_to_pointers: bool,   // @KindaHack, used in sizeof
+    pub vla_sizes:     IntMap<TypeRef, i32>,  // Fresh TypeRef -> rbp_off of total byte size local
 
     pub pp:            PP,
 }
@@ -4134,9 +4176,11 @@ impl Compiler {
     pub fn new(pp: PP) -> Self {
         Self {
             pp,
+            in_global_context: true,
             loop_stack: Vec::new(),
             type_table: TypeTable::new(),
             typedefs: Default::default(),
+            vla_sizes: Default::default(),
             data: Vec::new(), globals: GlobalTable::new(),
             bss_size: 0, data_relocs: Vec::new(),
             buf: CodeBuf::new(), vstack: ValueStack::new(),
@@ -4191,6 +4235,43 @@ impl Compiler {
             c.dont_decay_types_of_array_globals_to_pointers = false;
             Ok(c.vstack.pop().ty)
         })
+    }
+
+    #[inline]
+    fn compile_array_dim_loop(&mut self, mut ty: TypeRef) -> CResult<TypeRef> {
+        while self.current_token.kind == TK::LSquare {
+            self.next(); // [
+
+            if self.current_token.kind == TK::RSquare {
+                self.next();
+
+                ty = self.type_table.array_of(ty, 0);
+            } else if self.current_token.kind == TK::Number || !self.is_hash_a_local_or_a_global(self.current_token.hash) {
+                let len = self.try_parse_and_eval_const_int()? as u32;
+                self.expect(TK::RSquare, "']'")?;
+
+                ty = self.type_table.array_of(ty, len);
+            } else {
+                if self.in_global_context {
+                    return Err(CError::VlaInGlobalContext { span: self.current_token.span });
+                }
+
+                self.compile_expr()?;
+                self.expect(TK::RSquare, "']'")?;
+
+                let (r, _) = self.pop_reg()?;
+                let dim_off = self.locals.alloc_vla(HASH_HIDDEN_LOCAL, TYPE_LONG);
+                self.buf.mov_store(Reg::Rbp, dim_off, r, true);
+                self.regs.free(r);
+
+                ty = self.type_table.alloc_fresh(
+                    TypeKind::Array, QualFlags::empty(), TypeFlags::empty(),
+                    ty, 0, dim_off as u32
+                );
+            }
+        }
+
+        Ok(ty)
     }
 
     #[inline]
@@ -4289,6 +4370,14 @@ impl Compiler {
             }
 
             ty = self.type_table.intern(TypeKind::Ptr, ptr_quals, TypeFlags::empty(), ty, 0, 0);
+        }
+
+        //
+        // Array dims - only in type-only contexts (sizeof, typeof, cast)
+        // Declarator dims are handled in compile_local_decl and compile_top_level.
+        //
+        if !self.in_global_context && self.current_token.kind == TK::LSquare {
+            ty = self.compile_array_dim_loop(ty)?;
         }
 
         Ok(ty)
@@ -4438,6 +4527,8 @@ impl Compiler {
             }
         }
 
+        self.in_global_context = true;
+
         if self.current_token.hash == HASH_TYPEDEF {
             return self.compile_typedef();
         }
@@ -4526,6 +4617,8 @@ impl Compiler {
         self.locals = LocalTable::new();
         self.regs   = RegAlloc::new();
         self.ret_ty = ret_ty;
+        self.vla_sizes = Default::default();
+        self.in_global_context = false;
 
         let code_off = self.buf.pos() as u32;
         let mut code_len = 0;
@@ -5406,54 +5499,41 @@ impl Compiler {
     }
 
     #[inline]
-    fn compile_vla_decl(&mut self, elem_ty: TypeRef, name_tok: Token) -> CResult<()> {
-        // Compile size expression
-        self.compile_expr()?;
-        self.expect(TK::RSquare, "']'")?;
+    fn compute_vla_flat_size(&mut self, ty: TypeRef, span: Span) -> CResult<Reg> {
+        let r = self.regs.alloc(span)?;
+        self.buf.mov_ri64(r, 1);
+        self.accumulate_vla_size(ty, r, span)?;
+        Ok(r)
+    }
 
-        // Handle trailing constant dimensions: int vla[n][4][8]
-        // elem_ty becomes array(4, array(8, orig_elem_ty)) so size_of is correct
-        let elem_ty = if self.current_token.kind == TK::LSquare {
-            let first_len = { self.next(); self.try_parse_and_eval_const_int()? as u32 };
-            self.expect(TK::RSquare, "']'")?;
-            self.parse_array_dims(elem_ty, first_len)?
+    #[inline]
+    fn accumulate_vla_size(&mut self, ty: TypeRef, acc: Reg, span: Span) -> CResult<()> {
+        if self.type_table.get_kind(ty) != TypeKind::Array {
+            let sz = self.type_table.size_of(ty) as i32;
+            if sz > 1 { self.buf.imul_ri(acc, sz); }
+            return Ok(());
+        }
+
+        let e    = *self.type_table.get(ty);
+        let elem = e.elem();
+        if e.is_vla() {
+            //
+            // Runtime dim - load from hidden local and multiply
+            //
+
+            let tmp = self.regs.alloc(span)?;
+            self.buf.mov_load(tmp, Reg::Rbp, e.vla_dim_off(), true);
+            self.buf.imul_rr(acc, tmp);
+            self.regs.free(tmp);
         } else {
-            elem_ty
-        };
+            //
+            // Comptime dim
+            //
 
-        // VLAs cannot have initializers
-        if self.current_token.kind == TK::Eq {
-            return Err(CError::VlaWithInitializer { span: self.current_token.span });
+            self.buf.imul_ri(acc, e.array_len() as i32);
         }
 
-        // Size is on vstack - materialize it
-        let (size_r, _) = self.pop_reg()?;
-
-        // Multiply by elem_sz to get byte count
-        let elem_sz = self.type_table.size_of(elem_ty) as i64;
-        if elem_sz > 1 {
-            self.buf.imul_ri(size_r, elem_sz as i32);
-        }
-
-        // Align to 16: size = (size + 15) & ~15 (SYSV)
-        self.buf.add_ri8(size_r, 15);
-        self.buf.and_ri(size_r, -16);
-
-        // sub rsp, size_r
-        self.buf.sub_rr(Reg::Rsp, size_r);
-        self.regs.free(size_r);
-
-        // Save rsp (the array base) into a pointer local
-        let ptr_ty  = self.type_table.ptr_to(elem_ty);
-        let hash    = name_tok.hash;
-        let ptr_off = self.locals.alloc(hash, ptr_ty, &self.type_table);
-
-        // mov [rbp + ptr_off], rsp
-        self.buf.mov_store(Reg::Rbp, ptr_off, Reg::Rsp, true);
-
-        self.expect(TK::SemiColon, "';'")?;
-        Ok(())
-
+        self.accumulate_vla_size(elem, acc, span)
     }
 
     /// Parse `[len][len]...` dimensions (all must be constant expressions).
@@ -5478,35 +5558,99 @@ impl Compiler {
     }
 
     #[inline]
+    fn finish_vla_local_decl(&mut self, outermost_ty: TypeRef, name_tok: Token) -> CResult<()> {
+        if self.current_token.kind == TK::Eq {
+            return Err(CError::VlaWithInitializer { span: self.current_token.span });
+        }
+
+        //
+        // Compute total size
+        //
+        let total_r = self.regs.alloc(name_tok.span)?;
+        self.buf.mov_ri64(total_r, 1);   // So we don't multiply 0
+        self.accumulate_vla_size(outermost_ty, total_r, name_tok.span)?;
+
+        //
+        // Cache total size
+        //
+        let size_off = self.locals.alloc_vla(HASH_HIDDEN_LOCAL, TYPE_LONG);
+        self.buf.mov_store(Reg::Rbp, size_off, total_r, true);
+        self.vla_sizes.insert(outermost_ty, size_off);
+
+        //
+        // Align to 16 (SYSV) and allocate on stack
+        //
+        self.buf.add_ri8(total_r, 15);
+        self.buf.and_ri(total_r, -16);
+        self.buf.sub_rr(Reg::Rsp, total_r);
+        self.regs.free(total_r);
+
+        //
+        // Named local: stores VLA array type, rbp_off = base pointer slot
+        //
+        let ptr_off = self.locals.alloc_vla(name_tok.hash, outermost_ty);
+        let array_base = Reg::Rsp;
+        self.buf.mov_store(Reg::Rbp, ptr_off, array_base, true);
+
+        self.expect(TK::SemiColon, "';'")?;
+        Ok(())
+    }
+
+    #[inline]
     fn compile_local_decl(&mut self) -> CResult<()> {
-        let ty       = self.compile_type()?;
+        let base_ty  = self.compile_type()?;
         let name_tok = self.eat_ident("variable name")?;
 
-        // @Cold
         //
-        // Array declarator
+        // Array declarator dims after the name
         //
+
         let ty = if self.current_token.kind == TK::LSquare {
             self.next(); // [
-
             if self.current_token.kind == TK::RSquare {
-                self.next(); // ]
+                // int arr[] = {...}
+                self.next();
                 self.expect(TK::Eq, "'='")?;
+                return self.compile_inferred_array_length_local_decl(base_ty, name_tok);
+            }
 
-                return self.compile_inferred_array_length_local_decl(ty, name_tok);
-            } else if self.current_token.kind == TK::Number || !self.is_hash_a_local_or_a_global(self.current_token.hash) {
+            //
+            // Parse first dim then loop for the rest
+            //
+
+            if self.current_token.kind == TK::Number || !self.is_hash_a_local_or_a_global(self.current_token.hash) {
                 let len = self.try_parse_and_eval_const_int()? as u32;
                 self.expect(TK::RSquare, "']'")?;
-                self.parse_array_dims(ty, len)?
+
+                let ty = self.type_table.array_of(base_ty, len);
+                self.compile_array_dim_loop(ty)?
             } else {
                 //
-                // VLA!
+                // First dim is a VLA
                 //
-                return self.compile_vla_decl(ty, name_tok);
+
+                self.compile_expr()?;
+                self.expect(TK::RSquare, "']'")?;
+
+                let (r, _) = self.pop_reg()?;
+                let dim_off = self.locals.alloc_vla(HASH_HIDDEN_LOCAL, TYPE_LONG);
+                self.buf.mov_store(Reg::Rbp, dim_off, r, true);
+                self.regs.free(r);
+
+                let ty = self.type_table.alloc_fresh(
+                    TypeKind::Array, QualFlags::empty(), TypeFlags::empty(),
+                    base_ty, 0, dim_off as u32
+                );
+                self.compile_array_dim_loop(ty)?
             }
         } else {
-            ty
+            base_ty
         };
+
+        // VLA
+        if self.type_table.get(ty).is_vla() {
+            return self.finish_vla_local_decl(ty, name_tok);
+        }
 
         let hash = name_tok.hash;
         let off  = self.locals.alloc(hash, ty, &self.type_table);
@@ -5718,6 +5862,16 @@ impl Compiler {
         if self.type_table.get_kind(v.ty) != TypeKind::Array {
             return Ok(v);
         }
+
+        if self.type_table.get(v.ty).is_vla() {
+            // rbp_off holds pointer to array base - load it
+            let r = self.regs.alloc(Span::POISONED)?;
+            self.buf.mov_load(r, Reg::Rbp, v.offset, true);
+            let elem_ty = self.type_table.get(v.ty).elem();
+            let ptr_ty  = self.type_table.ptr_to(elem_ty);
+            return Ok(CValue::gp(ptr_ty, r));
+        }
+
 
         let ptr_ty = self.decay_array_type(v.ty);
 
@@ -6302,13 +6456,14 @@ impl Compiler {
 
     #[inline]
     fn try_parse_and_eval_const_int(&mut self) -> CResult<i64> {
+        let expr_start_span = self.current_token.span;
         let v = self.try_eval_const_expr()?;
 
         if matches!(v.kind, VK::Imm) {
             Ok(v.imm)
         } else {
             return Err(CError::Expected {
-                span: self.current_token.span,
+                span: expr_start_span,
                 expected: "constant integer expression",
                 got: format!("{:?}", v.kind),
             })
@@ -6472,8 +6627,28 @@ impl Compiler {
 
                     if has_parens { self.expect(TK::RParen, "')'")?; }
 
-                    let size = self.type_table.size_of(ty);
-                    self.vstack.push(CValue::imm(TYPE_INT, size as _));
+                    if self.type_table.get(ty).is_vla() {
+                        let r = if let Some(&size_off) = self.vla_sizes.get(&ty) {
+                            //
+                            // Named local VLA - single load from cached size
+                            //
+
+                            let r = self.regs.alloc(Span::POISONED)?;
+                            self.buf.mov_load(r, Reg::Rbp, size_off, true);
+                            r
+                        } else {
+                            //
+                            // Type-form sizeof(int[n][m]) - walk and multiply
+                            //
+
+                            self.compute_vla_flat_size(ty, Span::POISONED)?
+                        };
+
+                        self.vstack.push(CValue::gp(TYPE_INT, r));
+                    } else {
+                        let size = self.type_table.size_of(ty);
+                        self.vstack.push(CValue::imm(TYPE_INT, size as _));
+                    }
                 } else if self.current_token.kind == TK::LParen {
                     self.compile_call(hash, name_tok)?;
                 } else if let Some(lv) = self.locals.find(hash) {
@@ -6577,8 +6752,14 @@ impl Compiler {
             };
 
             let idx_r = self.force_gp(idx)?;
-            let elem_sz = self.type_table.size_of(elem_ty) as i32;
-            self.scale_index(idx_r, elem_sz);
+            if self.type_table.get(elem_ty).is_vla() {
+                let stride_r = self.compute_vla_flat_size(elem_ty, Span::POISONED)?;
+                self.buf.imul_rr(idx_r, stride_r);
+                self.regs.free(stride_r);
+            } else {
+                let elem_sz = self.type_table.size_of(elem_ty) as i32;
+                self.scale_index(idx_r, elem_sz);
+            }
             self.buf.add_rr(base, idx_r);
             self.regs.free(idx_r);
             self.vstack.push(CValue::regind(elem_ty, base, 0));
