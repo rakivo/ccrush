@@ -796,10 +796,10 @@ enum IfdefState {
 }
 
 pub struct PP {
-    src_arena:         SrcArena,
-
     current_token:     Token,
     next_token:        Token,
+
+    src_arena:         SrcArena,
 
     ifdef_stack:       Vec<IfdefState>,
     file_stack:        Vec<FileFrame>,
@@ -2155,7 +2155,7 @@ entity_impl!(FieldRef);
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct FieldEntry {
-    pub name:       u32,     // interned string id,                   0 otherwise
+    pub name:       u64,
     pub ty:         TypeRef, // field type
     pub offset:     u32,     // byte offset within struct/union
 
@@ -2251,7 +2251,7 @@ pub struct TypeEntry {
     pub flags:  TypeFlags,   // 1 byte
     pub _pad:   u8,          // 1 byte
     pub ref_:   TypeRef,     // 4 bytes - pointee     / element     / return type
-    pub extra:  u32,         // 4 bytes - array len   / field start / param start
+    pub extra:  u32,         // 4 bytes - field start / param start / array len (0 for VLA)
     pub extra2: u32,         // 4 bytes - field count / param count
 }
 
@@ -2395,6 +2395,14 @@ pub const fn unsign_a_builtin_type(ty: TypeRef) -> TypeRef {
 
 pub struct TypeName {
     ty: TypeRef,
+
+    //
+    // @Memory
+    //
+    // I'm not sure if we'll ever gonna need to have
+    // builtin types with associated type names,
+    // but if we didn't, we could use a Span instead.
+    //
     s: SmallString<[u8; 23]>
 }
 
@@ -2413,9 +2421,14 @@ pub struct TypeTable {
     map_mask: usize,
     map_used: usize,
 
+    //
     // Sub-pools
-    pub field_pool: Vec<FieldEntry>,
-    pub param_pool: Vec<TypeRef>,    // Func param types
+    //
+
+    pub param_pool:  Vec<TypeRef>,    // Func param types
+
+    pub field_pool:  Vec<FieldEntry>,
+    pub field_names: Vec<Span>,      // Global field index -> span
 
     //
     // Typenames @Note:
@@ -2426,7 +2439,7 @@ pub struct TypeTable {
     // with scalars for example), they need to be associated ONLY with struct/enum/union types,
     // since those can introduce new names, i.e. `typedef struct { ref: u32; } TypeRef`
     //
-    pub type_names: SparseMap<TypeRef, TypeName>
+    pub type_names: SparseMap<TypeRef, TypeName>,
 }
 
 impl TypeTable {
@@ -2444,6 +2457,7 @@ impl TypeTable {
             map_vals:   vec![TypeRef(0); cap],
             map_mask:   cap - 1,
             map_used:   0,
+            field_names: Vec::with_capacity(256),
             field_pool: Vec::with_capacity(256),
             param_pool: Vec::with_capacity(256),
             type_names: SparseMap::new()
@@ -2736,9 +2750,10 @@ impl TypeTable {
     }
 
     #[inline]
-    pub fn alloc_fields(&mut self, fields: &[FieldEntry]) -> (u32, u32) {
+    pub fn alloc_fields(&mut self, fields: &[FieldEntry], field_names: &[Span]) -> (u32, u32) {
         let start = self.field_pool.len() as u32;
         self.field_pool.extend_from_slice(fields);
+        self.field_names.extend_from_slice(field_names);
         (start, fields.len() as u32)
     }
 
@@ -2750,7 +2765,14 @@ impl TypeTable {
     }
 
     #[inline]
-    pub fn find_field(&self, start: u32, count: u32, name: u32) -> Option<&FieldEntry> {
+    pub fn field_name_slice(&self, start: u32, count: u32) -> &[Span] {
+        let s = start as usize;
+        let e = s + count as usize;
+        &self.field_names[s..e]
+    }
+
+    #[inline]
+    pub fn find_field(&self, start: u32, count: u32, name: u64) -> Option<&FieldEntry> {
         self.field_slice(start, count).iter().find(|f| f.name == name)
     }
 
@@ -2784,6 +2806,8 @@ impl TypeTable {
     // Mutates field_pool in-place.
     #[inline]
     pub fn layout_union(&mut self, start: u32, count: u32) -> (u32, u32) {
+        // @Cutnpaste from layout_struct
+
         let mut max_size:  u32 = 0;
         let mut max_align: u32 = 1;
 
@@ -4131,6 +4155,7 @@ pub struct Compiler {
 
     pub types:         TypeTable,
     pub typedefs:      IntMap<u64, TypeRef>,
+    pub tags:          IntMap<u64, TypeRef>,
 
     pub data:          Vec<u8>,
     pub data_relocs:   Vec<DataReloc>,
@@ -4181,6 +4206,7 @@ impl Compiler {
         Self {
             pp,
             in_global_context: true,
+            tags: Default::default(),
             loop_stack: Vec::new(),
             types: TypeTable::new(),
             typedefs: Default::default(),
@@ -4278,7 +4304,78 @@ impl Compiler {
         Ok(ty)
     }
 
-    #[inline]
+    fn compile_struct(&mut self) -> CResult<TypeRef> {
+        if self.current_token.hash == HASH_STRUCT { self.next(); }
+
+        let tag = (self.current_token.kind == TK::Ident).then(|| self.next());
+
+        if let Some(tag) = tag && let Some(&ty) = self.tags.get(&tag.hash) {
+            // @Incomplete: Check that ty is a struct.
+            return Ok(ty);
+        }
+
+        if self.current_token.kind != TK::LCurly{
+            let t = tag.filter(|t| t.hash != HASH_STRUCT).unwrap_or(self.current_token);
+
+            return Err(CError::UnknownType {
+                name: t.s(&self.src_arena).to_owned(),
+                span: t.span
+            });
+        }
+
+        self.next(); // {
+
+        let mut field_names   = Vec::new();
+        let mut field_entries = Vec::<FieldEntry>::new();
+        loop {
+            let ty = match self.current_token.kind {
+                TK::RCurly => break,
+
+                TK::Comma => {
+                    self.next();
+                    field_entries.last().unwrap().ty  // @Incomplete
+                }
+
+                TK::SemiColon => {
+                    self.next();
+                    continue;
+                }
+
+                _ => self.compile_type()?
+            };
+
+            let name = self.eat_ident("field name")?;
+
+            let e = FieldEntry {
+                ty,
+                name: name.hash,
+
+                offset: 0,   // Set during struct layouting
+
+                _pad: 0,
+
+                // @Incomplete
+                bit_offset: 0,
+                bit_width:  0
+            };
+
+            field_entries.push(e);
+            field_names.push(name.span);
+        }
+
+        self.expect(TK::RCurly, "'}'")?;
+
+        let (start, count) = self.types.alloc_fields(&field_entries, &field_names);
+        _ = self.types.layout_struct(start, count);  // @Speed: Cache layouts?
+
+        let ty = self.types.make_struct(start, count);
+        if let Some(tag) = tag {
+            self.tags.insert(tag.hash, ty);
+        }
+
+        Ok(ty)
+    }
+
     fn compile_type(&mut self) -> CResult<TypeRef> {
         let mut quals = QualFlags::empty();
         let mut ty = None;
@@ -4300,11 +4397,10 @@ impl Compiler {
                 HASH_LONG => {
                     self.next();
                     ty = Some(match self.current_token.hash {
-                        HASH_LONG   => { self.next(); TYPE_LLONG   }    // long long
-                        HASH_INT    => { self.next(); TYPE_LONG    }    // long int (explicit)
-                        // @Incomplete
-                        // HASH_DOUBLE => { self.next(); TYPE_LDOUBLE } // long double
-                        _           =>                TYPE_LONG         // bare long
+                        HASH_LONG   => { self.next(); TYPE_LLONG   }  // long long
+                        HASH_INT    => { self.next(); TYPE_LONG    }  // long int (explicit)
+                        HASH_DOUBLE => { self.next(); TYPE_LDOUBLE }  // long double
+                        _           =>                TYPE_LONG       // bare long
                     });
                 }
                 HASH_CONST    => { quals |= QualFlags::CONST;    self.next(); }
@@ -4326,6 +4422,12 @@ impl Compiler {
                     ty = Some(self.parse_expr_and_get_its_type()?);
 
                     if has_parens { self.expect(TK::RParen, "')'")?; }
+                }
+
+                HASH_STRUCT => {
+                    self.next(); // struct
+
+                    ty = Some(self.compile_struct()?);
                 }
 
                 //
@@ -4537,6 +4639,12 @@ impl Compiler {
             return self.compile_typedef();
         }
 
+        if self.current_token.hash == HASH_STRUCT {
+            _ = self.compile_struct()?;
+            self.expect(TK::SemiColon, "';'")?;
+            return Ok(());
+        }
+
         let mut top_flags = TopLevelFlags::empty();
 
         //
@@ -4717,6 +4825,7 @@ impl Compiler {
                 else if h == HASH_IF            { self.compile_if()         }
                 else if h == HASH_FOR           { self.compile_for()        }
                 else if h == HASH_WHILE         { self.compile_while()      }
+                else if h == HASH_STRUCT        { self.compile_struct().map(|_| ()) }
                 else if h == HASH_BREAK         { self.compile_break(self.current_token.span)    }
                 else if h == HASH_CONTINUE      { self.compile_continue(self.current_token.span) }
                 else if self.can_hash_start_a_type(h) { self.compile_local_decl() }
