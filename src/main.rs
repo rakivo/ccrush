@@ -450,18 +450,18 @@ const HASH_ELSE:     u64 = hash_str("else");
 const HASH_ELIF:     u64 = hash_str("elif");
 const HASH_ENDIF:    u64 = hash_str("endif");
 const HASH_BREAK:    u64 = hash_str("break");
+const HASH_BOOL:     u64 = hash_str("bool");
+const HASH__BOOL:    u64 = hash_str("_Bool");
 const HASH_CONTINUE: u64 = hash_str("continue");
 
 const HASH_HIDDEN_LOCAL: u64 = 0;
 
 const HASHES_THAT_START_TYPES: &[u64] = &[
-    HASH_INT, HASH_LONG, HASH_CHAR, HASH_VOID,
+    HASH_INT, HASH_BOOL, HASH__BOOL, HASH_LONG, HASH_CHAR, HASH_VOID,
     HASH_FLOAT, HASH_DOUBLE, HASH_SHORT,
 
-    HASH_UNION,
-    HASH_STRUCT,
-    HASH_TYPEOF,
-    HASH_TYPEDEF,
+    HASH_ENUM, HASH_UNION, HASH_STRUCT,
+    HASH_TYPEOF, HASH_TYPEDEF,
 
     // Qualifiers can start a type too...... Sigh.............
     HASH_UNSIGNED, HASH_SIGNED,
@@ -629,6 +629,7 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileRef) -> Token {
 #[inline]
 fn parse_number_int(s: &str) -> i64 {
     let s = s.trim_end_matches(|c| matches!(c, 'u'|'U'|'l'|'L'));  // @Incomplete
+
     if s.starts_with("0x") || s.starts_with("0X") {
         u64::from_str_radix(&s[2..], 16).unwrap_or(0) as i64
     } else {
@@ -4632,6 +4633,7 @@ impl Compiler {
             let t = self.current_token;
             if t.kind != TK::Ident { break; }
             match t.hash {
+                HASH_BOOL | HASH__BOOL => { if ty.is_none() { ty = Some(TYPE_BOOL); } self.next(); }
                 HASH_INT    => { if ty.is_none() { ty = Some(TYPE_INT);    } self.next(); }
                 HASH_CHAR   => { if ty.is_none() { ty = Some(TYPE_CHAR);   } self.next(); }
                 HASH_SHORT  => { if ty.is_none() { ty = Some(TYPE_SHORT);  } self.next(); }
