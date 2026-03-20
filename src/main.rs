@@ -2793,12 +2793,18 @@ impl TypeTable {
     }
 
     #[inline]
-    pub fn patch_forward_decl(&mut self, ty: TypeRef, start: u32, count: u32, is_union: bool) {
+    pub fn patch_struct_forward_decl(&mut self, ty: TypeRef, start: u32, count: u32, is_union: bool) {
         let e = &mut self.entries[ty];
         e.kind   = if is_union { TypeKind::Union } else { TypeKind::Struct };
         e.flags  = TypeFlags::empty();
         e.extra  = start;
         e.extra2 = count;
+    }
+
+    #[inline]
+    pub fn patch_enum_forward_decl(&mut self, ty: TypeRef) {
+        let e = &mut self.entries[ty];
+        e.flags = TypeFlags::empty();
     }
 
     // Lay out a struct: compute offsets respecting alignment, return (size, align).
@@ -4195,6 +4201,7 @@ pub struct Compiler {
     pub types:         TypeTable,
     pub typedefs:      IntMap<u64, TypeRef>,
     pub tags:          IntMap<u64, TypeRef>,
+    pub enum_consts:   IntMap<u64, i64>,
 
     pub data:          Vec<u8>,
     pub data_relocs:   Vec<DataReloc>,
@@ -4248,6 +4255,7 @@ impl Compiler {
             tags: Default::default(),
             loop_stack: Vec::new(),
             types: TypeTable::new(),
+            enum_consts: Default::default(),
             typedefs: Default::default(),
             vla_sizes: Default::default(),
             data: Vec::new(), globals: GlobalTable::new(),
@@ -4486,13 +4494,16 @@ impl Compiler {
         let ty = if let Some(tag) = tag && let Some(&existing_ty) = self.tags.get(&tag.hash)
             && self.types.get(existing_ty).flags == TypeFlags::FORWARD_DECLARATION
         {
+            //
             // Patch the forward declaration in-place
+            //
+
             if is_union {
                 self.types.layout_union(start, count);
             } else {
                 self.types.layout_struct(start, count);
             }
-            self.types.patch_forward_decl(existing_ty, start, count, is_union);
+            self.types.patch_struct_forward_decl(existing_ty, start, count, is_union);
 
             existing_ty  // reuse the same TypeRef
         } else {
@@ -4506,6 +4517,106 @@ impl Compiler {
         };
 
         if let Some(tag) = tag { self.tags.insert(tag.hash, ty); }
+
+        Ok(ty)
+    }
+
+    fn compile_enum(&mut self) -> CResult<TypeRef> {
+        let tag = (
+            self.current_token.kind == TK::Ident
+                && !self.can_hash_start_a_type(self.current_token.hash)
+        ).then(|| self.next());
+
+        //
+        // Return existing if already defined and no body
+        //
+        if let Some(tag) = tag && let Some(&existing_ty) = self.tags.get(&tag.hash) {
+            //
+            // If already fully defined, return it
+            // If it's an incomplete forward decl and we have a body, fall through
+            //
+            let is_incomplete =
+                self.types.get(existing_ty).flags == TypeFlags::FORWARD_DECLARATION;
+
+            if !is_incomplete || self.current_token.kind != TK::LCurly {
+                return Ok(existing_ty);
+            }
+
+            // ... Fall through to parse the full definition
+        }
+
+        if self.current_token.kind != TK::LCurly {
+            if let Some(tag) = tag {
+                //
+                // Forward declaration - register incomplete type if not already known
+                //
+
+                if !self.tags.contains_key(&tag.hash) {
+                    //
+                    // Empty placeholder
+                    //
+
+                    let ty = self.types.intern(
+                        TypeKind::Enum,
+                        QualFlags::empty(),
+                        TypeFlags::FORWARD_DECLARATION,
+                        TypeRef(0), 0, 0
+                    );
+                    self.tags.insert(tag.hash, ty);
+                }
+
+                return Ok(*self.tags.get(&tag.hash).unwrap());
+            }
+
+            let t = tag.unwrap_or(self.current_token);
+            return Err(CError::UnknownType {
+                name: t.s(&self.src_arena).to_owned(),
+                span: t.span,
+            });
+        }
+
+        self.next(); // {
+
+        let mut next_val: i64 = 0;
+        while self.current_token.kind != TK::RCurly && !self.at_eof() {
+            let name_tok = self.eat_ident("enumerator name")?;
+
+            let val = if self.current_token.kind == TK::Eq {
+                self.next(); // =
+                let v = self.try_parse_and_eval_const_int()?;
+                next_val = v;
+                v
+            } else {
+                next_val
+            };
+
+            self.enum_consts.insert(name_tok.hash, val);
+            next_val += 1;
+
+            if self.current_token.kind == TK::Comma { self.next(); }
+        }
+
+        self.expect(TK::RCurly, "'}'")?;
+
+        let ty = if let Some(tag) = tag && let Some(&existing_ty) = self.tags.get(&tag.hash)
+            && self.types.get(existing_ty).flags == TypeFlags::FORWARD_DECLARATION
+        {
+            //
+            // Patch the forward declaration in-place
+            //
+
+            self.types.patch_enum_forward_decl(existing_ty);
+
+            existing_ty  // reuse the same TypeRef
+        } else {
+            self.types.intern(
+                TypeKind::Enum, QualFlags::empty(), TypeFlags::empty(),
+                TypeRef(0), 0, 0
+            )
+        };
+
+        if let Some(tag) = tag { self.tags.insert(tag.hash, ty); }
+
         Ok(ty)
     }
 
@@ -4565,6 +4676,11 @@ impl Compiler {
                 HASH_UNION => {
                     self.next(); // union
                     ty = Some(self.compile_union()?);
+                }
+
+                HASH_ENUM => {
+                    self.next(); // enum
+                    ty = Some(self.compile_enum()?);
                 }
 
                 //
@@ -4778,6 +4894,12 @@ impl Compiler {
 
         if self.current_token.hash == HASH_STRUCT {
             _ = self.compile_struct()?;
+            self.expect(TK::SemiColon, "';'")?;
+            return Ok(());
+        }
+
+        if self.current_token.hash == HASH_ENUM {
+            _ = self.compile_enum()?;
             self.expect(TK::SemiColon, "';'")?;
             return Ok(());
         }
@@ -6811,7 +6933,7 @@ impl Compiler {
     #[inline]
     fn try_eval_const_expr(&mut self) -> CResult<CValue> {
         self.with_rollback(|c| {
-            c.compile_expr()?;
+            c.compile_expr_no_comma()?;
             Ok(c.vstack.pop())
         })
     }
@@ -7065,7 +7187,9 @@ impl Compiler {
                     } else {
                         self.vstack.push(CValue::regind(gv.ty, dst, 0));
                     }
-                } else {
+                } else if let Some(&val) = self.enum_consts.get(&hash) {
+                    self.vstack.push(CValue::imm(TYPE_INT, val));
+                }  else {
                     return Err(CError::Undefined {
                         span: name_tok.span,
                         name: self.s(name_tok).to_owned()
