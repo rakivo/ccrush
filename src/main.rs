@@ -10,6 +10,7 @@
 // TODO(#15): Stack unwind info
 // TODO(#14): GCC statement expressions
 // TODO(#16): More declarators support: `void (*(*fp)(int))(float)`
+// TODO(#17): __builtin_bswap16, __builtin_*...
 
 //
 // @Cleanup: There's lots of unnecessary std::process::exit calls.
