@@ -5018,7 +5018,15 @@ impl Compiler {
         // Cond
         //
         self.buf.patch_rel32(jmp_cond, self.buf.pos());
-        if !cond_toks.is_empty() {
+        if cond_toks.is_empty() {
+            //
+            // Cond tokens are empty: for (.. ;; ..)
+            // this is an infinite loop.
+            //
+
+            let jmp = self.buf.jmp_rel32();
+            self.buf.patch_rel32(jmp, loop_top);
+        } else {
             let saved_cur  = self.pp.current_token;
             let saved_peek = self.pp.next_token;
 
