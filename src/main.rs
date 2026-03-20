@@ -159,9 +159,10 @@ pub fn emit_diag_impl(msg: &str, span: Span, arena: &SrcArena, is_warning: bool)
     const B: &str = "\x1b[1m";    const X: &str = "\x1b[0m";
     const Y: &str = "\x1b[0;33m";
 
+    let color = if is_warning { Y }         else { R };
+
     eprintln!(
         "{color}{what}{X}{B}: {msg}{X}",
-        color = if is_warning { Y }         else { R },
         what  = if is_warning { "warning" } else { "error" }
     );
     if span == Span::POISONED { return; }
@@ -219,7 +220,7 @@ pub fn emit_diag_impl(msg: &str, span: Span, arena: &SrcArena, is_warning: bool)
 
     eprintln!("{pad} {C}|{X}");
     eprintln!("{B}{lnum}{X} {C}|{X} {line_txt}");
-    eprintln!("{pad} {C}|{X} {}{R}{}{X}", " ".repeat(hl_s), "^".repeat(hl_l));
+    eprintln!("{pad} {C}|{X} {}{color}{}{X}", " ".repeat(hl_s), "^".repeat(hl_l));
     eprintln!("{pad} {C}|{X}");
 }
 
@@ -292,6 +293,9 @@ pub enum CError {
     #[error("unknown type '{name}'")]
     UnknownType { span: Span, name: String },
 
+    #[error("unknown field '{name}'")]
+    UnknownField { span: Span, name: String },
+
     #[error("undefined symbol '{name}'")]
     Undefined   { span: Span, name: String },
 
@@ -323,6 +327,7 @@ impl CError {
         match self {
             CError::Expected    { span, .. } => *span,
             CError::UnknownType { span, .. } => *span,
+            CError::UnknownField { span, .. } => *span,
             CError::Undefined   { span, .. } => *span,
             CError::NotLvalue   { span, .. } => *span,
             CError::ArgumentCountMismatch { span, .. } => *span,
@@ -346,8 +351,8 @@ pub type CResult<T> = Result<T, CError>;
 pub enum TK {
     Eof, Ident, Number, CharLit, StrLit,
     LSquare, RSquare, LParen, RParen, LCurly, RCurly,
-    Comma, SemiColon, TripleDot,
-    Plus, PlusPlus, Minus, MinusMinus,
+    Comma, Colon, SemiColon, TripleDot,
+    Plus, PlusPlus, Minus, MinusMinus, Arrow,
     PlusEq,         MinusEq,
     Less, LessLess, Greater, GreaterGreater,
     LessEq,         GreaterEq,
@@ -452,6 +457,7 @@ const HASHES_THAT_START_TYPES: &[u64] = &[
     HASH_INT, HASH_LONG, HASH_CHAR, HASH_VOID,
     HASH_FLOAT, HASH_DOUBLE, HASH_SHORT,
 
+    HASH_UNION,
     HASH_STRUCT,
     HASH_TYPEOF,
     HASH_TYPEDEF,
@@ -487,6 +493,7 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileRef) -> Token {
         b'('  => tok!(TK::LParen),  b')' => tok!(TK::RParen),
         b'{'  => tok!(TK::LCurly),  b'}' => tok!(TK::RCurly),
         b','  => tok!(TK::Comma),   b';' => tok!(TK::SemiColon),
+        b':'  => tok!(TK::Colon),
         b'~'  => tok!(TK::BitNot),
         b'*'  => tok2!(b'=', TK::StarEq,    TK::Star),
         b'^'  => tok2!(b'=', TK::XorEq,     TK::Xor),
@@ -522,6 +529,7 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileRef) -> Token {
         }
         b'-' => {
             if *pos < src.len() && src[*pos] == b'-' { *pos += 1; tok!(TK::MinusMinus) }
+            else if *pos < src.len() && src[*pos] == b'>' { *pos += 1; tok!(TK::Arrow) }
             else if *pos < src.len() && src[*pos] == b'=' { *pos += 1; tok!(TK::MinusEq) }
             else { tok!(TK::Minus) }
         }
@@ -2240,6 +2248,7 @@ bitflags::bitflags! {
         const NORETURN  = 0x02;
         const INLINE    = 0x04;
         const PACKED    = 0x08;
+        const FORWARD_DECLARATION = 0x10;
     }
 }
 
@@ -2776,6 +2785,15 @@ impl TypeTable {
         self.field_slice(start, count).iter().find(|f| f.name == name)
     }
 
+    #[inline]
+    pub fn patch_forward_decl(&mut self, ty: TypeRef, start: u32, count: u32, is_union: bool) {
+        let e = &mut self.entries[ty];
+        e.kind   = if is_union { TypeKind::Union } else { TypeKind::Struct };
+        e.flags  = TypeFlags::empty();
+        e.extra  = start;
+        e.extra2 = count;
+    }
+
     // Lay out a struct: compute offsets respecting alignment, return (size, align).
     // Mutates the field_pool entries in-place to fill in offsets.
     #[inline]
@@ -2876,6 +2894,19 @@ impl TypeTable {
             .map(|f| self.align_of(f.ty))
             .max()
             .unwrap_or(1)
+    }
+
+    // Call after layout_struct to register the type
+    #[inline]
+    pub fn make_struct_with_flags(&mut self, field_start: u32, field_count: u32, flags: TypeFlags) -> TypeRef {
+        self.intern(
+            TypeKind::Struct,
+            QualFlags::empty(),
+            flags,
+            TypeRef(0),
+            field_start,
+            field_count,
+        )
     }
 
     // Call after layout_struct to register the type
@@ -4067,6 +4098,7 @@ pub struct DataReloc {
     pub is_bss:   bool,
 }
 
+#[derive(Default)]
 pub struct LoopContext {
     break_patches:    Vec<usize>,
     continue_patches: Vec<usize>,
@@ -4203,7 +4235,7 @@ impl Compiler {  // TypeTable helpers
 impl Compiler {
     #[inline]
     pub fn new(pp: PP) -> Self {
-        Self {
+        let mut c = Self {
             pp,
             in_global_context: true,
             tags: Default::default(),
@@ -4219,7 +4251,17 @@ impl Compiler {
             rodata: Vec::new(), rodata_relocs: Vec::new(),
             locals: LocalTable::new(), ret_ty: TYPE_VOID,
             dont_decay_types_of_array_globals_to_pointers: false
-        }
+        };
+
+        // @Incomplete
+        // @Incomplete
+        // @Incomplete
+        let void_ptr = c.types.ptr_to(TYPE_VOID);
+        c.typedefs.insert(hash_str("__builtin_va_list"), void_ptr);
+        c.typedefs.insert(hash_str("__gnuc_va_list"), void_ptr);
+        c.typedefs.insert(hash_str("va_list"), void_ptr);
+
+        c
     }
 
     // cur/peek/next come from Deref to PP.
@@ -4304,18 +4346,60 @@ impl Compiler {
         Ok(ty)
     }
 
+    #[inline]
     fn compile_struct(&mut self) -> CResult<TypeRef> {
-        if self.current_token.hash == HASH_STRUCT { self.next(); }
+        self.compile_struct_or_union(false)
+    }
+
+    #[inline]
+    fn compile_union(&mut self) -> CResult<TypeRef> {
+        self.compile_struct_or_union(true)
+    }
+
+    fn compile_struct_or_union(&mut self, is_union: bool) -> CResult<TypeRef> {
+        if [HASH_UNION, HASH_STRUCT].contains(&self.current_token.hash) {
+            self.next();
+        }
 
         let tag = (self.current_token.kind == TK::Ident).then(|| self.next());
 
-        if let Some(tag) = tag && let Some(&ty) = self.tags.get(&tag.hash) {
-            // @Incomplete: Check that ty is a struct.
-            return Ok(ty);
+        if let Some(tag) = tag && let Some(&existing_ty) = self.tags.get(&tag.hash) {
+            //
+            // If already fully defined, return it
+            // If it's an incomplete forward decl and we have a body, fall through
+            //
+            let is_incomplete =
+                self.types.get(existing_ty).flags == TypeFlags::FORWARD_DECLARATION;
+
+            if !is_incomplete || self.current_token.kind != TK::LCurly {
+                return Ok(existing_ty);
+            }
+
+            // ... Fall through to parse the full definition
         }
 
-        if self.current_token.kind != TK::LCurly{
-            let t = tag.filter(|t| t.hash != HASH_STRUCT).unwrap_or(self.current_token);
+        if self.current_token.kind != TK::LCurly {
+            if let Some(tag) = tag {
+                //
+                // Forward declaration - register incomplete type if not already known
+                //
+
+                if !self.tags.contains_key(&tag.hash) {
+                    //
+                    // Empty placeholder
+                    //
+
+                    let ty = self.types.make_struct_with_flags(
+                        0, 0,
+                        TypeFlags::FORWARD_DECLARATION
+                    );
+                    self.tags.insert(tag.hash, ty);
+                }
+
+                return Ok(*self.tags.get(&tag.hash).unwrap());
+            }
+
+            let t = tag.unwrap_or(self.current_token);
 
             return Err(CError::UnknownType {
                 name: t.s(&self.src_arena).to_owned(),
@@ -4346,6 +4430,30 @@ impl Compiler {
 
             let name = self.eat_ident("field name")?;
 
+            let ty = if self.current_token.kind == TK::LSquare {
+                self.next(); // [
+                if self.current_token.kind == TK::RSquare {
+                    self.next();
+                    self.types.array_of(ty, 0) // flexible array member
+                } else {
+                    let len = self.try_parse_and_eval_const_int()? as u32;
+                    self.expect(TK::RSquare, "']'")?;
+                    self.parse_array_dims(ty, len)?
+                }
+            } else {
+                ty
+            };
+
+            if self.current_token.kind == TK::Colon {
+                // @Incomplete
+                //
+                // int _flags2:24;
+                //
+
+                self.next();
+                self.expect(TK::Number, "bit-width")?;
+            }
+
             let e = FieldEntry {
                 ty,
                 name: name.hash,
@@ -4366,13 +4474,31 @@ impl Compiler {
         self.expect(TK::RCurly, "'}'")?;
 
         let (start, count) = self.types.alloc_fields(&field_entries, &field_names);
-        _ = self.types.layout_struct(start, count);  // @Speed: Cache layouts?
 
-        let ty = self.types.make_struct(start, count);
-        if let Some(tag) = tag {
-            self.tags.insert(tag.hash, ty);
-        }
+        // @Speed: Cache layouts?
+        let ty = if let Some(tag) = tag && let Some(&existing_ty) = self.tags.get(&tag.hash)
+            && self.types.get(existing_ty).flags == TypeFlags::FORWARD_DECLARATION
+        {
+            // Patch the forward declaration in-place
+            if is_union {
+                self.types.layout_union(start, count);
+            } else {
+                self.types.layout_struct(start, count);
+            }
+            self.types.patch_forward_decl(existing_ty, start, count, is_union);
 
+            existing_ty  // reuse the same TypeRef
+        } else {
+            if is_union {
+                self.types.layout_union(start, count);
+                self.types.make_union(start, count)
+            } else {
+                self.types.layout_struct(start, count);
+                self.types.make_struct(start, count)
+            }
+        };
+
+        if let Some(tag) = tag { self.tags.insert(tag.hash, ty); }
         Ok(ty)
     }
 
@@ -4388,12 +4514,12 @@ impl Compiler {
             let t = self.current_token;
             if t.kind != TK::Ident { break; }
             match t.hash {
-                HASH_INT      => { ty = Some(TYPE_INT);    self.next(); }
-                HASH_CHAR     => { ty = Some(TYPE_CHAR);   self.next(); }
-                HASH_SHORT    => { ty = Some(TYPE_SHORT);  self.next(); }
-                HASH_VOID     => { ty = Some(TYPE_VOID);   self.next(); }
-                HASH_FLOAT    => { ty = Some(TYPE_FLOAT);  self.next(); }
-                HASH_DOUBLE   => { ty = Some(TYPE_DOUBLE); self.next(); }
+                HASH_INT    => { if ty.is_none() { ty = Some(TYPE_INT);    } self.next(); }
+                HASH_CHAR   => { if ty.is_none() { ty = Some(TYPE_CHAR);   } self.next(); }
+                HASH_SHORT  => { if ty.is_none() { ty = Some(TYPE_SHORT);  } self.next(); }
+                HASH_VOID   => { if ty.is_none() { ty = Some(TYPE_VOID);   } self.next(); }
+                HASH_FLOAT  => { if ty.is_none() { ty = Some(TYPE_FLOAT);  } self.next(); }
+                HASH_DOUBLE => { if ty.is_none() { ty = Some(TYPE_DOUBLE); } self.next(); }
                 HASH_LONG => {
                     self.next();
                     ty = Some(match self.current_token.hash {
@@ -4426,8 +4552,12 @@ impl Compiler {
 
                 HASH_STRUCT => {
                     self.next(); // struct
-
                     ty = Some(self.compile_struct()?);
+                }
+
+                HASH_UNION => {
+                    self.next(); // union
+                    ty = Some(self.compile_union()?);
                 }
 
                 //
@@ -4480,7 +4610,7 @@ impl Compiler {
 
         //
         // Array dims - only in type-only contexts (sizeof, typeof, cast)
-        // Declarator dims are handled in compile_local_decl and compile_top_level.
+        // @Declarator dims are handled in compile_local_decl and compile_top_level.
         //
         if !self.in_global_context && self.current_token.kind == TK::LSquare {
             ty = self.compile_array_dim_loop(ty)?;
@@ -4641,6 +4771,12 @@ impl Compiler {
 
         if self.current_token.hash == HASH_STRUCT {
             _ = self.compile_struct()?;
+            self.expect(TK::SemiColon, "';'")?;
+            return Ok(());
+        }
+
+        if self.current_token.hash == HASH_UNION {
+            _ = self.compile_union()?;
             self.expect(TK::SemiColon, "';'")?;
             return Ok(());
         }
@@ -4813,7 +4949,7 @@ impl Compiler {
 
     #[inline]
     fn can_hash_start_a_type(&self, h: u64) -> bool {
-        HASHES_THAT_START_TYPES.contains(&h) || self.typedefs.contains_key(&h)
+        HASHES_THAT_START_TYPES.contains(&h) || self.typedefs.contains_key(&h) || self.tags.contains_key(&h)
     }
 
     #[inline]
@@ -4825,11 +4961,10 @@ impl Compiler {
                 else if h == HASH_IF            { self.compile_if()         }
                 else if h == HASH_FOR           { self.compile_for()        }
                 else if h == HASH_WHILE         { self.compile_while()      }
-                else if h == HASH_STRUCT        { self.compile_struct().map(|_| ()) }
                 else if h == HASH_BREAK         { self.compile_break(self.current_token.span)    }
                 else if h == HASH_CONTINUE      { self.compile_continue(self.current_token.span) }
                 else if self.can_hash_start_a_type(h) { self.compile_local_decl() }
-                else                            { self.compile_expr_stmt()  }
+                else { self.compile_expr_stmt()  }
             }
 
             TK::LCurly => self.compile_block(),
@@ -4966,10 +5101,7 @@ impl Compiler {
         // Body
         //
 
-        self.loop_stack.push(LoopContext {
-            break_patches: Vec::new(),
-            continue_patches: Vec::new(),
-        });
+        self.loop_stack.push(Default::default());
 
         self.compile_stmt()?;
 
@@ -5073,10 +5205,7 @@ impl Compiler {
         // Body
         //
 
-        self.loop_stack.push(LoopContext {
-            break_patches: Vec::new(),
-            continue_patches: Vec::new(),
-        });
+        self.loop_stack.push(Default::default());
 
         self.compile_stmt()?;
 
@@ -5201,18 +5330,41 @@ impl Compiler {
         self.next(); // typedef
 
         let base_ty = self.compile_type()?;
+        if self.current_token.kind == TK::SemiColon {
+            emit_diag_warning("typedef requires a name", self.current_token.span, &self.src_arena);
+            self.next();
+            return Ok(());
+        }
+
         let name = self.eat_ident("ident")?;
 
+        // @Declarator
         let ty = if self.current_token.kind == TK::LSquare {
             self.next(); // [
             let len = self.try_parse_and_eval_const_int()? as u32;
             self.expect(TK::RSquare, "']'")?;
             self.parse_array_dims(base_ty, len)?
+        } else if self.current_token.kind == TK::LParen {
+            //
+            // Function type typedef: typedef ret_ty name(params);
+            //
+
+            self.next(); // (
+            let (params, is_variadic) = self.compile_params()?;
+            self.expect(TK::RParen, "')'")?;
+
+            let param_types = params.iter()
+                .map(|(ty, _)| *ty)
+                .collect::<SmallVec<[_; MAX_PARAMS]>>();
+            let param_start = self.types.alloc_params(&param_types);
+
+            self.types.make_func(base_ty, param_start, params.len() as _, is_variadic)
         } else {
             base_ty
         };
 
         self.expect(TK::SemiColon, "';'")?;
+
         self.typedefs.insert(name.hash, ty);
 
         if matches!(
@@ -5243,7 +5395,7 @@ impl Compiler {
             let hash = name_tok.hash;
 
             //
-            // Parse declarator dims after the name (lengths must be const integers)
+            // Parse @Declarator dims after the name (lengths must be const integers)
             //
             let ty = if self.current_token.kind == TK::LSquare {
                 self.next(); // [
@@ -5758,7 +5910,7 @@ impl Compiler {
         let name_tok = self.eat_ident("variable name")?;
 
         //
-        // Array declarator dims after the name
+        // Array @Declarator dims after the name
         //
 
         let ty = if self.current_token.kind == TK::LSquare {
@@ -6902,40 +7054,106 @@ impl Compiler {
 
         // @Cold
         //
-        // Subscript stuff
+        // Postfix: subscript, field access
         //
-        while self.current_token.kind == TK::LSquare {
-            self.next();
-            self.compile_expr()?;
-            self.expect(TK::RSquare, "']'")?;
+        loop {
+            match self.current_token.kind {
+                TK::LSquare => {
+                    self.next();
+                    self.compile_expr()?;
+                    self.expect(TK::RSquare, "']'")?;
 
-            let idx = self.vstack.pop();
-            let ptr = self.pop_vstack_and_decay_array()?;
+                    let idx = self.vstack.pop();
+                    let ptr = self.pop_vstack_and_decay_array()?;
 
-            let (elem_ty, base) = match self.types.get_kind(ptr.ty) {
-                TypeKind::Ptr => {
-                    let elem_ty = self.types.deref(ptr.ty);
-                    (elem_ty, self.force_gp(ptr)?)
+                    let (elem_ty, base) = match self.types.get_kind(ptr.ty) {
+                        TypeKind::Ptr => {
+                            let elem_ty = self.types.deref(ptr.ty);
+                            (elem_ty, self.force_gp(ptr)?)
+                        }
+                        _ => return Err(CError::Expected {
+                            span: self.current_token.span,
+                            expected: "array or pointer",
+                            got: self.types.to_string(ptr.ty)
+                        })
+                    };
+
+                    let idx_r = self.force_gp(idx)?;
+                    if self.types.get(elem_ty).is_vla() {
+                        let stride_r = self.compute_vla_flat_size(elem_ty, Span::POISONED)?;
+                        self.buf.imul_rr(idx_r, stride_r);
+                        self.regs.free(stride_r);
+                    } else {
+                        let elem_sz = self.types.size_of(elem_ty) as i32;
+                        self.scale_index(idx_r, elem_sz);
+                    }
+                    self.regs.free(idx_r);
+                    self.buf.add_rr(base, idx_r);
+                    self.vstack.push(CValue::regind(elem_ty, base, 0));
                 }
-                _ => return Err(CError::Expected {
-                    span: self.current_token.span,
-                    expected: "array or pointer",
-                    got: self.types.to_string(ptr.ty)
-                })
-            };
 
-            let idx_r = self.force_gp(idx)?;
-            if self.types.get(elem_ty).is_vla() {
-                let stride_r = self.compute_vla_flat_size(elem_ty, Span::POISONED)?;
-                self.buf.imul_rr(idx_r, stride_r);
-                self.regs.free(stride_r);
-            } else {
-                let elem_sz = self.types.size_of(elem_ty) as i32;
-                self.scale_index(idx_r, elem_sz);
+                TK::Dot | TK::Arrow => {
+                    let op   = self.current_token.kind;
+                    let span = self.current_token.span;
+                    self.next();
+
+                    let field_tok  = self.eat_ident("field name")?;
+                    let field_hash = field_tok.hash;
+
+                    let v = self.vstack.pop();
+
+                    let (struct_ty, base, base_off) = match op {
+                        TK::Arrow |
+                        TK::Dot if self.is_ptr(v.ty) => {
+                            if !self.is_ptr(v.ty) {
+                                return Err(CError::Expected {
+                                    span,
+                                    expected: "pointer to struct or union",
+                                    got: self.types.to_string(v.ty),
+                                });
+                            }
+
+                            let struct_ty = self.types.deref(v.ty);
+                            let base = self.force_gp(v)?;
+                            (struct_ty, base, 0i32)
+                        }
+
+                        TK::Dot => {
+                            if !matches!(self.get_kind(v.ty), TypeKind::Struct | TypeKind::Union) {
+                                return Err(CError::Expected {
+                                    span,
+                                    expected: "struct or union",
+                                    got: self.types.to_string(v.ty),
+                                });
+                            }
+
+                            let base = v.reg.as_gp();
+                            (v.ty, base, v.offset)
+                        }
+
+                        _ => unreachable!()
+                    };
+
+                    //
+                    // @Incomplete: Union handling
+                    //
+
+                    let e = self.types.get(struct_ty);
+                    let (start, count) = (e.field_start(), e.field_count());
+                    let field = self.types.find_field(start, count, field_hash)
+                        .ok_or_else(|| CError::UnknownField {
+                            span: field_tok.span,
+                            name: field_tok.s(&self.src_arena).to_owned(),
+                        })?;
+
+                    let field_ty  = field.ty;
+                    let field_off = base_off + field.offset as i32;
+
+                    self.vstack.push(CValue::regind(field_ty, base, field_off));
+                }
+
+                _ => break
             }
-            self.buf.add_rr(base, idx_r);
-            self.regs.free(idx_r);
-            self.vstack.push(CValue::regind(elem_ty, base, 0));
         }
 
         Ok(())
