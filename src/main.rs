@@ -7798,18 +7798,29 @@ fn main() {
         Err(e) => { e.emit(&SrcArena::new()); std::process::exit(1); }
     };
 
-    //
-    // Parse -DFOO or -DFOO=BAR args
-    //
     for arg in &args {
+        //
+        // -DFOO or -DFOO=BAR args
+        //
         if let Some(def) = arg.strip_prefix("-D") {
-            // define FOO or FOO=BAR
             let (name, val) = if let Some(eq) = def.find('=') {
                 (&def[..eq], &def[eq+1..])
             } else {
                 (def, "1")
             };
             pp.define_simple(name, val);
+        }
+
+        //
+        // -Iinclude or -I=BAR args
+        //
+        if let Some(include) = arg.strip_prefix("-I") {
+            let path = if let Some(eq) = include.find('=') {
+                &include[eq+1..]
+            } else {
+                &include
+            };
+            pp.include_dirs.push(path.into());
         }
     }
 
