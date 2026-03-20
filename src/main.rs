@@ -5,6 +5,10 @@
 // TODO(#9): Global extern symbols
 // TODO(#10): Stringify, __VA_ARGS__ and concat in macros
 // TODO(#11): String interning for .rodata
+// TODO: {} Initializers
+// TODO: Debug info
+// TODO: Stack unwind info
+// TODO: GCC statement expressions
 
 //
 // @Cleanup: There's lots of unnecessary std::process::exit calls.
@@ -4125,7 +4129,7 @@ pub struct Compiler {
 
     pub ret_ty:        TypeRef,
 
-    pub type_table:         TypeTable,
+    pub type_table:    TypeTable,
     pub typedefs:      IntMap<u64, TypeRef>,
 
     pub data:          Vec<u8>,
@@ -4549,7 +4553,7 @@ impl Compiler {
 
         let ret_ty   = self.compile_type()?;
         let name_tok = self.eat_ident("function or variable name")?;
-        let name     = self.s(name_tok).to_owned();
+        let name     = self.s(name_tok).to_owned(); // @Borrow
         let hash     = name_tok.hash;
 
         if self.current_token.kind != TK::LParen {
@@ -4557,23 +4561,9 @@ impl Compiler {
             // @Cold
             //
 
-            let ty = if self.current_token.kind == TK::LSquare {
-                self.next(); // [
-                if self.current_token.kind == TK::RSquare {
-                    self.next(); // ]
-                    self.type_table.array_of(ret_ty, 0) // Placeholder
-                } else {
-                    let len = self.try_parse_and_eval_const_int()? as u32;
-                    self.expect(TK::RSquare, "']'")?;
-                    self.parse_array_dims(ret_ty, len)?
-                }
-            } else {
-                ret_ty
-            };
-
             self.compile_global_decl(
-                ty,
-                &name, hash,
+                ret_ty,
+                name_tok,
                 top_flags.contains(TopLevelFlags::EXTERN),
                 top_flags.contains(TopLevelFlags::STATIC),
             )?;
@@ -4796,7 +4786,7 @@ impl Compiler {
         self.next(); // if
 
         self.expect(TK::LParen, "'('")?; // (
-        self.compile_expr()?;
+        self.compile_expr_no_comma()?;
         self.expect(TK::RParen, "')'")?; // )
 
         let (r, _) = self.pop_reg()?;
@@ -4898,7 +4888,7 @@ impl Compiler {
             self.pp.current_token = self.pp.cook();
             self.pp.next_token    = self.pp.cook();
 
-            self.compile_expr()?;
+            self.compile_expr_no_comma()?;
             let (r, _) = self.pop_reg()?;
             self.buf.test_rr(r);
             self.regs.free(r);
@@ -4918,7 +4908,6 @@ impl Compiler {
     fn compile_for(&mut self) -> CResult<()> {
         self.next(); // for
         self.expect(TK::LParen, "'('")?;
-
 
         //
         // Init
@@ -5038,7 +5027,7 @@ impl Compiler {
             self.pp.current_token = self.pp.cook();
             self.pp.next_token    = self.pp.cook();
 
-            self.compile_expr()?;
+            self.compile_expr_no_comma()?;
             let (r, _) = self.pop_reg()?;
             self.buf.test_rr(r);
             self.regs.free(r);
@@ -5132,8 +5121,46 @@ impl Compiler {
         Ok(())
     }
 
-    #[inline]
     fn compile_global_decl(
+        &mut self,
+        base_ty: TypeRef,
+        first_name_tok: Token,
+        is_extern: bool,
+        is_static: bool,
+    ) -> CResult<()> {
+        let mut name_tok = first_name_tok;
+        loop {
+            let name = self.s(name_tok).to_owned(); // @Borrow
+            let hash = name_tok.hash;
+
+            //
+            // Parse declarator dims after the name (lengths must be const integers)
+            //
+            let ty = if self.current_token.kind == TK::LSquare {
+                self.next(); // [
+                if self.current_token.kind == TK::RSquare {
+                    self.next();
+                    self.type_table.array_of(base_ty, 0)
+                } else {
+                    let len = self.try_parse_and_eval_const_int()? as u32;
+                    self.expect(TK::RSquare, "']'")?;
+                    self.parse_array_dims(base_ty, len)?
+                }
+            } else {
+                base_ty
+            };
+
+            self.compile_global_decl_impl(ty, &name, hash, is_extern, is_static)?;
+
+            if self.current_token.kind != TK::Comma { break; }
+            self.next(); // ,
+            name_tok = self.eat_ident("variable name")?;
+        }
+
+        self.expect(TK::SemiColon, "';'").map(|_| ())
+    }
+
+    fn compile_global_decl_impl(
         &mut self,
         ty_ref: TypeRef,
         name: &str,
@@ -5147,10 +5174,12 @@ impl Compiler {
             // Extern global - treat like extern function, add to sym table
             // for now skip - extern globals need GOT relocs which is more complex
             //
-            while !matches!(self.current_token.kind, TK::SemiColon | TK::Eof) {
+            while !matches!(
+                self.current_token.kind,
+                TK::SemiColon | TK::Comma | TK::Eof) {
                 self.next();
             }
-            self.expect(TK::SemiColon, "';'")?;
+
             return Ok(());
         }
 
@@ -5159,6 +5188,10 @@ impl Compiler {
 
         let has_initializer = self.current_token.kind == TK::Eq;
         if !has_initializer {
+            //
+            // No initializer - goes into .bss
+            //
+
             if ty == TypeKind::Array {
                 let arr_len = self.type_table.get(ty_ref).array_len() as usize;
                 let inferred = arr_len == 0;  // @Note: Shouldn't be a VLA since its a global..?
@@ -5168,13 +5201,11 @@ impl Compiler {
                 }
             }
 
-            // No initializer - goes into .bss
             let off = self.bss_size;
 
             self.bss_size += size;
             self.globals.insert(name, hash, ty_ref, off as u32, true, is_static);
 
-            self.expect(TK::SemiColon, "';'")?;
             return Ok(())
         }
 
@@ -5315,22 +5346,21 @@ impl Compiler {
                 // Insert the global here, with our computed type in case the size was inferred: int arr[] = {..}
                 //
                 self.globals.insert(name, hash, array_ty, off, false, is_static);
-                self.expect(TK::SemiColon, "';'")?;
                 return Ok(());
             }
 
-            _ => {  // @Incomplete
-                while !matches!(self.current_token.kind, TK::SemiColon | TK::Eof) {
+            _ => {  // @Incomplete: Just skip this one
+                while !matches!( // @Cutnpaste from above
+                    self.current_token.kind,
+                    TK::SemiColon | TK::Comma | TK::Eof) {
                     self.next();
                 }
-                self.expect(TK::SemiColon, "';'")?;
                 return Ok(());
             }
         };
 
         self.globals.insert(name, hash, ty_ref, data_off, is_bss, is_static);
 
-        self.expect(TK::SemiColon, "';'")?;
         Ok(())
     }
 
@@ -5428,11 +5458,11 @@ impl Compiler {
         while self.current_token.kind != TK::RCurly && !self.at_eof() {
             if idx >= arr_len {
                 // Too many initializers, @Error out..?
-                self.compile_expr()?;
+                self.compile_expr_no_comma()?;
                 self.vstack.pop();
             } else {
                 let off = base_off + idx * elem_sz;
-                self.compile_expr()?;
+                self.compile_expr_no_comma()?;
                 self.compile_store(Reg::Rbp, off, elem_ty)?;
             }
 
@@ -5474,7 +5504,6 @@ impl Compiler {
             let real_ty = self.type_table.array_of(ty, len as u32);
             let off = self.locals.alloc(name_tok.hash, real_ty, &self.type_table);
             self.compile_array_initializer(off, real_ty)?;
-            self.expect(TK::SemiColon, "';'")?;
 
             return Ok(());
         }
@@ -5501,7 +5530,6 @@ impl Compiler {
         self.pp.next_token    = self.pp.cook();
 
         self.compile_array_initializer(off, real_ty)?;
-        self.expect(TK::SemiColon, "';'")?;
 
         Ok(())
     }
@@ -5600,13 +5628,24 @@ impl Compiler {
         let array_base = Reg::Rsp;
         self.buf.mov_store(Reg::Rbp, ptr_off, array_base, true);
 
-        self.expect(TK::SemiColon, "';'")?;
         Ok(())
     }
 
     #[inline]
     fn compile_local_decl(&mut self) -> CResult<()> {
-        let base_ty  = self.compile_type()?;
+        let base_ty = self.compile_type()?;
+        loop {
+            self.compile_local_decl_impl(base_ty)?;
+            if self.current_token.kind != TK::Comma { break; }
+
+            self.next(); // ,
+        }
+
+        self.expect(TK::SemiColon, "';'").map(|_| ())
+    }
+
+    #[inline]
+    fn compile_local_decl_impl(&mut self, base_ty: TypeRef) -> CResult<()> {
         let name_tok = self.eat_ident("variable name")?;
 
         //
@@ -5637,7 +5676,7 @@ impl Compiler {
                 // First dim is a VLA
                 //
 
-                self.compile_expr()?;
+                self.compile_expr_no_comma()?;
                 self.expect(TK::RSquare, "']'")?;
 
                 let (r, _) = self.pop_reg()?;
@@ -5667,12 +5706,12 @@ impl Compiler {
             if self.type_table.get_kind(ty) == TypeKind::Array {
                 self.compile_array_initializer(off, ty)?;
             } else {
-                self.compile_expr()?;
+                self.compile_expr_no_comma()?;
                 self.compile_store(Reg::Rbp, off, ty)?;
             }
         }
 
-        self.expect(TK::SemiColon, "';'").map(|_| ())
+        Ok(())
     }
 
     #[inline]
@@ -5688,18 +5727,20 @@ impl Compiler {
     #[inline]
     const fn op_prec(k: TK) -> Option<(u8, bool)> {
         match k {
+            TK::Comma => Some((0, false)),
+
             TK::Eq     | TK::PlusEq  | TK::MinusEq  |
             TK::StarEq | TK::SlashEq | TK::BinAndEq |
-            TK::XorEq  | TK::BinOrEq => Some((1, true)),
-            TK::Or                   => Some((2, false)),
-            TK::And                  => Some((3, false)),
-            TK::BinOr                => Some((4, false)),
-            TK::Xor                  => Some((5, false)),
-            TK::BinAnd               => Some((6, false)),
-            TK::EqEq | TK::NotEq     => Some((7, false)),
-            TK::Less | TK::Greater | TK::LessEq | TK::GreaterEq => Some((8, false)),
-            TK::Plus | TK::Minus     => Some((9, false)),
-            TK::Star | TK::Slash     => Some((10, false)),
+            TK::XorEq  | TK::BinOrEq => Some((2, true)),
+            TK::Or                   => Some((3, false)),
+            TK::And                  => Some((4, false)),
+            TK::BinOr                => Some((5, false)),
+            TK::Xor                  => Some((6, false)),
+            TK::BinAnd               => Some((7, false)),
+            TK::EqEq | TK::NotEq     => Some((8, false)),
+            TK::Less | TK::Greater | TK::LessEq | TK::GreaterEq => Some((9, false)),
+            TK::Plus | TK::Minus     => Some((10, false)),
+            TK::Star | TK::Slash     => Some((11, false)),
 
             _ => None
         }
@@ -5708,6 +5749,11 @@ impl Compiler {
     #[inline]
     fn compile_expr(&mut self) -> CResult<()> {
         self.compile_expr_impl(0)
+    }
+
+    #[inline]
+    fn compile_expr_no_comma(&mut self) -> CResult<()> {
+        self.compile_expr_impl(1)  // stops before comma
     }
 
     #[inline]
@@ -5917,8 +5963,18 @@ impl Compiler {
             TK::BinAnd | TK::BinOr | TK::Xor                     => self.compile_bitwise(op)?,
             TK::EqEq | TK::NotEq |
             TK::Less | TK::Greater | TK::LessEq | TK::GreaterEq  => self.compile_cmp(op)?,
+
+            TK::Comma => {
+                // Discard lhs, keep rhs - already on vstack in right order
+                let rhs = self.vstack.pop();
+                let lhs = self.vstack.pop();
+                if matches!(lhs.kind, VK::Reg | VK::RegInd) { self.free_reg(lhs.reg); }
+                self.vstack.push(rhs);
+            }
+
             other => unreachable!("{other:?}"),
         }
+
         Ok(())
     }
 
@@ -6427,7 +6483,7 @@ impl Compiler {
     fn emit_float_cmp(&mut self, lhs: XmmReg, rhs: XmmReg, ty: TypeRef) {
         match self.get_kind(ty) {
             TypeKind::Float => self.buf.ucomiss(lhs, rhs),
-            _            => self.buf.ucomisd(lhs, rhs),
+            _               => self.buf.ucomisd(lhs, rhs),
         }
     }
 
@@ -6856,7 +6912,7 @@ impl Compiler {
             //
             self.spill_vstack_across_call()?;
 
-            self.compile_expr()?;
+            self.compile_expr_no_comma()?;
             let v = self.pop_vstack_and_decay_array()?;
 
             let spill_off = self.locals.alloc(0, v.ty, &self.type_table);
