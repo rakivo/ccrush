@@ -846,19 +846,18 @@ impl PP {
             file_stack:         vec![FileFrame { fid, pos: 0 }],
             exp:                Expansions::new(),
             macros:             MacroTable::new(),
-            include_dirs:       [
-                "/usr/include",
-                "/usr/local/include",
-                "/usr/include/linux",
-                "/usr/include/x86_64-linux-gnu",
+            include_dirs: [
+                "/usr/lib/gcc/x86_64-linux-gnu/14/include",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/include",
                 "/usr/lib/gcc/x86_64-linux-gnu/12/include",
                 "/usr/lib/gcc/x86_64-linux-gnu/11/include",
                 "/usr/lib/gcc/x86_64-linux-gnu/10/include",
-                "/usr/lib/gcc/x86_64-linux-gnu/13/include",
-                "/usr/lib/gcc/x86_64-linux-gnu/14/include",
-                "/usr/lib/gcc/x86_64-pc-linux-gnu/12/include",
-                "/usr/lib/gcc/x86_64-pc-linux-gnu/13/include",
                 "/usr/lib/gcc/x86_64-pc-linux-gnu/14/include",
+                "/usr/lib/gcc/x86_64-pc-linux-gnu/13/include",
+                "/usr/lib/gcc/x86_64-pc-linux-gnu/12/include",
+                "/usr/local/include",
+                "/usr/include/x86_64-linux-gnu",
+                "/usr/include",
             ].into_iter().map(PathBuf::from).collect(),
             pragma_once_paths: Vec::new(),
             at_bol:             true,
@@ -876,18 +875,6 @@ impl PP {
     pub fn add_include_dir(&mut self, p: impl Into<PathBuf>) {
         self.include_dirs.push(p.into());
     }
-
-    // Slide window, return consumed token.
-    #[inline]
-    pub fn next(&mut self) -> Token {
-        let t   = self.current_token;
-        self.current_token  = self.next_token;
-        self.next_token = self.cook();
-        t
-    }
-
-    #[inline]
-    pub fn s(&self, t: Token) -> &str { t.s(&self.src_arena) }
 
     #[inline]
     fn init_predefined_macros(&mut self) {
@@ -1039,10 +1026,17 @@ impl PP {
         // @Incomplete
         // @Incomplete
         // @Incomplete
+
         self.define_noop_func_macro("__attribute__", &["x"]);
         self.define_noop_func_macro("__attribute",   &["x"]);
         self.define_noop_func_macro("__asm__",       &["x"]);
         self.define_noop_func_macro("__asm",         &["x"]);
+
+        self.define_func_macro("__has_feature", &["x"], *b"0");
+        self.define_func_macro("__has_extension", &["x"], *b"0");
+        self.define_func_macro("__has_attribute", &["x"], *b"0");
+        self.define_func_macro("__has_builtin", &["x"], *b"0");
+        self.define_func_macro("__has_include", &["x"], *b"0");
 
         self.define_func_macro("__glibc_clang_prereq",        &["maj", "min"], *b"0");
         self.define_func_macro("__glibc_has_attribute",       &["attr"],       *b"0");
@@ -1211,6 +1205,18 @@ impl PP {
         }
     }
 
+    // Slide window, return consumed token.
+    #[inline]
+    pub fn next(&mut self) -> Token {
+        let t = self.current_token;
+        self.current_token  = self.next_token;
+        self.next_token = self.cook();
+        t
+    }
+
+    #[inline]
+    pub fn s(&self, t: Token) -> &str { t.s(&self.src_arena) }
+
     #[inline]
     fn directive(&mut self) -> PPResult<()> {
         let mut name = self.raw();
@@ -1275,7 +1281,7 @@ impl PP {
             && next.span.file  == name_tok.span.file
             && next.span.start == name_tok.span.start + name_tok.span.len as u32;
 
-        let mut def  = MacroDef {
+        let mut def = MacroDef {
             name_hash, def_span: name_tok.span, ..MacroDef::ZERO
         };
 
@@ -4937,6 +4943,36 @@ impl Compiler {
                 0
             };
 
+            //
+            // Array @Declarator on parameter: char[N] or char arr[N]
+            //
+            let ty = if self.current_token.kind == TK::LSquare {
+                self.next(); // [
+                if self.current_token.kind == TK::RSquare {
+                    self.next();
+
+                    // char[] param - decays to char*
+                    self.types.ptr_to(ty)
+                } else {
+                    // char[N] - consume the size expr, still decays to char *
+                    // just skip the expression... Sigh.......
+                    let mut depth = 0;
+                    loop {
+                        match self.current_token.kind {
+                            TK::LSquare => { depth += 1; self.next(); }
+                            TK::RSquare if depth > 0 => { depth -= 1; self.next(); }
+                            TK::RSquare => { self.next(); break; }
+                            TK::Eof => break,
+                            _ => { self.next(); }
+                        }
+                    }
+
+                    self.types.ptr_to(ty)
+                }
+            } else {
+                ty
+            };
+
             params.push((ty, hash));
 
             if self.current_token.kind != TK::Comma { break; }
@@ -7653,10 +7689,10 @@ fn main() {
     let mut c = Compiler::new(pp);
     c.compile();
 
-    #[cfg(debug_assertions)]
-    for (i, e) in c.types.entries.iter() {
-        eprintln!("  [{i:?}] {:?} quals={:?} ref_={:?} extra={}", e.kind, e.quals, e.ref_, e.extra);
-    }
+    // #[cfg(debug_assertions)]
+    // for (i, e) in c.types.entries.iter() {
+    //     eprintln!("  [{i:?}] {:?} quals={:?} ref_={:?} extra={}", e.kind, e.quals, e.ref_, e.extra);
+    // }
 
     if args.contains(&"-run".into()) {
         run_main(c);
