@@ -7308,7 +7308,9 @@ fn main() {
         Err(e) => { e.emit(&SrcArena::new()); std::process::exit(1); }
     };
 
-    // parse -DFOO or -DFOO=BAR args before creating PP
+    //
+    // Parse -DFOO or -DFOO=BAR args
+    //
     for arg in &args {
         if let Some(def) = arg.strip_prefix("-D") {
             // define FOO or FOO=BAR
