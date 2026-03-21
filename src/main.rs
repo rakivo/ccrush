@@ -1,3 +1,62 @@
+//
+//
+// ccrush: The fastest C compiler in the world.
+//
+// repository: https://github.com/rakivo/ccrush.
+//
+//
+//
+// Yes, this is a single file containing the ENTIRETY of the compiler.
+//
+// I've had multiple reasons to keep it that way, but the main ones are:
+//
+//   1. Locality of reference. Meaning that people won't have to jump around
+//        to read the source code. FUCK CLEAN CODE.
+//
+//
+//   2. To flex on all the clean code paradigm users.
+//        I'm a huge proponent of simple code — code that is Semantically
+//        Compressed, with no bullshit and unnecessary abstraction.
+//        What's "Semantic Compression"? Read what Casey Muratori has to say
+//        about it:
+//
+//        https://caseymuratori.com/blog_0015
+//
+//
+//        Semantic Compression — Casey Muratori
+//
+//        I look at programming as having essentially two parts: figuring out
+//        what the processor actually needs to do to get something done, and
+//        then figuring out the most efficient way to express that in the
+//        language I'm using. Increasingly, it is the latter that accounts
+//        for what programmers actually spend their time on: wrangling all
+//        those algorithms and all that math into a coherent whole that
+//        doesn't collapse under its own weight.
+//
+//        So any experienced programmer who's any good has had to come up
+//        with some way — if even just by intuition — of thinking about what
+//        it means to program efficiently. By "efficiently", I don't just mean
+//        that the code is optimized. Rather, I mean that the development of
+//        the code is optimized — that the code is structured in such a way
+//        as to minimize the amount of human effort necessary to type it, get
+//        it working, modify it, and debug it enough for it to be shippable.
+//
+//        I like to think of efficiency as holistically as possible. If you
+//        look at the development process for a piece of code as a whole, you
+//        won't overlook any hidden costs. Given a certain level of
+//        performance and quality required by the places the code gets used,
+//        beginning at its inception and ending with the last time the code
+//        is ever used by anyone for any reason, the goal is to minimize the
+//        total amount of human effort it costs. This includes the time to
+//        type it in. It includes the time to debug it. It includes the time
+//        to modify it. It includes the time to adapt it for other uses. It
+//        includes any work done to other code to get it to work with this
+//        code that perhaps wouldn't have been necessary if the code were
+//        written differently. All work on the code for its entire usable
+//        lifetime is included.
+//
+//
+
 // TODO(#2): Structs
 // TODO(#4): Enums
 // TODO(#3): Function pointers
@@ -36,16 +95,14 @@ use memmap2::{Mmap, MmapMut, MmapOptions};
 use cranelift_entity::{PrimaryMap, SparseMap, SparseMapValue, entity_impl};
 
 #[allow(non_camel_case_types, unused)]
-pub mod bools {
-    pub type bx   = bool; // x
-    pub type b8   = bool; // 1
-    pub type b16  = bool; // 2
-    pub type b32  = bool; // 4
-    pub type b64  = bool; // 8
-    pub type b128 = bool; // 16
-}
-
-use bools::*;
+pub use {
+    bool as bx,   // x
+    bool as b8,   // 1
+    bool as b16,  // 2
+    bool as b32,  // 4
+    bool as b64,  // 8
+    bool as b128, // 16
+};
 
 #[inline(always)]
 const fn hash_str(s: &str) -> u64 {
@@ -141,7 +198,7 @@ pub struct Span {
 }
 
 impl Span {
-    pub const POISONED: Span = unsafe { core::mem::zeroed() };
+    pub const POISONED: Self = unsafe { core::mem::zeroed() };
 
     #[inline]
     pub fn s<'a>(&self, arena: &'a SrcArena) -> &'a str {
@@ -675,10 +732,7 @@ struct MacroDef {
 }
 
 impl MacroDef {
-    const ZERO: Self = Self {
-        name_hash: 0, def_span: Span::POISONED, body_start: 0, body_len: 0,
-        param_count: 0, param_hashes: [0; MAX_PARAMS],
-    };
+    pub const POISONED: Self = unsafe { core::mem::zeroed() };
 }
 
 struct MacroTable {
@@ -1300,7 +1354,7 @@ impl PP {
             && next.span.start == name_tok.span.start + name_tok.span.len as u32;
 
         let mut def = MacroDef {
-            name_hash, def_span: name_tok.span, ..MacroDef::ZERO
+            name_hash, def_span: name_tok.span, ..MacroDef::POISONED
         };
 
         #[inline]
