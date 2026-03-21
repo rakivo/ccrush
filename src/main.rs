@@ -12,6 +12,8 @@
 // TODO(#16): More declarators support: `void (*(*fp)(int))(float)`
 // TODO(#17): __builtin_bswap16, __builtin_*...
 
+// TODO: Resolve the situation with sret and VLA hidden slot using the same slot...?
+
 //
 // @Cleanup: There's lots of unnecessary std::process::exit calls.
 //
@@ -20,6 +22,7 @@
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use std::borrow::Cow;
 use std::io;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -31,6 +34,18 @@ use smallvec::{SmallVec, smallvec};
 use nohash_hasher::IntMap;
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use cranelift_entity::{PrimaryMap, SparseMap, SparseMapValue, entity_impl};
+
+#[allow(non_camel_case_types, unused)]
+pub mod bools {
+    pub type bx   = bool; // x
+    pub type b8   = bool; // 1
+    pub type b16  = bool; // 2
+    pub type b32  = bool; // 4
+    pub type b64  = bool; // 8
+    pub type b128 = bool; // 16
+}
+
+use bools::*;
 
 #[inline(always)]
 const fn hash_str(s: &str) -> u64 {
@@ -816,8 +831,8 @@ pub struct PP {
     file_stack:        Vec<FileFrame>,
 
     exp:               Expansions,
-    at_bol:            bool,  // At beginning of line - gate for # directives
-    stop_at_newline:   bool,  // For # directives as well
+    at_bol:            bx,  // At beginning of line - gate for # directives
+    stop_at_newline:   bx,  // For # directives as well
 
     pragma_once_paths: Vec<PathBuf>,
 
@@ -1365,7 +1380,8 @@ impl PP {
         let (path_str, is_sys) = match first.kind {
             TK::StrLit => {
                 let raw = first.s(&self.src_arena);
-                (raw[1..raw.len()-1].to_owned(), false)
+
+                (Cow::Borrowed(&raw[1..raw.len()-1]), false)
             }
 
             TK::Less => {
@@ -1375,12 +1391,12 @@ impl PP {
                     if matches!(t.kind, TK::Greater | TK::Newline | TK::Eof) { break; }
                     s.push_str(t.s(&self.src_arena));
                 }
-                (s, true)
+
+                (Cow::Owned(s), true)
             }
 
             _ => { self.skip_line(); return Ok(()); }
         };
-        self.skip_line();
 
         let cur_dir = {
             let fid  = self.file_stack.last().map(|f| f.fid).unwrap_or(FileRef(0));
@@ -1391,13 +1407,17 @@ impl PP {
         let resolved = if is_sys {
             self.find_sys(&path_str)
         } else {
-            let l = cur_dir.join(&path_str);
+            let l = cur_dir.join(path_str.as_ref());
             if l.exists() { Some(l) } else { self.find_sys(&path_str) }
         };
 
         let Some(resolved) = resolved else {
-            return Err(PPError::NotFound { span: first.span, path: path_str });
+            let path = path_str.into_owned(); // @Borrow
+            self.skip_line();
+            return Err(PPError::NotFound { span: first.span, path });
         };
+
+        self.skip_line();
 
         if self.pragma_once_paths.contains(&resolved) { return Ok(()); }
 
@@ -2673,6 +2693,12 @@ impl TypeTable {
     }
 
     #[inline]
+    pub fn get_param(&self, func_ty: TypeRef, param_index: u32) -> TypeRef {
+        let e = self.get(func_ty);
+        self.param_slice(e.param_start() as _, e.param_count() as _)[param_index as usize]
+    }
+
+    #[inline]
     pub fn get(&self, id: TypeRef) -> &TypeEntry {
         &self.entries[id]
     }
@@ -2787,6 +2813,11 @@ impl TypeTable {
         let s = start as usize;
         let e = s + count as usize;
         &self.field_names[s..e]
+    }
+
+    #[inline]
+    pub fn iter_fields_with_names(&self, start: u32, count: u32) -> impl Iterator<Item = (&FieldEntry, Span)> {
+        self.field_slice(start, count).iter().zip(self.field_name_slice(start, count).iter().copied())
     }
 
     #[inline]
@@ -3476,6 +3507,27 @@ impl CodeBuf {
     }
 
     #[inline]
+    pub fn movq_xmm_load(&mut self, dst: XmmReg, base: Reg, off: i32) {
+        // REX byte: 0100 W R X B
+        // W=1 (64-bit), R=xmm>=8, B=base>=8
+        let rex = 0x48 | ((dst as u8 >= 8) as u8) << 2 | ((base as u8 >= 8) as u8);
+        self.emit_byte(0x66);
+        self.emit_byte(rex);
+        self.emit_byte(0x0F);
+        self.emit_byte(0x6E);
+        self.modrm_mem_impl(dst as u8 & 7, base, off);
+    }
+    #[inline]
+    pub fn movq_xmm_store(&mut self, base: Reg, off: i32, src: XmmReg) {
+        let rex = 0x48 | ((src as u8 >= 8) as u8) << 2 | ((base as u8 >= 8) as u8);
+        self.emit_byte(0x66);
+        self.emit_byte(rex);
+        self.emit_byte(0x0F);
+        self.emit_byte(0x7E);
+        self.modrm_mem_impl(src as u8 & 7, base, off);
+    }
+
+    #[inline]
     pub fn neg_r(&mut self, r: Reg) {
         self.rex_w(Reg::Rax, r);
         self.emit_byte(0xF7);
@@ -3554,6 +3606,13 @@ impl CodeBuf {
             self.emit_byte(0xE0 | dst.enc());
             self.emit_i32(imm);
         }
+    }
+    #[inline]
+    pub fn shl_ri(&mut self, dst: Reg, imm: u8) {
+        self.rex_w(Reg::Rax, dst);
+        self.emit_byte(0xC1);
+        self.emit_byte(0xE0 | dst.enc());
+        self.emit_byte(imm);
     }
     #[inline]
     pub fn imul_rr  (&mut self, dst: Reg, src: Reg) {
@@ -3897,16 +3956,18 @@ const MAX_LOCALS: usize = 128;
 
 #[derive(Clone, Copy)]
 pub struct LocalEntry {
-    pub hash: u64,
-    pub ty: TypeRef,
-    pub rbp_off: i32
+    pub hash: u64,       // 8
+    pub ty: TypeRef,     // 4
+    pub rbp_off: i32,    // 4
+    pub is_indirect: b32 // 4 - rbp_off holds a pointer to the value, not the value itself.
 }
 
 pub struct LocalTable {
+    frame_bytes: i32,
+
     locals:      SmallVec<[LocalEntry; MAX_LOCALS]>,
     index:       IntMap<u64, u32>,              // hash -> index of most recent in current scope
     scope_stack: Vec<Vec<(u64, Option<u32>)>>,  // stack of (hash, previous_index) per scope
-    frame_bytes: i32,
 }
 
 impl LocalTable {
@@ -3928,12 +3989,12 @@ impl LocalTable {
     }
 
     #[inline]
-    fn alloc_impl(&mut self, hash: u64, ty: TypeRef, size: i32) -> i32 {
+    fn alloc_impl(&mut self, hash: u64, ty: TypeRef, size: i32, is_indirect: bool) -> i32 {
         self.frame_bytes += size;
         let rbp_off = -(self.frame_bytes);
 
         let idx = self.locals.len() as u32;
-        self.locals.push(LocalEntry { hash, ty, rbp_off });
+        self.locals.push(LocalEntry { hash, ty, rbp_off, is_indirect });
 
         if hash != 0 {
             // Save previous index for this hash so we can restore on scope exit
@@ -3948,12 +4009,17 @@ impl LocalTable {
 
     #[inline]
     pub fn alloc(&mut self, hash: u64, ty: TypeRef, type_table: &TypeTable) -> i32 {
-        self.alloc_impl(hash, ty, type_table.size_of(ty) as _)
+        self.alloc_impl(hash, ty, type_table.size_of(ty) as _, false)
     }
 
     #[inline]
     pub fn alloc_vla(&mut self, hash: u64, vla_ty: TypeRef) -> i32 {
-        self.alloc_impl(hash, vla_ty, 8)
+        self.alloc_impl(hash, vla_ty, 8, false)
+    }
+
+    #[inline]
+    pub fn alloc_indirect(&mut self, hash: u64, ty: TypeRef) -> i32 {
+        self.alloc_impl(hash, ty, 8, true)
     }
 
     #[inline]
@@ -4121,17 +4187,17 @@ pub struct LoopContext {
 
 #[derive(Copy, Clone)]
 pub struct GlobalEntry {
-    pub hash:     u64,
+    pub hash:     u64,  // 8
 
-    pub data_off: u32,  // Offset into .data OR .bss
-    pub name_off: u32,
-    pub name_len: u16,
+    pub ty:       TypeRef, // 4
 
-    pub ty:       TypeRef,
+    pub data_off: u32,  // 4 - Offset into .data OR .bss
+    pub name_off: u32,  // 4
+    pub name_len: u16,  // 2
 
     // @BitFlagsCandidate
-    pub is_bss:    bool,
-    pub is_static: bool,
+    pub is_bss:    b8,
+    pub is_static: b8,
 }
 
 impl GlobalEntry {
@@ -4195,10 +4261,11 @@ pub struct Compiler {
     pub locals:        LocalTable,
     pub globals:       GlobalTable,
 
-    pub in_global_context:                             bool,   // @KindaHack, used in compile_type
-    pub dont_decay_types_of_array_globals_to_pointers: bool,   // @KindaHack, used in sizeof
+    pub in_global_context:                             bx,   // @KindaHack, used in compile_type
+    pub dont_decay_types_of_array_globals_to_pointers: bx,   // @KindaHack, used in sizeof
 
     pub ret_ty:        TypeRef,
+    pub ret_ptr_off:   Option<i32>,
 
     pub types:         TypeTable,
     pub typedefs:      IntMap<u64, TypeRef>,
@@ -4248,11 +4315,98 @@ impl Compiler {  // TypeTable helpers
     #[inline] fn get_kind(&self, id: TypeRef) -> TypeKind { self.types.get_kind(id) }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SysVClass { Integer, Sse, Memory }
+
+impl SysVClass {
+    #[inline]
+    fn merge(self, other: Self) -> Self {
+        let a = self;
+        let b = other;
+
+             if a == b                                             { a }
+        else if a == SysVClass::Memory  || b == SysVClass::Memory  { SysVClass::Memory }
+        else if a == SysVClass::Integer || b == SysVClass::Integer { SysVClass::Integer }
+        else                                                       { SysVClass::Sse }
+    }
+}
+
+impl Compiler {
+    #[inline]
+    fn classify_eightbyte(&self, ty: TypeRef, offset: u32, end: u32) -> SysVClass {
+        match self.get_kind(ty) {
+            TypeKind::Struct => {
+                let e = self.types.get(ty);
+                let fields = self.types.field_slice(e.field_start(), e.field_count());
+
+                let mut cls: Option<SysVClass> = None;
+                for f in fields {
+                    let f_start = f.offset;
+                    let f_end   = f_start + self.types.size_of(f.ty);
+
+                    //
+                    // Skip fields not overlapping this eightbyte
+                    //
+                    if f_end <= offset || f_start >= end { continue }
+
+                    let f_cls = self.classify_eightbyte(
+                        f.ty,
+                        offset.saturating_sub(f_start),
+                        (end - f_start).min(self.types.size_of(f.ty))
+                    );
+                    cls = Some(match cls {
+                        None    => f_cls,
+                        Some(c) => c.merge(f_cls),
+                    });
+                }
+
+                cls.unwrap_or(SysVClass::Integer)
+            }
+
+            TypeKind::Float | TypeKind::Double => SysVClass::Sse,
+
+            TypeKind::Array => {
+                let elem_ty  = self.types.get(ty).elem();
+                let elem_sz  = self.types.size_of(elem_ty);
+                if elem_sz == 0 { return SysVClass::Integer; }
+
+                self.classify_eightbyte(elem_ty, offset % elem_sz, elem_sz)
+            }
+
+            _ => SysVClass::Integer,
+        }
+    }
+
+    #[inline]
+    fn classify_struct(&self, ty: TypeRef) -> SmallVec<[SysVClass; 4]> {
+        let size = self.types.size_of(ty);
+
+        //
+        // > 16 bytes always goes to memory (SYSV)
+        //
+        if size > 16 {
+            return smallvec![SysVClass::Memory];
+        }
+
+        let n_eightbytes = (size + 7) / 8;
+        let mut classes = SmallVec::new();
+
+        for i in 0..n_eightbytes {
+            let offset = i * 8;
+            let end    = (offset + 8).min(size);
+            classes.push(self.classify_eightbyte(ty, offset, end));
+        }
+
+        classes
+    }
+}
+
 impl Compiler {
     #[inline]
     pub fn new(pp: PP) -> Self {
         let mut c = Self {
             pp,
+            ret_ptr_off: None,
             in_global_context: true,
             tags: Default::default(),
             loop_stack: Vec::new(),
@@ -4762,6 +4916,7 @@ impl Compiler {
                 let base = v.reg.as_gp();
                 let r = self.regs.alloc(Span::POISONED)?;
                 self.emit_int_load(r, base, v.offset, v.ty);
+                self.regs.free(base);  // Free the pointer register after dereferencing
                 Ok(r)
             }
         }
@@ -4929,7 +5084,6 @@ impl Compiler {
 
         let ret_ty   = self.compile_type()?;
         let name_tok = self.eat_ident("function or variable name")?;
-        let name     = self.s(name_tok).to_owned(); // @Borrow
         let hash     = name_tok.hash;
 
         if self.current_token.kind != TK::LParen {
@@ -4956,28 +5110,31 @@ impl Compiler {
         if top_flags.contains(TopLevelFlags::STATIC) { flags.insert(SymFlags::STATIC) };
         if top_flags.contains(TopLevelFlags::EXTERN) { flags.insert(SymFlags::EXTERN) };
 
-        let param_types = params.iter().map(|(ty, _)| *ty).collect::<SmallVec<[_; MAX_PARAMS]>>();
+        let param_types = params.iter().map(|(ty, ..)| *ty).collect::<SmallVec<[_; MAX_PARAMS]>>();
         let param_start = self.types.alloc_params(&param_types);
 
         let func_ty = self.types.make_func(ret_ty, param_start, params.len() as _, is_variadic);
 
         if flags.contains(SymFlags::EXTERN) || self.current_token.kind == TK::SemiColon {
             self.expect(TK::SemiColon, "';'")?;
+
+            let name: SmallString<[_; 24]> = name_tok.s(&self.src_arena).into(); // @Borrow
             self.syms.insert(&name, 0, 0, flags, Some(func_ty));
+
             return Ok(());
         }
 
         flags.insert(SymFlags::DEFINED);
-        self.compile_func(&name, hash, ret_ty, func_ty, params, flags)
+        self.compile_func(name_tok.span, hash, ret_ty, func_ty, params, flags)
     }
 
     fn compile_func(
         &mut self,
-        name: &str,
+        name_span: Span,
         _hash: u64,
         ret_ty: TypeRef,
         func_ty: TypeRef,
-        params: Vec<(TypeRef, u64)>,
+        params: Vec<(TypeRef, u64, Span)>,
         flags: SymFlags
     ) -> CResult<()> {
         self.locals = LocalTable::new();
@@ -4989,12 +5146,14 @@ impl Compiler {
         let code_off = self.buf.pos() as u32;
         let mut code_len = 0;
 
+        let name: SmallString<[_; 24]> = name_span.s(&self.src_arena).into(); // @Borrow
+
         //
         // Store code length as 0 for now (patch up later)
         //
 
         let sym_index = self.syms.insert(
-            name,
+            &name,
             code_off,
             code_len,
             flags,
@@ -5009,12 +5168,74 @@ impl Compiler {
         let frame_patch = self.buf.pos() + 3; // imm32 inside sub rsp, imm32
         self.buf.sub_rsp(0);
 
+        let mut argc     = 0usize;
+        let mut xmm_argc = 0usize;
+
         //
-        // Spill args to stack (convenience, for pop_reg)
         //
-        for (i, (ty, phash)) in params.iter().enumerate() {
-            let off = self.locals.alloc(*phash, *ty, &self.types);
-            self.emit_int_store(Reg::Rbp, off, ARG_REGS[i], *ty);
+        // Handle struct return - hidden pointer arrives in rdi
+        //
+        //
+
+        let is_memory_ret = matches!(
+            self.get_kind(ret_ty), TypeKind::Struct | TypeKind::Union
+        ) && self.classify_struct(ret_ty)[0] == SysVClass::Memory;
+
+        if is_memory_ret {
+            //
+            // Save the sret pointer
+            //
+
+            let ret_ptr_off = self.locals.alloc(
+                HASH_HIDDEN_LOCAL,
+                self.types.ptr_to(ret_ty),
+                &self.types
+            );
+            self.buf.mov_store(Reg::Rbp, ret_ptr_off, ARG_REGS[0], true);
+            self.ret_ptr_off = Some(ret_ptr_off);
+
+            argc = 1;
+        }
+
+        //
+        // Spill params to stack (convenience, for pop_reg)
+        //
+
+        for &(param_ty, param_hash, param_span) in &params {
+            if matches!(self.get_kind(param_ty), TypeKind::Struct | TypeKind::Union) {
+                let classes = self.classify_struct(param_ty);
+
+                if classes[0] == SysVClass::Memory {
+                    //
+                    // Param arrived as pointer in integer reg - copy into local
+                    //
+
+                    let ptr_r = ARG_REGS[argc];
+                    argc += 1;
+
+                    let ptr_off = self.locals.alloc_indirect(param_hash, param_ty);
+                    self.buf.mov_store(Reg::Rbp, ptr_off, ptr_r, true);
+                } else {
+                    //
+                    // Param arrived in registers - unpack into local
+                    //
+
+                    let off = self.locals.alloc(param_hash, param_ty, &self.types);
+                    self.unpack_struct_from_arg_regs(
+                        off, param_ty,
+                        &mut argc, &mut xmm_argc,
+                        name_span, param_span
+                    )?;
+                }
+            } else if self.is_float(param_ty) {
+                let off = self.locals.alloc(param_hash, param_ty, &self.types);
+                self.emit_float_store(Reg::Rbp, off, XMM_ARG_REGS[xmm_argc], param_ty);
+                xmm_argc += 1;
+            } else {
+                let off = self.locals.alloc(param_hash, param_ty, &self.types);
+                self.emit_int_store(Reg::Rbp, off, ARG_REGS[argc], param_ty);
+                argc += 1;
+            }
         }
 
         self.expect(TK::LCurly, "'{'")?;
@@ -5047,7 +5268,7 @@ impl Compiler {
     }
 
     #[inline]
-    fn compile_params(&mut self) -> CResult<(Vec<(TypeRef, u64)>, bool)> {
+    fn compile_params(&mut self) -> CResult<(Vec<(TypeRef, u64, Span)>, bool)> {
         let mut params = Vec::new();
         if self.current_token.kind == TK::RParen {
             return Ok((params, false));
@@ -5062,11 +5283,11 @@ impl Compiler {
         let mut variadic = false;
         loop {
             let ty   = self.compile_type()?;
-            let hash = if self.current_token.kind == TK::Ident {
+            let (hash, span) = if self.current_token.kind == TK::Ident {
                 let t = self.next();
-                t.hash
+                (t.hash, t.span)
             } else {
-                0
+                (0, Span::POISONED)
             };
 
             //
@@ -5099,7 +5320,7 @@ impl Compiler {
                 ty
             };
 
-            params.push((ty, hash));
+            params.push((ty, hash, span));
 
             if self.current_token.kind != TK::Comma { break; }
             self.next();
@@ -5158,20 +5379,50 @@ impl Compiler {
         let mut has_parens = false;
         if self.current_token.kind == TK::LParen { self.next(); has_parens = true }
 
+        let ret_ty = self.ret_ty;
+        let is_struct = matches!(self.get_kind(ret_ty), TypeKind::Struct | TypeKind::Union);
+
         if self.current_token.kind != TK::SemiColon {
             self.compile_expr()?;
 
-            let ret_ty = self.ret_ty;
-            if self.is_float(ret_ty) {
+            if is_struct {
+                let v = self.vstack.pop();
+                let size = self.types.size_of(ret_ty) as i32;
+
+                let (src_base, src_off) = match v.kind {
+                    VK::Local | VK::RegInd => (v.reg.as_gp(), v.offset),
+                    VK::Reg  => (v.reg.as_gp(), 0),
+                    VK::Imm  => unreachable!(),
+                };
+
+                let classes = self.classify_struct(ret_ty);
+                if classes[0] == SysVClass::Memory {
+                    //
+                    // The struct is big, just copy it into dst.
+                    //
+
+                    let ret_ptr_off = self.ret_ptr_off.unwrap();
+                    let dst = self.regs.alloc(Span::POISONED)?;
+                    self.buf.mov_load(dst, Reg::Rbp, ret_ptr_off, true);
+                    self.emit_struct_copy(dst, 0, src_base, src_off, size)?;
+                    self.buf.mov_rr(Reg::Rax, dst);
+                    self.regs.free(dst);
+                } else {
+                    //
+                    // The struct isn't that big, pack it into registers.
+                    //
+
+                    self.pack_struct_into_return_regs(src_base, src_off, ret_ty)?;
+                }
+
+                if v.kind == VK::RegInd { self.regs.free(v.reg.as_gp()); }
+            } else if self.is_float(ret_ty) {
                 let v = self.vstack.pop();
                 let r = self.coerce_to_xmm(v, ret_ty)?;
-
-                self.emit_float_mov(XmmReg::Xmm0, r, self.ret_ty);
-
+                self.emit_float_mov(XmmReg::Xmm0, r, ret_ty);
                 self.xmms.free(r);
             } else {
                 let (r, _) = self.pop_reg_and_decay_array()?;
-
                 self.buf.mov_rr(Reg::Rax, r);
                 self.regs.free(r);
             }
@@ -5448,9 +5699,37 @@ impl Compiler {
     }
 
     #[inline]
-    fn compile_store_impl(&mut self, base: Reg, off: i32, ty: TypeRef, keep: bool) -> CResult<()> {
+    fn emit_store_impl(&mut self, base: Reg, off: i32, ty: TypeRef, keep: bool) -> CResult<()> {
+        if matches!(self.get_kind(ty), TypeKind::Struct | TypeKind::Union) {
+            let v = self.vstack.pop();
+            let size = self.types.size_of(ty) as i32;
+
+            let (src_base, src_off) = match v.kind {
+                VK::Local | VK::RegInd => (v.reg.as_gp(), v.offset),
+                VK::Reg                => (v.reg.as_gp(), 0),
+
+                VK::Imm => unreachable!(),
+            };
+
+            //
+            // Don't free yet: emit_struct_copy is using it!
+            //
+            // if v.kind == VK::RegInd { ... }
+            self.emit_struct_copy(base, off, src_base, src_off, size)?;
+            if v.kind == VK::RegInd { self.regs.free(v.reg.as_gp()); }
+
+            if keep {
+                let dst_r = self.regs.alloc(Span::POISONED)?;
+                self.buf.lea(dst_r, base, off);
+                self.vstack.push(CValue::regind(ty, dst_r, 0));
+            }
+
+            return Ok(());
+        }
+
         if !self.is_float(ty) {
-            let (r, _) = self.pop_reg()?;
+            let v = self.pop_vstack_and_decay_array()?;
+            let r = self.force_gp(v)?;
 
             self.emit_int_store(base, off, r, ty);
 
@@ -5478,13 +5757,13 @@ impl Compiler {
     }
 
     #[inline]
-    fn compile_store(&mut self, base: Reg, off: i32, ty: TypeRef) -> CResult<()> {
-        self.compile_store_impl(base, off, ty, false)
+    fn emit_store(&mut self, base: Reg, off: i32, ty: TypeRef) -> CResult<()> {
+        self.emit_store_impl(base, off, ty, false)
     }
 
     #[inline]
-    fn compile_store_keep(&mut self, base: Reg, off: i32, ty: TypeRef) -> CResult<()> {
-        self.compile_store_impl(base, off, ty, true)
+    fn emit_store_keep(&mut self, base: Reg, off: i32, ty: TypeRef) -> CResult<()> {
+        self.emit_store_impl(base, off, ty, true)
     }
 
     #[inline]
@@ -5516,7 +5795,7 @@ impl Compiler {
             self.expect(TK::RParen, "')'")?;
 
             let param_types = params.iter()
-                .map(|(ty, _)| *ty)
+                .map(|(ty, ..)| *ty)
                 .collect::<SmallVec<[_; MAX_PARAMS]>>();
             let param_start = self.types.alloc_params(&param_types);
 
@@ -5553,7 +5832,7 @@ impl Compiler {
     ) -> CResult<()> {
         let mut name_tok = first_name_tok;
         loop {
-            let name = self.s(name_tok).to_owned(); // @Borrow
+            let name: SmallString<[_; 24]> = name_tok.s(&self.src_arena).into(); // @Borrow
             let hash = name_tok.hash;
 
             //
@@ -5886,7 +6165,7 @@ impl Compiler {
             } else {
                 let off = base_off + idx * elem_sz;
                 self.compile_expr_no_comma()?;
-                self.compile_store(Reg::Rbp, off, elem_ty)?;
+                self.emit_store(Reg::Rbp, off, elem_ty)?;
             }
 
             idx += 1;
@@ -6130,7 +6409,7 @@ impl Compiler {
                 self.compile_array_initializer(off, ty)?;
             } else {
                 self.compile_expr_no_comma()?;
-                self.compile_store(Reg::Rbp, off, ty)?;
+                self.emit_store(Reg::Rbp, off, ty)?;
             }
         }
 
@@ -6247,7 +6526,7 @@ impl Compiler {
         }
 
         let base = lhs.reg.as_gp();
-        self.compile_store_keep(base, lhs.offset, lhs.ty)?;
+        self.emit_store_keep(base, lhs.offset, lhs.ty)?;
         self.regs.free(base);
         Ok(())
     }
@@ -7139,7 +7418,17 @@ impl Compiler {
                 } else if self.current_token.kind == TK::LParen {
                     self.compile_call(hash, name_tok)?;
                 } else if let Some(lv) = self.locals.find(hash) {
-                    self.vstack.push(CValue::local(lv.ty, lv.rbp_off));
+                    if lv.is_indirect {
+                        //
+                        // Load the pointer, then push as RegInd
+                        //
+
+                        let r = self.regs.alloc(name_tok.span)?;
+                        self.buf.mov_load(r, Reg::Rbp, lv.rbp_off, true);
+                        self.vstack.push(CValue::regind(lv.ty, r, 0));
+                    } else {
+                        self.vstack.push(CValue::local(lv.ty, lv.rbp_off));
+                    }
 
                     // postfix ++ / --
                     if matches!(self.current_token.kind, TK::PlusPlus | TK::MinusMinus) {
@@ -7331,9 +7620,20 @@ impl Compiler {
                 VK::Reg | VK::RegInd => {}
             }
 
-            let spill_off = self.locals.alloc(0, v.ty, &self.types);
+            let spill_off = self.locals.alloc(HASH_HIDDEN_LOCAL, v.ty, &self.types);
 
-            if self.is_float(v.ty) {
+            if matches!(self.get_kind(v.ty), TypeKind::Struct | TypeKind::Union) {
+                //
+                // Struct in RegInd - base reg will be clobbered
+                // Copy struct data to a stack local
+                //
+
+                let size = self.types.size_of(v.ty) as i32;
+
+                let (src_base, src_off) = (v.reg.as_gp(), v.offset);
+                self.emit_struct_copy(Reg::Rbp, spill_off, src_base, src_off, size)?;
+                self.regs.free(src_base);
+            } else if self.is_float(v.ty) {
                 let xmm = if v.kind == VK::RegInd {
                     let tmp = self.xmms.alloc(Span::POISONED)?;
                     self.emit_float_load(tmp, v.reg.as_gp(), v.offset, v.ty);
@@ -7369,6 +7669,96 @@ impl Compiler {
         Ok(())
     }
 
+    #[inline]
+    fn emit_memcpy_call(&mut self) -> CResult<()> {
+        let call_site = self.buf.call_rel32();
+        let memcpy_hash = hash_str("memcpy");
+        let idx = if let Some(idx) = self.syms.find(memcpy_hash) {
+            idx
+        } else {
+            self.syms.insert("memcpy", 0, 0, SymFlags::EXTERN, None)
+        };
+
+        if self.syms[idx].flags.contains(SymFlags::EXTERN) {
+            self.relocs.push(Reloc {
+                offset: call_site as u32,
+                sym_index: idx as u32,
+                addend: -4,
+            });
+        } else {
+            self.buf.patch_call(call_site, self.syms[idx].code_off as usize);
+        }
+
+        self.regs.clobber_caller_save();
+        self.xmms.clobber_caller_save();
+
+        Ok(())
+    }
+
+    fn emit_struct_copy(
+        &mut self,
+        dst_base: Reg, dst_off: i32,
+        src_base: Reg, src_off: i32,
+        size: i32
+    ) -> CResult<()> {
+        //
+        // @Note: This could use the alignment of the type,
+        // which would be a good @CodeOptimization.
+        //
+
+        if size <= 64 {
+            let tmp = self.regs.alloc(Span::POISONED)?;
+
+            let mut copied = 0i32;
+            while copied + 8 <= size {
+                self.buf.mov_load(tmp, src_base, src_off + copied, true);
+                self.buf.mov_store(dst_base, dst_off + copied, tmp, true);
+                copied += 8;
+            }
+
+            if copied + 4 <= size {
+                self.buf.mov_load(tmp, src_base, src_off + copied, false);
+                self.buf.mov_store(dst_base, dst_off + copied, tmp, false);
+                copied += 4;
+            }
+
+            while copied < size {
+                self.buf.movzx8_load(tmp, src_base, src_off + copied);
+                self.buf.mov_store8(dst_base, dst_off + copied, tmp);
+                copied += 1;
+            }
+
+            self.regs.free(tmp);
+        } else {
+            if src_base == Reg::Rdi {
+                // src is gonna get clobbered, alloc a temp register
+                let src_tmp = self.regs.alloc(Span::POISONED)?;
+
+                if src_off == 0 { self.buf.mov_rr(src_tmp, src_base); }
+                else            { self.buf.lea(src_tmp, src_base, src_off); }
+
+                if dst_off == 0 { self.buf.mov_rr(Reg::Rdi, dst_base); }
+                else            { self.buf.lea(Reg::Rdi, dst_base, dst_off); }
+
+                self.buf.mov_rr(Reg::Rsi, src_tmp);
+
+                // free the temp register
+                self.regs.free(src_tmp);
+            } else {
+                if dst_off == 0 { self.buf.mov_rr(Reg::Rdi, dst_base); }
+                else            { self.buf.lea(Reg::Rdi, dst_base, dst_off); }
+                if src_off == 0 { self.buf.mov_rr(Reg::Rsi, src_base); }
+                else            { self.buf.lea(Reg::Rsi, src_base, src_off); }
+            }
+
+            self.buf.mov_ri64(Reg::Rdx, size as i64);
+
+            self.emit_memcpy_call()?;  // memcpy(dst(rdi), src(rsi), n(rdx))
+        }
+
+        Ok(())
+    }
+
     fn compile_call(&mut self, callee_hash: u64, name_tok: Token) -> CResult<()> {
         self.next(); // '('
 
@@ -7391,8 +7781,8 @@ impl Compiler {
         // Evaluate all args and spill to locals
         // This ensures nested calls don't clobber already-evaluated args
         //
-        //                             off   ty
-        let mut arg_spills: SmallVec<[(i32, TypeRef); 8]> = SmallVec::new();
+        //                             off   ty     arg span
+        let mut arg_spills: SmallVec<[(i32, TypeRef, Span); 8]> = SmallVec::new();
 
         while self.current_token.kind != TK::RParen && !self.at_eof() {
             //
@@ -7403,22 +7793,29 @@ impl Compiler {
             //
             self.spill_vstack_across_call()?;
 
-            self.compile_expr_no_comma()?;
+            let arg_span = {
+                let s = self.current_token.span;
+                self.compile_expr_no_comma()?;
+                s.merge(self.current_token.span)
+            };
             let v = self.pop_vstack_and_decay_array()?;
 
-            let spill_off = self.locals.alloc(0, v.ty, &self.types);
-
-            if self.is_float(v.ty) {
-                let xmm = self.coerce_to_xmm(v, v.ty)?;
-                self.emit_float_store(Reg::Rbp, spill_off, xmm, v.ty);
-                self.xmms.free(xmm);
+            //
+            // Get declared param type for coercion
+            //
+            let arg_idx = arg_spills.len();
+            let declared_ty = if arg_idx < param_count as usize {
+                self.types.get_param(sym.func_ty, arg_idx as _)
             } else {
-                let gp = self.force_gp(v)?;
-                self.emit_int_store(Reg::Rbp, spill_off, gp, v.ty);
-                self.regs.free(gp);
-            }
+                v.ty  // variadic, use value type
+            };
 
-            arg_spills.push((spill_off, v.ty));
+            let spill_off = self.locals.alloc(0, declared_ty, &self.types);
+
+            self.vstack.push(v);  // emit_store pops from vstack
+            self.emit_store(Reg::Rbp, spill_off, declared_ty)?;
+
+            arg_spills.push((spill_off, declared_ty, arg_span));
 
             if self.current_token.kind == TK::Comma { self.next(); }
         }
@@ -7458,9 +7855,51 @@ impl Compiler {
         let mut argc     = 0usize;
         let mut xmm_argc = 0usize;
 
-        for &(spill_off, ty) in &arg_spills {
+        //
+        // Handle struct return
+        //
+        //                          off is_memory
+        let struct_ret_off: Option<(i32, bool)> = if matches!(self.get_kind(ret_ty), TypeKind::Struct | TypeKind::Union) {
+            let classes = self.classify_struct(ret_ty);
+            if classes[0] == SysVClass::Memory {
+                //
+                // Sret pointer
+                //
+
+                argc = 1;
+
+                let ret_off = self.locals.alloc(HASH_HIDDEN_LOCAL, ret_ty, &self.types);
+                self.buf.lea(ARG_REGS[0], Reg::Rbp, ret_off);
+
+                Some((ret_off, true))
+            } else {
+                //
+                // Register return
+                //
+
+                Some((self.locals.alloc(0, ret_ty, &self.types), false))
+            }
+        } else {
+            None
+        };
+
+        for &(spill_off, ty, arg_span) in &arg_spills {
             let kind = self.get_kind(ty);
-            if kind.is_float() {
+            if matches!(kind, TypeKind::Struct | TypeKind::Union) {
+                //
+                // Struct argument
+                //
+
+                self.pass_struct_arg(
+                    spill_off, ty,
+                    &mut argc, &mut xmm_argc,
+                    call_span, arg_span,
+                )?;
+            } else if kind.is_float() {
+                //
+                // Float argument
+                //
+
                 if xmm_argc >= XMM_ARG_REGS.len() {
                     return Err(CError::ArgumentCountMismatch {
                         span: call_span,
@@ -7482,6 +7921,10 @@ impl Compiler {
 
                 xmm_argc += 1;
             } else {
+                //
+                // Integer argument
+                //
+
                 if argc >= ARG_REGS.len() {
                     return Err(CError::ArgumentCountMismatch {
                         span: call_span,
@@ -7520,12 +7963,248 @@ impl Compiler {
         self.regs.clobber_caller_save();
         self.xmms.clobber_caller_save();
 
-        if self.is_float(ret_ty) {
+        if let Some((ret_off, is_memory)) = struct_ret_off {
+            if !is_memory {
+                self.unpack_struct_return_regs(ret_off, ret_ty)?;
+            }
+
+            self.vstack.push(CValue::local(ret_ty, ret_off));
+        } else if self.is_float(ret_ty) {
             self.xmms.mark(XmmReg::Xmm0);
             self.vstack.push(CValue::xmm(ret_ty, XmmReg::Xmm0));
         } else {
             self.regs.mark(Reg::Rax);
             self.vstack.push(CValue::gp(ret_ty, Reg::Rax));
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn unpack_struct_return_regs(&mut self, ret_off: i32, ret_ty: TypeRef) -> CResult<()> {
+        let classes = self.classify_struct(ret_ty);
+        let size = self.types.size_of(ret_ty) as i32;
+
+        for (i, &cls) in classes.iter().enumerate() {
+            let offset = (i * 8) as i32;
+            let chunk  = (size - offset).min(8);
+
+            match cls {
+                SysVClass::Integer => {
+                    let src = if i == 0 { Reg::Rax } else { Reg::Rdx };
+
+                    if chunk >= 8 {
+                        self.buf.mov_store(Reg::Rbp, ret_off + offset, src, true);
+                    } else if chunk >= 4 {
+                        self.buf.mov_store(Reg::Rbp, ret_off + offset, src, false);
+                    } else {
+                        self.buf.mov_store8(Reg::Rbp, ret_off + offset, src);
+                    }
+                }
+
+                SysVClass::Sse => {
+                    let xmm = if i == 0 { XmmReg::Xmm0 } else { XmmReg::Xmm1 };
+
+                    self.buf.movq_xmm_store(Reg::Rbp, ret_off + offset, xmm);
+                }
+
+                SysVClass::Memory => unreachable!(),
+            }
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn pack_struct_into_return_regs(&mut self, src_base: Reg, src_off: i32, ret_ty: TypeRef) -> CResult<()> {
+        let classes = self.classify_struct(ret_ty);
+        let size = self.types.size_of(ret_ty) as i32;
+
+        for (i, &cls) in classes.iter().enumerate() {
+            let offset = (i * 8) as i32;
+            let chunk  = (size - offset).min(8);
+
+            match cls {
+                SysVClass::Integer => {
+                    let dst = if i == 0 { Reg::Rax } else { Reg::Rdx };
+
+                    self.buf.xor_rr(dst, dst);
+
+                    if chunk >= 8 {
+                        self.buf.mov_load(dst, src_base, src_off + offset, true);
+                    } else if chunk >= 4 {
+                        self.buf.mov_load(dst, src_base, src_off + offset, false);
+                    } else {
+                        let tmp = self.regs.alloc(Span::POISONED)?;
+                        let mut b = 0i32;
+                        while b < chunk {
+                            self.buf.movzx8_load(tmp, src_base, src_off + offset + b);
+                            self.buf.shl_ri(dst, 8);
+                            self.buf.or_rr(dst, tmp);
+                            b += 1;
+                        }
+                        self.regs.free(tmp);
+                    }
+                }
+
+                SysVClass::Sse => {
+                    let xmm = if i == 0 { XmmReg::Xmm0 } else { XmmReg::Xmm1 };
+
+                    if chunk >= 8 {
+                        self.buf.movq_xmm_load(xmm, src_base, src_off + offset);
+                    } else if chunk >= 4 {
+                        self.buf.movss_load(xmm, src_base, src_off + offset);
+                    } else {
+                        self.buf.movss_load(xmm, src_base, src_off + offset);
+                    }
+                }
+
+                SysVClass::Memory => unreachable!(),
+            }
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn unpack_struct_from_arg_regs(
+        &mut self,
+        off: i32,
+        ty: TypeRef,
+
+        argc: &mut usize,
+        xmm_argc: &mut usize,
+
+        // For errors
+        call_span: Span,
+        arg_span: Span,
+    ) -> CResult<()> {
+        let classes = self.classify_struct(ty);
+        let size = self.types.size_of(ty) as i32;
+        for (i, &cls) in classes.iter().enumerate() {
+            let offset = (i * 8) as i32;
+            let chunk  = (size - offset).min(8);
+            match cls {
+                SysVClass::Integer => {
+                    if *argc >= ARG_REGS.len() {
+                        return Err(CError::ArgumentCountMismatch {
+                            span: call_span,
+                            expected: ARG_REGS.len(),
+                            name: arg_span.s(&self.src_arena).to_owned()
+                        });
+                    }
+
+                    let src = ARG_REGS[*argc];
+                    *argc += 1;
+
+                    if chunk >= 8 {
+                        self.buf.mov_store(Reg::Rbp, off + offset, src, true);
+                    } else if chunk >= 4 {
+                        self.buf.mov_store(Reg::Rbp, off + offset, src, false);
+                    } else {
+                        self.buf.mov_store8(Reg::Rbp, off + offset, src);
+                    }
+                }
+
+                SysVClass::Sse => {
+                    if *xmm_argc >= XMM_ARG_REGS.len() {
+                        return Err(CError::ArgumentCountMismatch {
+                            span: call_span,
+                            expected: XMM_ARG_REGS.len(),
+                            name: arg_span.s(&self.src_arena).to_owned()
+                        });
+                    }
+
+                    let xmm = XMM_ARG_REGS[*xmm_argc];
+                    *xmm_argc += 1;
+                    self.buf.movq_xmm_store(Reg::Rbp, off + offset, xmm);
+                }
+
+                SysVClass::Memory => unreachable!(),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn pass_struct_arg(
+        &mut self,
+
+        spill_off: i32,
+        ty: TypeRef,
+
+        argc: &mut usize,
+        xmm_argc: &mut usize,
+
+        // For errors
+        call_span: Span,
+        arg_span: Span,
+    ) -> CResult<()> {
+        let classes = self.classify_struct(ty);
+
+        if classes[0] == SysVClass::Memory {
+            //
+            // Pass pointer to the spilled copy (C value semantics)
+            //
+
+            if *argc >= ARG_REGS.len() {
+                return Err(CError::ArgumentCountMismatch {
+                    span: call_span,
+                    expected: ARG_REGS.len(),
+                    name: arg_span.s(&self.src_arena).to_owned()
+                });
+            }
+            self.buf.lea(ARG_REGS[*argc], Reg::Rbp, spill_off);
+            *argc += 1;
+
+            return Ok(());
+        }
+
+        let size = self.types.size_of(ty);
+
+        for (i, &cls) in classes.iter().enumerate() {
+            let offset = (i * 8) as i32;
+            let chunk  = (size as i32 - offset).min(8);
+            match cls {
+                SysVClass::Integer => {
+                    if *argc >= ARG_REGS.len() {
+                        return Err(CError::ArgumentCountMismatch {
+                            span: call_span,
+                            expected: ARG_REGS.len(),
+                            name: arg_span.s(&self.src_arena).to_owned()
+                        });
+                    }
+
+                    let r = ARG_REGS[*argc];
+                    *argc += 1;
+
+                    self.buf.xor_rr(r, r);
+                    if chunk >= 8 {
+                        self.buf.mov_load(r, Reg::Rbp, spill_off + offset, true);
+                    } else if chunk >= 4 {
+                        self.buf.mov_load(r, Reg::Rbp, spill_off + offset, false);
+                    } else {
+                        // Just in case... Load 4 bytes, upper bits zeroed by xor above
+                        self.buf.mov_load(r, Reg::Rbp, spill_off + offset, false);
+                    }
+                }
+
+                SysVClass::Sse => {
+                    if *xmm_argc >= XMM_ARG_REGS.len() {
+                        return Err(CError::ArgumentCountMismatch {
+                            span: call_span,
+                            expected: XMM_ARG_REGS.len(),
+                            name: arg_span.s(&self.src_arena).to_owned()
+                        });
+                    }
+
+                    let xmm = XMM_ARG_REGS[*xmm_argc];
+                    self.buf.movq_xmm_load(xmm, Reg::Rbp, spill_off + offset);
+                    *xmm_argc += 1;
+                }
+
+                SysVClass::Memory => unreachable!(),
+            }
         }
 
         Ok(())
