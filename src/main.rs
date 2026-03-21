@@ -12,7 +12,7 @@
 // TODO(#16): More declarators support: `void (*(*fp)(int))(float)`
 // TODO(#17): __builtin_bswap16, __builtin_*...
 
-// TODO: Resolve the situation with sret and VLA hidden slot using the same slot...?
+// TODO(#18): Resolve the situation with sret and VLA hidden slot using the same slot...?
 
 //
 // @Cleanup: There's lots of unnecessary std::process::exit calls.
