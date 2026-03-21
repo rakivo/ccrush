@@ -682,9 +682,6 @@ impl MacroDef {
 }
 
 struct MacroTable {
-    defs:     SmallVec<[MacroDef; 64]>,
-    tok_pool: SmallVec<[Token; 512]>,
-
     index:    IntMap<u64, u32>,
 
     scratch:  Vec<Token>,  // Reused across calls, never shrinks
@@ -694,6 +691,9 @@ struct MacroTable {
     // arg_ends[i] is the exclusive end index in arg_pool for argument i.
     arg_pool: Vec<Token>,
     arg_ends: SmallVec<[u32; MAX_PARAMS]>,
+
+    defs:     SmallVec<[MacroDef; 64]>,
+    tok_pool: SmallVec<[Token; 256]>,
 }
 
 impl MacroTable {
@@ -834,11 +834,11 @@ pub struct PP {
     at_bol:            bx,  // At beginning of line - gate for # directives
     stop_at_newline:   bx,  // For # directives as well
 
+    // TODO: Make pragma_once_paths and include_dirs in PP hashsets
     pragma_once_paths: Vec<PathBuf>,
-
     include_dirs:      Vec<PathBuf>,
 
-    macros:            MacroTable,
+    macros:            MacroTable, // Huge struct (~194 cache lines)
 }
 
 impl PP {
@@ -4257,10 +4257,6 @@ pub struct Compiler {
     pub xmms:          XmmAlloc,
     pub regs:          RegAlloc,
 
-    // Reset per function
-    pub locals:        LocalTable,
-    pub globals:       GlobalTable,
-
     pub in_global_context:                             bx,   // @KindaHack, used in compile_type
     pub dont_decay_types_of_array_globals_to_pointers: bx,   // @KindaHack, used in sizeof
 
@@ -4276,8 +4272,6 @@ pub struct Compiler {
     pub data_relocs:   Vec<DataReloc>,
     pub bss_size:      usize,
 
-    pub syms:          SymTable,
-
     pub loop_stack:    Vec<LoopContext>,
 
     pub relocs:        Vec<Reloc>,
@@ -4285,6 +4279,12 @@ pub struct Compiler {
     pub rodata_relocs: Vec<RodataReloc>,
 
     pub vla_sizes:     IntMap<TypeRef, i32>,  // Fresh TypeRef -> rbp_off of total byte size local
+
+    // Reset per function
+    pub locals:        LocalTable,  // Huge struct (~50 cache lines)
+    pub globals:       GlobalTable, // Huge struct (~25 cache lines)
+
+    pub syms:          SymTable,    // Huge struct (~33 cache lines)
 
     pub pp:            PP,
 }
