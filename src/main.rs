@@ -7283,7 +7283,7 @@ impl Compiler {
         // Spill lhs base address if it's a RegInd - rhs evaluation (e.g. function calls)
         // can clobber the base register before we get to emit the store.
         //
-        let (lhs, lhs_addr_spill) = if lhs.kind() == VK::RegInd {
+        let (lhs, lhs_addr_spill) = if lhs.kind() == VK::RegInd && lhs.reg().as_gp() != Reg::Rbp {
             let addr_off = self.locals.alloc(HASH_HIDDEN_LOCAL, TYPE_LONG, &self.types);
             let base = lhs.reg().as_gp();
             self.buf.mov_store(Reg::Rbp, addr_off, base, true);
