@@ -5474,7 +5474,7 @@ impl Compiler {
 
         let (sym_index, func_ty) = if let Some(forward_declaration_symbol_index) = self.syms.find(hash) {
             // @Incomplete
-            // TODO: Verify that func's forward decl and definition signatures match
+            // TODO(#22): Verify that func's forward decl and definition signatures match
 
             self.syms.patch_forward_declaration(
                 forward_declaration_symbol_index,
@@ -9024,4 +9024,3 @@ fn run_main(mut c: Compiler) {
     let result = f(argc, argv_ptr, envp_ptr);
     std::process::exit(result);
 }
-     
