@@ -109,7 +109,7 @@ pub use {
 };
 
 #[inline(always)]
-const fn hash_str(s: &str) -> u64 {
+const fn hash_ident(s: &str) -> u64 {
     let b = s.as_bytes();
     let mut h = 0xcbf29ce484222325u64;
     let mut i = 0;
@@ -118,6 +118,13 @@ const fn hash_str(s: &str) -> u64 {
         i += 1;
     }
     h
+}
+
+type RodataHash = u64;
+
+#[inline(always)]
+fn hash_bytes_for_rodata_interning(bytes: &[u8]) -> u64 {
+    wyhash::wyhash(bytes, 0)
 }
 
 #[inline]
@@ -486,50 +493,50 @@ impl Token {
 
 // Pre-computed fnv1a hashes of every keyword.  Used in place of string
 // comparisons throughout the compiler hot path - integer equality only.
-const HASH_RETURN:   u64 = hash_str("return");
-const HASH_INT:      u64 = hash_str("int");
-const HASH_LONG:     u64 = hash_str("long");
-const HASH_CHAR:     u64 = hash_str("char");
-const HASH_VOID:     u64 = hash_str("void");
-const HASH_FLOAT:    u64 = hash_str("float");
-const HASH_SIGNED:   u64 = hash_str("signed");
-const HASH_UNSIGNED: u64 = hash_str("unsigned");
-const HASH_STATIC:   u64 = hash_str("static");
-const HASH_RESTRICT: u64 = hash_str("restrict");
-const HASH_VOLATILE: u64 = hash_str("volatile");
-const HASH_REGISTER: u64 = hash_str("register");
-const HASH_AUTO:     u64 = hash_str("auto");
-const HASH_INLINE:   u64 = hash_str("inline");
-const HASH_CONST:    u64 = hash_str("const");
-const HASH_DEFINED:  u64 = hash_str("defined");
-const HASH_DOUBLE:   u64 = hash_str("double");
-const HASH_SHORT:    u64 = hash_str("short");
-const HASH_ONCE:     u64 = hash_str("once");
-const HASH_EXTERN:   u64 = hash_str("extern");
-const HASH_DEFINE:   u64 = hash_str("define");
-const HASH_TYPEDEF:  u64 = hash_str("typedef");
-const HASH_STRUCT:   u64 = hash_str("struct");
-const HASH_UNION:    u64 = hash_str("union");
-const HASH_ENUM:     u64 = hash_str("enum");
-const HASH_INCLUDE:  u64 = hash_str("include");
-const HASH_PRAGMA:   u64 = hash_str("pragma");
-const HASH_UNDEF:    u64 = hash_str("undef");
-const HASH_IFNDEF:   u64 = hash_str("ifndef");
-const HASH_IFDEF:    u64 = hash_str("ifdef");
-const HASH_ERROR:    u64 = hash_str("error");
-const HASH_WARNING:  u64 = hash_str("warning");
-const HASH_IF:       u64 = hash_str("if");
-const HASH_FOR:      u64 = hash_str("for");
-const HASH_WHILE:    u64 = hash_str("while");
-const HASH_SIZEOF:   u64 = hash_str("sizeof");
-const HASH_TYPEOF:   u64 = hash_str("typeof");
-const HASH_ELSE:     u64 = hash_str("else");
-const HASH_ELIF:     u64 = hash_str("elif");
-const HASH_ENDIF:    u64 = hash_str("endif");
-const HASH_BREAK:    u64 = hash_str("break");
-const HASH_BOOL:     u64 = hash_str("bool");
-const HASH__BOOL:    u64 = hash_str("_Bool");
-const HASH_CONTINUE: u64 = hash_str("continue");
+const HASH_RETURN:   u64 = hash_ident("return");
+const HASH_INT:      u64 = hash_ident("int");
+const HASH_LONG:     u64 = hash_ident("long");
+const HASH_CHAR:     u64 = hash_ident("char");
+const HASH_VOID:     u64 = hash_ident("void");
+const HASH_FLOAT:    u64 = hash_ident("float");
+const HASH_SIGNED:   u64 = hash_ident("signed");
+const HASH_UNSIGNED: u64 = hash_ident("unsigned");
+const HASH_STATIC:   u64 = hash_ident("static");
+const HASH_RESTRICT: u64 = hash_ident("restrict");
+const HASH_VOLATILE: u64 = hash_ident("volatile");
+const HASH_REGISTER: u64 = hash_ident("register");
+const HASH_AUTO:     u64 = hash_ident("auto");
+const HASH_INLINE:   u64 = hash_ident("inline");
+const HASH_CONST:    u64 = hash_ident("const");
+const HASH_DEFINED:  u64 = hash_ident("defined");
+const HASH_DOUBLE:   u64 = hash_ident("double");
+const HASH_SHORT:    u64 = hash_ident("short");
+const HASH_ONCE:     u64 = hash_ident("once");
+const HASH_EXTERN:   u64 = hash_ident("extern");
+const HASH_DEFINE:   u64 = hash_ident("define");
+const HASH_TYPEDEF:  u64 = hash_ident("typedef");
+const HASH_STRUCT:   u64 = hash_ident("struct");
+const HASH_UNION:    u64 = hash_ident("union");
+const HASH_ENUM:     u64 = hash_ident("enum");
+const HASH_INCLUDE:  u64 = hash_ident("include");
+const HASH_PRAGMA:   u64 = hash_ident("pragma");
+const HASH_UNDEF:    u64 = hash_ident("undef");
+const HASH_IFNDEF:   u64 = hash_ident("ifndef");
+const HASH_IFDEF:    u64 = hash_ident("ifdef");
+const HASH_ERROR:    u64 = hash_ident("error");
+const HASH_WARNING:  u64 = hash_ident("warning");
+const HASH_IF:       u64 = hash_ident("if");
+const HASH_FOR:      u64 = hash_ident("for");
+const HASH_WHILE:    u64 = hash_ident("while");
+const HASH_SIZEOF:   u64 = hash_ident("sizeof");
+const HASH_TYPEOF:   u64 = hash_ident("typeof");
+const HASH_ELSE:     u64 = hash_ident("else");
+const HASH_ELIF:     u64 = hash_ident("elif");
+const HASH_ENDIF:    u64 = hash_ident("endif");
+const HASH_BREAK:    u64 = hash_ident("break");
+const HASH_BOOL:     u64 = hash_ident("bool");
+const HASH__BOOL:    u64 = hash_ident("_Bool");
+const HASH_CONTINUE: u64 = hash_ident("continue");
 
 const HASH_HIDDEN_LOCAL: u64 = 0;
 
@@ -1129,7 +1136,7 @@ impl PP {
 
     #[inline]
     pub fn define_simple(&mut self, name: &str, val: &str) {
-        let name_hash = hash_str(name);
+        let name_hash = hash_ident(name);
 
         let val = self.src_arena.add_bytes(
             &PathBuf::from("<builtin>"),
@@ -1164,7 +1171,7 @@ impl PP {
     fn define_func_macro(&mut self, name: &str, params: &[&str], body: impl Into<Box<[u8]>>) {
         // @Cutnpaste from define_simple
 
-        let name_hash = hash_str(name);
+        let name_hash = hash_ident(name);
         let val_fid = self.src_arena.add_bytes(
             &PathBuf::from("<builtin>"),
             body
@@ -1180,7 +1187,7 @@ impl PP {
 
         let mut param_hashes = [0u64; MAX_PARAMS];
         for (i, &p) in params.iter().enumerate() {
-            param_hashes[i] = hash_str(p);
+            param_hashes[i] = hash_ident(p);
         }
 
         let def = MacroDef {
@@ -1260,7 +1267,7 @@ impl PP {
                 TK::Ident => {
                     self.at_bol = false;
 
-                    let hash = hash_str(t.s(&self.src_arena));
+                    let hash = hash_ident(t.s(&self.src_arena));
                     let Some(index) = self.macros.find(hash) else {
                         return Token { kind: t.kind, span: t.span, hash };
                     };
@@ -1307,7 +1314,7 @@ impl PP {
             return Ok(());
         }
 
-        name.hash = hash_str(name.s(&self.src_arena));
+        name.hash = hash_ident(name.s(&self.src_arena));
 
         match name.hash {
             HASH_DEFINE  => self.pp_define(),
@@ -1355,7 +1362,7 @@ impl PP {
         let name_tok = self.raw();
         if name_tok.kind != TK::Ident { self.skip_line(); return Ok(()); }
 
-        let name_hash = hash_str(name_tok.s(&self.src_arena));
+        let name_hash = hash_ident(name_tok.s(&self.src_arena));
         let next      = self.raw();
 
         // Function macro: '(' must be immediately adjacent - no whitespace
@@ -1371,7 +1378,7 @@ impl PP {
         fn try_param_subst(t: Token, def: &MacroDef, arena: &SrcArena) -> Token {
             if t.kind != TK::Ident || def.param_count == 0 { return t; }
 
-            let h = hash_str(t.s(arena));
+            let h = hash_ident(t.s(arena));
             for i in 0..def.param_count as usize {
                 if def.param_hashes[i] == h {
                     return Token { kind: TK::Param(i as u8), span: t.span, hash: 0 };
@@ -1389,7 +1396,7 @@ impl PP {
                     TK::RParen            => break,
                     TK::Comma             => {}
                     TK::Ident             => {
-                        let ph = hash_str(t.s(&self.src_arena));
+                        let ph = hash_ident(t.s(&self.src_arena));
                         def.param_hashes[def.param_count as usize] = ph;
                         def.param_count += 1;
                     }
@@ -1429,7 +1436,7 @@ impl PP {
     fn pp_undef(&mut self) {
         let t = self.raw();
         if t.kind == TK::Ident {
-            self.macros.undef(hash_str(t.s(&self.src_arena)));
+            self.macros.undef(hash_ident(t.s(&self.src_arena)));
         }
 
         self.skip_line();
@@ -1505,7 +1512,7 @@ impl PP {
     #[inline]
     fn pp_pragma(&mut self) {
         let t = self.raw();
-        if hash_str(t.s(&self.src_arena)) == HASH_ONCE {
+        if hash_ident(t.s(&self.src_arena)) == HASH_ONCE {
             if let Some(ff) = self.file_stack.last() {
                 let path = Path::new(self.src_arena.files[ff.fid].path.as_ref());
                 if let Ok(canonical) = path.canonicalize() {
@@ -1679,7 +1686,7 @@ impl PP {
                     let name = self.raw();
                     if name.kind != TK::Ident { self.skip_line(); continue; }
 
-                    let h = hash_str(name.s(&self.src_arena));
+                    let h = hash_ident(name.s(&self.src_arena));
                     match h {
                         HASH_IF | HASH_IFDEF | HASH_IFNDEF => {
                             depth += 1;
@@ -1718,7 +1725,7 @@ impl PP {
         let name = self.raw();
         if name.kind != TK::Ident { self.skip_line(); return Ok(()); }
 
-        let hash = hash_str(name.s(&self.src_arena));
+        let hash = hash_ident(name.s(&self.src_arena));
         self.skip_line();
 
         let defined = self.macros.find(hash).is_some();
@@ -1941,7 +1948,7 @@ impl PP {
                 if has_paren { i += 1 }
 
                 let name_hash = if i < raw_line.len() {
-                    hash_str(raw_line[i].s(&self.src_arena))
+                    hash_ident(raw_line[i].s(&self.src_arena))
                 } else {
                     0
                 };
@@ -1986,7 +1993,7 @@ impl PP {
                 }
 
                 TK::Ident => {
-                    let h = hash_str(t.s(&self.src_arena));
+                    let h = hash_ident(t.s(&self.src_arena));
                     if let Some(index) = self.macros.find(h) {
                         let def = self.macros.defs[index];
                         if def.param_count == 0 {
@@ -4286,7 +4293,7 @@ impl SymTable {
         flags: SymFlags,
         func_ty: Option<TypeRef>
     ) -> usize {
-        let hash = hash_str(name);
+        let hash = hash_ident(name);
         if let Some(&i) = self.index.get(&hash) {
             let s = &mut self.syms[i as usize];
             s.code_off = code_off;
@@ -4432,6 +4439,7 @@ pub struct Compiler {
     pub relocs:        Vec<Reloc>,
     pub rodata:        Vec<u8>,
     pub rodata_relocs: Vec<RodataReloc>,
+    pub rodata_interner: IntMap<RodataHash, u32>, // Bytes hash -> offset into rodata
 
     pub vla_sizes:     IntMap<TypeRef, i32>,  // Fresh TypeRef -> rbp_off of total byte size local
 
@@ -4442,6 +4450,8 @@ pub struct Compiler {
     pub syms:          SymTable,    // Huge struct (~33 cache lines)
 
     pub pp:            PP,
+
+    pub scratch_buffer_for_unescaping_string_literals_to_further_intern_them_into_rodata: SmallVec<[u8; 2048]>,
 }
 
 impl Deref for Compiler {
@@ -4566,6 +4576,7 @@ impl Compiler {
             tags: Default::default(),
             loop_stack: Vec::new(),
             types: TypeTable::new(),
+            rodata_interner: Default::default(),
             enum_consts: Default::default(),
             typedefs: Default::default(),
             vla_sizes: Default::default(),
@@ -4576,16 +4587,17 @@ impl Compiler {
             syms: SymTable::new(), relocs: Vec::new(),
             rodata: Vec::new(), rodata_relocs: Vec::new(),
             locals: LocalTable::new(), ret_ty: TYPE_VOID,
-            dont_decay_types_of_array_globals_to_pointers: false
+            dont_decay_types_of_array_globals_to_pointers: false,
+            scratch_buffer_for_unescaping_string_literals_to_further_intern_them_into_rodata: Default::default()
         };
 
         // @Incomplete
         // @Incomplete
         // @Incomplete
         let void_ptr = c.types.ptr_to(TYPE_VOID);
-        c.typedefs.insert(hash_str("__builtin_va_list"), void_ptr);
-        c.typedefs.insert(hash_str("__gnuc_va_list"), void_ptr);
-        c.typedefs.insert(hash_str("va_list"), void_ptr);
+        c.typedefs.insert(hash_ident("__builtin_va_list"), void_ptr);
+        c.typedefs.insert(hash_ident("__gnuc_va_list"), void_ptr);
+        c.typedefs.insert(hash_ident("va_list"), void_ptr);
 
         c
     }
@@ -4623,6 +4635,17 @@ impl Compiler {
             i   += 1;
         }
         len
+    }
+
+    #[inline]
+    fn rodata_intern(&mut self, bytes: &[u8]) -> u32 {
+        let hash = hash_bytes_for_rodata_interning(bytes);
+        *self.rodata_interner.entry(hash).or_insert_with(|| {
+            let off = self.rodata.len() as u32;
+            self.rodata.extend_from_slice(bytes);
+            if bytes.last() != Some(&0) { self.rodata.push(0); }
+            off
+        })
     }
 
     #[inline]
@@ -6305,6 +6328,7 @@ impl Compiler {
                         self.data.push(b);
                         i += 1;
                     }
+
                     self.data.push(0);
 
                     let actual_len = Self::unescape_len(s) + 1;
@@ -7706,33 +7730,31 @@ impl Compiler {
                 let t   = self.next();
                 let raw = t.s(&self.pp.src_arena);
                 let s   = &raw[1..raw.len()-1];
-                let rodata_off = self.rodata.len() as u32;
+                let bytes = s.as_bytes();
 
                 // @Refactor: Put this into a separate function
 
-                //
-                // Unescape into rodata
-                //
-                let bytes = s.as_bytes(); let mut i = 0;
+                let mut i = 0;
                 while i < bytes.len() {
                     if bytes[i] == b'\\' && i+1 < bytes.len() {
                         i += 1;
-                        self.rodata.push(match bytes[i] {
+                        self.scratch_buffer_for_unescaping_string_literals_to_further_intern_them_into_rodata.push(match bytes[i] {
                             b'n' => b'\n', b't' => b'\t', b'r' => b'\r',
                             b'0' => b'\0', other => other,
                         });
                     } else {
-                        self.rodata.push(bytes[i]);
+                        self.scratch_buffer_for_unescaping_string_literals_to_further_intern_them_into_rodata.push(bytes[i]);
                     }
-
                     i += 1;
                 }
-                self.rodata.push(0);
+
+                let bytes = core::mem::take(&mut self.scratch_buffer_for_unescaping_string_literals_to_further_intern_them_into_rodata);
+                let rodata_off = self.rodata_intern(&bytes);
 
                 // lea dst, [rip + disp32] - displacement patched by write_elf via R_X86_64_PC32
                 let dst = self.regs.alloc(Span::POISONED)?;
-                let patch = self.buf.lea_rip(dst);
-                self.rodata_relocs.push(RodataReloc { text_off: patch as _, rodata_off });
+                let text_off = self.buf.lea_rip(dst) as _;
+                self.rodata_relocs.push(RodataReloc { text_off, rodata_off });
 
                 let new_type = self.types.ptr_to(TYPE_CHAR);
                 self.vstack.push(CValue::gp(new_type, dst));
@@ -8070,7 +8092,7 @@ impl Compiler {
     #[inline]
     fn emit_memcpy_call(&mut self) -> CResult<()> {
         let call_site = self.buf.call_rel32();
-        let memcpy_hash = hash_str("memcpy");
+        let memcpy_hash = hash_ident("memcpy");
         let idx = if let Some(idx) = self.syms.find(memcpy_hash) {
             idx
         } else {
@@ -8749,17 +8771,14 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
     };
 
     for r in &c.relocs {
-        push_rela(&mut rela, r.offset as u64,
-            elf_sym_index[r.sym_index as usize] as u64, R_PLT32, r.addend);
+        push_rela(&mut rela, r.offset as u64, elf_sym_index[r.sym_index as usize] as u64, R_PLT32, r.addend);
     }
     for r in &c.rodata_relocs {
-        push_rela(&mut rela, r.text_off as u64, RODATA_SYM, R_PC32,
-            r.rodata_off as i64 - 4);
+        push_rela(&mut rela, r.text_off as u64, RODATA_SYM, R_PC32, r.rodata_off as i64 - 4);
     }
     for r in &c.data_relocs {
         let sym = if r.is_bss { BSS_SYM } else { DATA_SYM };
-        push_rela(&mut rela, r.text_off as u64, sym, R_PC32,
-            r.data_off as i64 - 4);
+        push_rela(&mut rela, r.text_off as u64, sym, R_PC32, r.data_off as i64 - 4);
     }
 
     //
@@ -8982,7 +9001,7 @@ fn run_main(mut c: Compiler) {
     //
     // Find main
     //
-    let main_hash = hash_str("main");
+    let main_hash = hash_ident("main");
     let Some(main_idx) = c.syms.find(main_hash) else {
         eprintln!("no main function"); std::process::exit(1);
     };

@@ -17,6 +17,7 @@ smallvec = { version = "1.15.1", features = ["const_new"] }
 thiserror = "1"
 mimalloc = { version = "=0.1.47", optional = true }
 smallstr = "0.3.1"
+wyhash = "0.6.0"
 
 [dev-dependencies]
 tempfile = "3"
