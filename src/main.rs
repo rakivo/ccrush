@@ -75,6 +75,7 @@
 // TODO(#24): Proper implicit coercion: int <-> float, etc
 // TODO(#25): Strings in initializers, i.e. char *s[] = {"abc", "xyz"};
 // TODO(#26): 50.f float literals
+// TODO(#27): Switch statements
 
 // TODO(#18): Resolve the situation with sret and VLA hidden slot using the same slot...?
 
