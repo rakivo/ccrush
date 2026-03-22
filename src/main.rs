@@ -58,6 +58,8 @@
 //
 
 // TODO(#2): Structs
+// TODO(#21): Struct literals
+// TODO: Enum repr type C23 extension.
 // TODO(#4): Enums
 // TODO(#3): Function pointers
 // TODO(#7): __attribute__
@@ -9022,3 +9024,4 @@ fn run_main(mut c: Compiler) {
     let result = f(argc, argv_ptr, envp_ptr);
     std::process::exit(result);
 }
+          
