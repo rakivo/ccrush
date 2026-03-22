@@ -66,7 +66,6 @@
 // TODO(#7): __attribute__
 // TODO(#9): Global extern symbols
 // TODO(#10): Stringify, __VA_ARGS__ and concat in macros
-// TODO(#11): String interning for .rodata
 // TODO(#12): {} Initializers
 // TODO(#13): Debug info
 // TODO(#15): Stack unwind info
