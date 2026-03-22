@@ -4651,7 +4651,7 @@ impl SymTable {
 }
 
 #[derive(Clone, Copy)]
-pub struct Reloc {
+pub struct CallReloc {
     pub offset: u32,
     pub sym_index: u32,
     pub addend: i64
@@ -4762,7 +4762,7 @@ pub struct Compiler {
 
     pub loop_stack:    Vec<LoopContext>,
 
-    pub relocs:        Vec<Reloc>,
+    pub call_relocs:   Vec<CallReloc>,
     pub rodata:        Vec<u8>,
     pub rodata_relocs: Vec<RodataReloc>,
     pub rodata_interner: IntMap<RodataHash, u32>, // Bytes hash -> offset into rodata
@@ -4910,7 +4910,7 @@ impl Compiler {
             bss_size: 0, data_relocs: Vec::new(),
             buf: CodeBuf::new(), vstack: ValueStack::new(),
             regs: RegAlloc::new(), xmms: XmmAlloc::new(),
-            syms: SymTable::new(), relocs: Vec::new(),
+            syms: SymTable::new(), call_relocs: Vec::new(),
             rodata: Vec::new(), rodata_relocs: Vec::new(),
             locals: LocalTable::new(), ret_ty: TYPE_VOID,
             dont_decay_types_of_array_globals_to_pointers: false,
@@ -8709,7 +8709,7 @@ impl Compiler {
         };
 
         if self.syms[idx].flags.contains(SymFlags::EXTERN) {
-            self.relocs.push(Reloc {
+            self.call_relocs.push(CallReloc {
                 offset: call_site as u32,
                 sym_index: idx as u32,
                 addend: -4,
@@ -9130,7 +9130,7 @@ impl Compiler {
             let sym = self.syms[sym_index];
             let call_site = self.buf.call_rel32();
             if sym.flags.contains(SymFlags::EXTERN) {
-                self.relocs.push(Reloc {
+                self.call_relocs.push(CallReloc {
                     offset: call_site as u32,
                     sym_index: sym_index as u32,
                     addend: -4
@@ -9818,7 +9818,7 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
         rela.extend_from_slice(&addend.to_le_bytes());
     };
 
-    for r in &c.relocs {
+    for r in &c.call_relocs {
         push_rela(&mut rela, r.offset as u64, elf_sym_index[r.sym_index as usize] as u64, R_PLT32, r.addend);
     }
     for r in &c.rodata_relocs {
@@ -10018,7 +10018,7 @@ fn run_main(mut c: Compiler) {
     // Trampolines
     //
     let mut sym_to_trampoline = IntMap::default();
-    for r in &c.relocs {
+    for r in &c.call_relocs {
         let sym_index = r.sym_index as usize;
         if sym_to_trampoline.contains_key(&sym_index) { continue; }
 
@@ -10066,7 +10066,7 @@ fn run_main(mut c: Compiler) {
     mmap.copy_from_slice(&c.buf.bytes);
 
     let base = mmap.as_ptr() as i64;
-    for r in &c.relocs {
+    for r in &c.call_relocs {
         let trampoline_off = sym_to_trampoline[&(r.sym_index as usize)];
         let patch_pos      = r.offset as usize;
         let rel = (base + trampoline_off as i64 - (base + patch_pos as i64 + 4)) as i32;
