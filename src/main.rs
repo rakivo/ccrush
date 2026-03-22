@@ -5298,10 +5298,7 @@ impl Compiler {
     }
 
     fn compile_enum(&mut self) -> CResult<TypeRef> {
-        let tag = (
-            self.current_token.kind == TK::Ident
-                && !self.can_hash_start_a_type(self.current_token.hash)
-        ).then(|| self.next());
+        let tag = (self.current_token.kind == TK::Ident).then(|| self.next());
 
         //
         // Return existing if already defined and no body
@@ -5850,18 +5847,21 @@ impl Compiler {
         }
 
         if self.current_token.hash == HASH_STRUCT {
+            self.next(); // struct
             _ = self.compile_struct()?;
             self.expect(TK::SemiColon, "';'")?;
             return Ok(());
         }
 
         if self.current_token.hash == HASH_ENUM {
+            self.next(); // enum
             _ = self.compile_enum()?;
             self.expect(TK::SemiColon, "';'")?;
             return Ok(());
         }
 
         if self.current_token.hash == HASH_UNION {
+            self.next(); // union
             _ = self.compile_union()?;
             self.expect(TK::SemiColon, "';'")?;
             return Ok(());
