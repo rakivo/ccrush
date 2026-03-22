@@ -10,7 +10,9 @@ It is fast because it is designed with handmade spirit: data-oriented, cache-fri
 
 ## Benchmark
 
-5 million lines of C, JIT mode. ccrush is ~2x faster than TCC with almost identical RSS's. This is early work. There is a TON of performance left on the table.
+> Synthetic input: 5 million lines of auto-generated C functions. Measures raw compiler throughput.
+
+5 million lines of C, JIT mode. ccrush is ~2x faster than TCC with almost identical RSS. This is early work and there is a TON of performance left on the table.
 
 ![benchmark](assets/bench.png)
 
