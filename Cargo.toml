@@ -8,16 +8,16 @@ default = ["mimalloc"]
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
-bitflags = "2.11.0"
-cranelift-entity = "0.129.1"
-libc = "0.2.183"
-memmap2 = "0.9.10"
-nohash-hasher = "0.2.0"
-smallvec = { version = "1.15.1", features = ["const_new"] }
-thiserror = "1"
-mimalloc = { version = "=0.1.47", optional = true }
-smallstr = "0.3.1"
-wyhash = "0.6.0"
+bitflags         = { version = "2.11.0",  default-features = false }
+cranelift-entity = { version = "0.129.1", default-features = false }
+libc             = { version = "0.2.183", default-features = false }
+memmap2          = { version = "0.9.10",  default-features = false }
+thiserror        = { version = "1",       default-features = false }
+smallstr         = { version = "0.3.1",   default-features = false }
+wyhash           = { version = "0.6.0",   default-features = false }
+mimalloc         = { version = "=0.1.47", default-features = false, optional = true }
+nohash-hasher    = { version = "0.2.0",   default-features = false, features = ["std"] }
+smallvec         = { version = "1.15.1",  default-features = false, features = ["const_new"] }
 
 [profile.release-fast]
 inherits = "release"
