@@ -19,9 +19,6 @@ mimalloc = { version = "=0.1.47", optional = true }
 smallstr = "0.3.1"
 wyhash = "0.6.0"
 
-[dev-dependencies]
-tempfile = "3"
-
 [profile.release-fast]
 inherits = "release"
 opt-level = 3
