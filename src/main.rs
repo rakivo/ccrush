@@ -7284,11 +7284,12 @@ impl Compiler {
         // can clobber the base register before we get to emit the store.
         //
         let (lhs, lhs_addr_spill) = if lhs.kind() == VK::RegInd && lhs.reg().as_gp() != Reg::Rbp {
+            let original_offset = lhs.offset();         // Preserve field offset
             let addr_off = self.locals.alloc(HASH_HIDDEN_LOCAL, TYPE_LONG, &self.types);
             let base = lhs.reg().as_gp();
             self.code.mov_store(Reg::Rbp, addr_off, base, true);
             self.regs.free(base);
-            (CValue::regind(lhs.ty, Reg::Rbp, addr_off), Some(addr_off))
+            (CValue::regind(lhs.ty, Reg::Rbp, addr_off), Some((addr_off, original_offset)))
         } else {
             (lhs, None)
         };
@@ -7298,10 +7299,10 @@ impl Compiler {
         //
         // Reload lhs base address if we spilled it
         //
-        let lhs = if let Some(addr_off) = lhs_addr_spill {
+        let lhs = if let Some((addr_off, original_offset)) = lhs_addr_spill {
             let r = self.regs.alloc(span)?;
             self.code.mov_load(r, Reg::Rbp, addr_off, true);
-            CValue::regind(lhs.ty, r, 0)
+            CValue::regind(lhs.ty, r, original_offset)  // Restore field offset
         } else {
             lhs
         };
@@ -8545,7 +8546,7 @@ impl Compiler {
                 TK::Dot | TK::Arrow => {
                     let op   = self.current_token.kind;
                     let span = self.current_token.span;
-                    self.next();
+                    self.next(); // . | ->
 
                     let field_tok  = self.eat_ident("field name")?;
                     let field_hash = field_tok.hash;
