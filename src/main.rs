@@ -94,7 +94,7 @@ use std::ops::{Deref, DerefMut};
 use smallstr::SmallString;
 use thiserror::Error;
 use smallvec::{SmallVec, smallvec};
-use nohash_hasher::IntMap;
+use nohash_hasher::{IntMap, IntSet};
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use cranelift_entity::{PrimaryMap, SparseMap, SparseMapValue, entity_impl};
 
@@ -462,6 +462,7 @@ pub enum TK {
     Hash, Newline, Paste /* ## */, Stringify /* # */,
     // Inside macro bodies only
     Param(u8),
+    MacroEnd, // Macro def index, consumed by cook() to pop expanding set
 }
 
 impl TK {
@@ -781,6 +782,8 @@ struct MacroTable {
     arg_pool: Vec<Token>,
     arg_ends: SmallVec<[u32; MAX_PARAMS]>,
 
+    expanding: IntSet<u64>, // Hashes of macros currently being expanded
+
     defs:        SmallVec<[MacroDef; 64]>,
     tok_pool:    SmallVec<[Token; 256]>,
 }
@@ -790,6 +793,7 @@ impl MacroTable {
     fn new() -> Self {
         Self {
             defs: SmallVec::new(),
+            expanding: IntSet::with_capacity_and_hasher(8, Default::default()),
             index: IntMap::with_capacity_and_hasher(64, Default::default()),
             tok_pool: SmallVec::new(),
             arg_ends: SmallVec::new(),
@@ -1278,16 +1282,74 @@ impl PP {
                         return Token { kind: t.kind, span: t.span, hash };
                     };
 
+                    //
+                    // Blue paint rule: if this macro is currently being expanded,
+                    // return the token as-is without re-expanding.
+                    //
+                    if self.macros.expanding.contains(&hash) {
+                        return Token { kind: t.kind, span: t.span, hash };
+                    }
+
                     let def = self.macros.defs[index];
                     if def.param_count == 0 {
-                        let body = self.macros.body(index);
-                        exp_push_body(&mut self.exp, body);
+                        //
+                        // Object macro - mark as expanding, push body + MacroEnd sentinel
+                        //
+
+                        self.macros.expanding.insert(hash);
+
+                        let body_start = def.body_start as usize;
+                        let body_len   = def.body_len   as usize;
+
+                        let frame_start = self.exp.pool.len() as u32;
+                        self.exp.pool.extend_from_slice(
+                            &self.macros.tok_pool[body_start..body_start + body_len]
+                        );
+                        // Sentinel to pop expanding set when frame is exhausted
+                        self.exp.pool.push(Token {
+                            kind: TK::MacroEnd,
+                            span: Span::POISONED,
+                            hash,
+                        });
+                        let frame_end = self.exp.pool.len() as u32;
+
+                        self.exp.frames.push((frame_start, frame_end, frame_start));
                     } else {
+                        //
+                        // Func macro - also needs blue paint but it's trickier
+                        // since expansion happens in expand_func_macro.
+                        // Mark before, unmark via sentinel after.
+                        //
+
+                        self.macros.expanding.insert(hash);
                         match self.expand_func_macro(&def, index) {
                             Ok(())  => {}
                             Err(e) => { e.emit(&self.src_arena); std::process::exit(1); }
                         }
+
+                        //
+                        // Push MacroEnd sentinel at end of the func macro's frame
+                        //
+                        self.exp.pool.push(Token {
+                            kind: TK::MacroEnd,
+                            span: Span::POISONED,
+                            hash
+                        });
+
+                        // Extend the last frame to include the sentinel
+                        if let Some(frame) = self.exp.frames.last_mut() {
+                            frame.1 += 1;
+                        }
                     }
+                }
+
+                TK::MacroEnd => {
+                    //
+                    // Blue paint rule - pop the macro from the expanding set
+                    //
+                    self.macros.expanding.remove(&t.hash);
+
+                    // Don't return - continue the cook loop
                 }
 
                 TK::Eof => return t,
@@ -4359,6 +4421,17 @@ impl CodeBuf {
         self.bytes.push(0xC0 | (dst.enc()) << 3 | (src as u8 & 7));
     }
 
+    // mov r64, [rip + disp32] - REX.W 8B /r with ModRM = 05 (RIP-relative)
+    #[inline]
+    pub fn mov_load_rip(&mut self, dst: Reg) -> usize {
+        let rex = 0x48 | ((dst.ext() as u8) << 2);
+        self.bytes.push(rex);
+        self.bytes.push(0x8B);
+        self.bytes.push(0x05 | (dst.enc() << 3));
+        let off = self.bytes.len();
+        self.bytes.extend_from_slice(&0u32.to_le_bytes()); // disp32, patched by reloc
+        off
+    }
     #[inline]
     pub fn movss_load_rip(&mut self, dst: XmmReg) -> usize {
         if dst as u8 >= 8 { self.emit_byte(0x44); }
@@ -4668,26 +4741,54 @@ pub struct DataReloc {
     pub is_bss:   b32
 }
 
+pub struct GotReloc {
+    pub text_off: u32,
+    pub sym_index: u32
+}
+
 #[derive(Default)]
 pub struct LoopContext {
     break_patches:    Vec<u32>,
     continue_patches: Vec<u32>,
 }
 
+bitflags::bitflags! {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+    pub struct GlobalEntryFlags: u8 {
+        const BSS    = 0x1;
+        const STATIC = 0x2;
+        const EXTERN = 0x4;
+    }
+}
+
 #[derive(Copy, Clone)]
 pub struct GlobalEntry {
     pub ty:       TypeRef, // 4
 
-    pub data_off: u32,     // 4 - Offset into .data OR .bss
     pub name_off: u32,     // 4
     pub name_len: u16,     // 2
 
-    // @BitFlagsCandidate
-    pub is_bss:    b8,
-    pub is_static: b8,
+    /// flags==IS_IN_BSS     :  Offset into bss
+    /// flags==IS_EXTERN     :  Symbol index (for GOT relocs)
+    /// flags==IS_STATIC     :  For symbol visibility
+    pub extra: u32,        // 4
+
+    pub flags: GlobalEntryFlags, // 1
 }
 
 impl GlobalEntry {
+    #[inline]
+    pub fn data_off(&self) -> u32 {
+        debug_assert!(!self.flags.contains(GlobalEntryFlags::EXTERN));
+        self.extra
+    }
+
+    #[inline]
+    pub fn sym_index(&self) -> u32 {
+        debug_assert!(self.flags.contains(GlobalEntryFlags::EXTERN));
+        self.extra
+    }
+
     #[inline]
     pub fn s<'a>(&self, buf: &'a [u8]) -> &'a str {
         unsafe {
@@ -4707,7 +4808,6 @@ pub struct GlobalTable {
     pub vars:     SmallVec<[GlobalEntry; 64]>,
 
     pub name_buf: Vec<u8>,
-
 }
 
 impl GlobalTable {
@@ -4732,8 +4832,27 @@ impl GlobalTable {
         let i = self.vars.len() as u32;
         self.vars.push(GlobalEntry {
             name_off, name_len: name.len() as u16,
-            ty, data_off,
-            is_bss, is_static
+            ty, extra: data_off,
+
+            flags: {
+                let mut flags = GlobalEntryFlags::empty();
+                flags.set(GlobalEntryFlags::BSS, is_bss);
+                flags.set(GlobalEntryFlags::STATIC, is_static);
+                flags
+            }
+        });
+        self.index.insert(hash, i);
+    }
+
+    #[inline]
+    pub fn insert_extern(&mut self, name: &str, hash: u64, ty: TypeRef, sym_index: u32) {
+        let name_off = self.name_buf.len() as u32;
+        self.name_buf.extend_from_slice(name.as_bytes());
+        let i = self.vars.len() as u32;
+        self.vars.push(GlobalEntry {
+            name_off, name_len: name.len() as u16,
+            ty, extra: sym_index,
+            flags: GlobalEntryFlags::EXTERN
         });
         self.index.insert(hash, i);
     }
@@ -4757,6 +4876,7 @@ pub struct Compiler {
     pub enum_consts:   IntMap<u64, i64>,
 
     pub data:          Vec<u8>,
+    pub got_relocs:    Vec<GotReloc>,
     pub data_relocs:   Vec<DataReloc>,
     pub bss_size:      usize,
 
@@ -4898,6 +5018,7 @@ impl Compiler {
         let mut c = Self {
             pp,
             ret_ptr_off: None,
+            got_relocs: Vec::new(),
             in_global_context: true,
             tags: Default::default(),
             loop_stack: Vec::new(),
@@ -6535,16 +6656,13 @@ impl Compiler {
         is_static: bool,
     ) -> CResult<()> {
         if is_extern {
-            //
-            // @Incomplete
-            // Extern global - treat like extern function, add to sym table
-            // for now skip - extern globals need GOT relocs which is more complex
-            //
-            while !matches!(
-                self.current_token.kind,
-                TK::SemiColon | TK::Comma | TK::Eof) {
+            // Skip the rest..
+            while !matches!(self.current_token.kind, TK::SemiColon | TK::Comma | TK::Eof) {
                 self.next();
             }
+
+            let sym_index = self.syms.insert(name, 0, 0, SymFlags::EXTERN, Some(ty_ref));
+            self.globals.insert_extern(name, hash, ty_ref, sym_index as _);
 
             return Ok(());
         }
@@ -8425,15 +8543,28 @@ impl Compiler {
                 } else if let Some(gv) = self.globals.find(hash) {
                     //
                     // RIP-relative address of global
-                    // push as a RegInd with a data/bss reloc
+                    // push as a RegInd with a data/bss/GOT reloc
                     //
                     let dst = self.regs.alloc(name_tok.span)?;
-                    let text_off = self.code.lea_rip(dst);
-                    self.data_relocs.push(DataReloc {
-                        text_off: text_off as u32,
-                        data_off: gv.data_off,
-                        is_bss:   gv.is_bss,
-                    });
+
+                    if gv.flags.contains(GlobalEntryFlags::EXTERN) {
+                        //
+                        // Extern global - GOT-indirect access
+                        // mov dst, [rip + got_slot] ->  dst = &global
+                        //
+                        let text_off = self.code.mov_load_rip(dst);
+                        self.got_relocs.push(GotReloc {
+                            text_off: text_off as u32,
+                            sym_index: gv.sym_index(),
+                        });
+                    } else {
+                        let text_off = self.code.lea_rip(dst);
+                        self.data_relocs.push(DataReloc {
+                            text_off: text_off as u32,
+                            data_off: gv.data_off(),
+                            is_bss:   gv.flags.contains(GlobalEntryFlags::BSS),
+                        });
+                    }
 
                     if !self.dont_decay_types_of_array_globals_to_pointers &&
                         self.types.get_kind(gv.ty) == TypeKind::Array
@@ -8852,6 +8983,7 @@ impl Compiler {
             Sym(usize),
             LocalFp(i32),        // rbp_off
             GlobalFp(u32, bool), // data_off, is_bss
+            ExternGlobalFp(u32), // sym_index for GOT reloc
         }
 
         self.next(); // '('
@@ -8885,7 +9017,15 @@ impl Compiler {
             //
 
             match self.types.resolve_func_ptr_type(gv.ty) {
-                Some(func_ty) => (func_ty, CalleeKind::GlobalFp(gv.data_off, gv.is_bss)),
+                Some(func_ty) => (
+                    func_ty,
+                    if gv.flags.contains(GlobalEntryFlags::EXTERN) {
+                        CalleeKind::ExternGlobalFp(gv.sym_index())
+                    } else {
+                        CalleeKind::GlobalFp(gv.data_off(), gv.flags.contains(GlobalEntryFlags::BSS))
+                    }
+                ),
+
                 None => return Err(CError::Undefined {
                     span: name_tok.span,
                     name: self.s(name_tok).to_owned()
@@ -8925,8 +9065,30 @@ impl Compiler {
                 let spill = self.locals.alloc(HASH_HIDDEN_LOCAL, TYPE_LONG, &self.types);
 
                 let r = self.regs.alloc(name_tok.span)?;
-                let text_off = self.code.lea_rip(r);  // lea r, [rip + global] then load the pointer value
+                let text_off = self.code.lea_rip(r); // lea r, [rip + global] then load the pointer value
                 self.data_relocs.push(DataReloc { text_off: text_off as u32, data_off, is_bss });
+
+                // Load the function pointer value itself
+                let r2 = self.regs.alloc(name_tok.span)?;
+                self.code.mov_load(r2, r, 0, true);
+                self.regs.free(r);
+
+                self.code.mov_store(Reg::Rbp, spill, r2, true);
+                self.regs.free(r2);
+
+                Some(spill)
+            }
+
+            CalleeKind::ExternGlobalFp(sym_index) => {
+                let spill = self.locals.alloc(HASH_HIDDEN_LOCAL, TYPE_LONG, &self.types);
+
+                let r = self.regs.alloc(name_tok.span)?;
+                let text_off = self.code.mov_load_rip(r); // GOT-indirect load: mov r, [rip + got_slot] -> r = &global
+                self.got_relocs.push(GotReloc { text_off: text_off as u32, sym_index });
+
+                // @Cutnpaste from above
+
+                // Load the function pointer value itself
                 let r2 = self.regs.alloc(name_tok.span)?;
                 self.code.mov_load(r2, r, 0, true);
                 self.regs.free(r);
@@ -9775,10 +9937,10 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
         push_sym(&mut symtab, sym_name_index[i], (STB_LOCAL<<4)|STT_FUNC, SHN_TEXT, sym.code_off as u64, sym.code_len as u64);
     }
     for (i, gv) in c.globals.vars.iter().enumerate() {
-        if !gv.is_static { continue; }
+        if !gv.flags.contains(GlobalEntryFlags::STATIC) { continue; }
 
-        let shndx = if gv.is_bss { SHN_BSS } else { SHN_DATA };
-        push_sym(&mut symtab, gvar_name_index[i], (STB_LOCAL<<4)|STT_OBJECT, shndx, gv.data_off as u64, c.size_of(gv.ty) as u64);
+        let shndx = if gv.flags.contains(GlobalEntryFlags::BSS) { SHN_BSS } else { SHN_DATA };
+        push_sym(&mut symtab, gvar_name_index[i], (STB_LOCAL<<4)|STT_OBJECT, shndx, gv.data_off() as u64, c.size_of(gv.ty) as u64);
     }
 
     //
@@ -9794,10 +9956,11 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
         push_sym(&mut symtab, sym_name_index[i], (STB_GLOBAL<<4)|STT_FUNC, SHN_TEXT, sym.code_off as u64, sym.code_len as u64);
     }
     for (i, gv) in c.globals.vars.iter().enumerate() {
-        if gv.is_static { continue; }
+        if gv.flags.contains(GlobalEntryFlags::EXTERN) { continue; }
+        if gv.flags.contains(GlobalEntryFlags::STATIC) { continue; }
 
-        let shndx = if gv.is_bss { SHN_BSS } else { SHN_DATA };
-        push_sym(&mut symtab, gvar_name_index[i], (STB_GLOBAL<<4)|STT_OBJECT, shndx, gv.data_off as u64, c.size_of(gv.ty) as u64);
+        let shndx = if gv.flags.contains(GlobalEntryFlags::BSS) { SHN_BSS } else { SHN_DATA };
+        push_sym(&mut symtab, gvar_name_index[i], (STB_GLOBAL<<4)|STT_OBJECT, shndx, gv.data_off() as u64, c.size_of(gv.ty) as u64);
     }
 
     let mut elf_sym_index = vec![0u32; nsyms];
@@ -9807,11 +9970,21 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
         push_sym(&mut symtab, sym_name_index[i], (STB_GLOBAL<<4)|STT_NOTYPE, SHN_UNDEF, 0, 0);
     }
 
+    // Extern globals - undefined symbols for GOT resolution
+    let mut elf_gvar_extern_sym_index = vec![0u32; c.globals.vars.len()];
+    for (i, gv) in c.globals.vars.iter().enumerate() {
+        if !gv.flags.contains(GlobalEntryFlags::EXTERN) { continue; }
+        elf_gvar_extern_sym_index[i] = (symtab.len() / 24) as u32;
+        push_sym(&mut symtab, gvar_name_index[i], (STB_GLOBAL<<4)|STT_OBJECT, SHN_UNDEF, 0, 0);
+    }
+
     //
     // rela.text
     //
     const R_PLT32: u64 = 4;
     const R_PC32:  u64 = 2;
+    const R_GOTPCREL: u64 = 9;
+
     let mut rela = Vec::new();
     let push_rela = |rela: &mut Vec<u8>, offset: u64, sym: u64, rtype: u64, addend: i64| {
         rela.extend_from_slice(&offset.to_le_bytes());
@@ -9828,6 +10001,10 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
     for r in &c.data_relocs {
         let sym = if r.is_bss { BSS_SYM } else { DATA_SYM };
         push_rela(&mut rela, r.text_off as u64, sym, R_PC32, r.data_off as i64 - 4);
+    }
+    for r in &c.got_relocs {
+        let sym_idx = elf_gvar_extern_sym_index[r.sym_index as usize];
+        push_rela(&mut rela, r.text_off as u64, sym_idx as u64, R_GOTPCREL, -4);
     }
 
     //
@@ -10018,12 +10195,12 @@ fn run_main(mut c: Compiler) {
     //
     // Trampolines
     //
-    let mut sym_to_trampoline = IntMap::default();
+    let mut sym_to_trampoline = IntMap::<u32, usize>::default();
     for r in &c.call_relocs {
-        let sym_index = r.sym_index as usize;
+        let sym_index = r.sym_index;
         if sym_to_trampoline.contains_key(&sym_index) { continue; }
 
-        let sym_name   = c.syms.s(sym_index);
+        let sym_name   = c.syms.s(sym_index as _);
         let sym_name_c = CString::new(sym_name).unwrap();
         let sym_addr   = unsafe { libc::dlsym(libc::RTLD_DEFAULT, sym_name_c.as_ptr()) } as i64;
         if sym_addr == 0 {
@@ -10036,6 +10213,27 @@ fn run_main(mut c: Compiler) {
 
         c.code.mov_ri64(Reg::R11, sym_addr);
         c.code.jmp_r(Reg::R11);
+    }
+
+    //
+    // GOT slots for extern globals
+    //
+    let mut sym_to_got_slot = IntMap::<u32, usize>::default();
+    for r in &c.got_relocs {
+        if sym_to_got_slot.contains_key(&r.sym_index) { continue; }
+
+        let sym_name   = c.syms.s(r.sym_index as _);
+        let sym_name_c = CString::new(sym_name).unwrap();
+        let sym_addr   = unsafe { libc::dlsym(libc::RTLD_DEFAULT, sym_name_c.as_ptr()) } as u64;
+        if sym_addr == 0 {
+            eprintln!("undefined extern global: {sym_name}");
+            std::process::exit(1);
+        }
+
+        // Allocate 8-byte GOT slot
+        let slot_off = c.code.bytes.len();
+        c.code.bytes.extend_from_slice(&sym_addr.to_le_bytes());
+        sym_to_got_slot.insert(r.sym_index, slot_off);
     }
 
     //
@@ -10068,11 +10266,26 @@ fn run_main(mut c: Compiler) {
 
     let base = mmap.as_ptr() as i64;
     for r in &c.call_relocs {
-        let trampoline_off = sym_to_trampoline[&(r.sym_index as usize)];
+        let trampoline_off = sym_to_trampoline[&r.sym_index];
         let patch_pos      = r.offset as usize;
         let rel = (base + trampoline_off as i64 - (base + patch_pos as i64 + 4)) as i32;
         unsafe {
             std::ptr::write_unaligned(mmap.as_mut_ptr().add(patch_pos) as *mut i32, rel);
+        }
+    }
+
+    //
+    // Patch GOT relocs - point each mov's disp32 at the GOT slot
+    //
+    for r in &c.got_relocs {
+        let slot_off  = sym_to_got_slot[&r.sym_index];
+        let patch_pos = r.text_off as usize;
+        let rel = (base + slot_off as i64) - (base + patch_pos as i64 + 4);
+        unsafe {
+            std::ptr::write_unaligned(
+                mmap.as_mut_ptr().add(patch_pos) as *mut i32,
+                rel as i32
+            );
         }
     }
 
