@@ -4740,7 +4740,7 @@ impl GlobalTable {
 }
 
 pub struct Compiler {
-    pub buf:           CodeBuf,
+    pub code:          CodeBuf,
     pub xmms:          XmmAlloc,
     pub regs:          RegAlloc,
     pub vstack:        ValueStack, // Huge struct (~16 cache lines)
@@ -4908,7 +4908,7 @@ impl Compiler {
             vla_sizes: Default::default(),
             data: Vec::new(), globals: GlobalTable::new(),
             bss_size: 0, data_relocs: Vec::new(),
-            buf: CodeBuf::new(), vstack: ValueStack::new(),
+            code: CodeBuf::new(), vstack: ValueStack::new(),
             regs: RegAlloc::new(), xmms: XmmAlloc::new(),
             syms: SymTable::new(), call_relocs: Vec::new(),
             rodata: Vec::new(), rodata_relocs: Vec::new(),
@@ -5008,7 +5008,7 @@ impl Compiler {
 
                 let (r, _) = self.pop_reg()?;
                 let dim_off = self.locals.alloc_vla(HASH_HIDDEN_LOCAL, TYPE_LONG);
-                self.buf.mov_store(Reg::Rbp, dim_off, r, true);
+                self.code.mov_store(Reg::Rbp, dim_off, r, true);
                 self.regs.free(r);
 
                 ty = self.types.alloc_fresh(
@@ -5517,7 +5517,7 @@ impl Compiler {
 
                 let (r, _) = self.pop_reg()?;
                 let dim_off = self.locals.alloc_vla(HASH_HIDDEN_LOCAL, TYPE_LONG);
-                self.buf.mov_store(Reg::Rbp, dim_off, r, true);
+                self.code.mov_store(Reg::Rbp, dim_off, r, true);
                 self.regs.free(r);
 
                 let ty = self.types.alloc_fresh(
@@ -5591,7 +5591,7 @@ impl Compiler {
             },
             VK::Imm => {
                 let r = self.regs.alloc(Span::POISONED)?;
-                self.buf.mov_ri64(r, v.imm);
+                self.code.mov_ri64(r, v.imm);
                 Ok(r)
             }
             VK::Local | VK::RegInd => {
@@ -5650,9 +5650,9 @@ impl Compiler {
 
             // Still need to convert if types differ
             if v_kind == TypeKind::Double && target_kind == TypeKind::Float {
-                self.buf.cvtsd2ss(r, r);
+                self.code.cvtsd2ss(r, r);
             } else if v_kind == TypeKind::Float && target_kind == TypeKind::Double {
-                self.buf.cvtss2sd(r, r);
+                self.code.cvtss2sd(r, r);
             }
 
             return Ok(r);
@@ -5663,10 +5663,10 @@ impl Compiler {
         //
         let gp = self.force_gp(v)?;
         let xmm = self.xmms.alloc(Span::POISONED)?;
-        self.buf.cvtsi2sd(xmm, gp);  // Always convert to double first
+        self.code.cvtsi2sd(xmm, gp);  // Always convert to double first
         self.regs.free(gp);
         if target_kind == TypeKind::Float {
-            self.buf.cvtsd2ss(xmm, xmm);
+            self.code.cvtsd2ss(xmm, xmm);
         }
 
         Ok(xmm)
@@ -5807,7 +5807,7 @@ impl Compiler {
         params: Vec<(TypeRef, u64, Span)>,
         flags: SymFlags,
     ) -> CResult<()> {
-        let code_off = self.buf.pos() as u32;
+        let code_off = self.code.pos() as u32;
         let mut code_len = 0;
 
         let name: SmallString<[_; 24]> = name_span.s(&self.src_arena).into(); // @Borrow
@@ -5855,10 +5855,10 @@ impl Compiler {
         //
         // Prologue
         //
-        self.buf.push_r(Reg::Rbp);
-        self.buf.mov_rr(Reg::Rbp, Reg::Rsp);
-        let frame_patch = self.buf.pos() + 3; // imm32 inside sub rsp, imm32
-        self.buf.sub_rsp(0);
+        self.code.push_r(Reg::Rbp);
+        self.code.mov_rr(Reg::Rbp, Reg::Rsp);
+        let frame_patch = self.code.pos() + 3; // imm32 inside sub rsp, imm32
+        self.code.sub_rsp(0);
 
         let mut argc     = 0usize;
         let mut xmm_argc = 0usize;
@@ -5884,7 +5884,7 @@ impl Compiler {
                 self.types.ptr_to(ret_ty),
                 &self.types
             );
-            self.buf.mov_store(Reg::Rbp, ret_ptr_off, ARG_REGS[0], true);
+            self.code.mov_store(Reg::Rbp, ret_ptr_off, ARG_REGS[0], true);
             self.ret_ptr_off = Some(ret_ptr_off);
 
             argc = 1;
@@ -5945,18 +5945,18 @@ impl Compiler {
         //
         // Fall-through epilogue
         //
-        self.buf.xor_rr(Reg::Rax, Reg::Rax);  // Implicit return 0
-        self.buf.mov_rr(Reg::Rsp, Reg::Rbp);
-        self.buf.pop_r(Reg::Rbp);
-        self.buf.ret();
+        self.code.xor_rr(Reg::Rax, Reg::Rax);  // Implicit return 0
+        self.code.mov_rr(Reg::Rsp, Reg::Rbp);
+        self.code.pop_r(Reg::Rbp);
+        self.code.ret();
 
         let frame = align(self.locals.frame_bytes as _, 16) as _;
-        self.buf.patch_i32(frame_patch, frame);
+        self.code.patch_i32(frame_patch, frame);
 
         //
         // Patch up the code length
         //
-        code_len = self.buf.bytes.len() as u32 - code_off;
+        code_len = self.code.bytes.len() as u32 - code_off;
         self.syms[sym_index].code_len = code_len;
 
         Ok(())
@@ -6075,9 +6075,9 @@ impl Compiler {
 
                     let ret_ptr_off = self.ret_ptr_off.unwrap();
                     let dst = self.regs.alloc(Span::POISONED)?;
-                    self.buf.mov_load(dst, Reg::Rbp, ret_ptr_off, true);
+                    self.code.mov_load(dst, Reg::Rbp, ret_ptr_off, true);
                     self.emit_struct_copy(dst, 0, src_base, src_off, size)?;
-                    self.buf.mov_rr(Reg::Rax, dst);
+                    self.code.mov_rr(Reg::Rax, dst);
                     self.regs.free(dst);
                 } else {
                     //
@@ -6097,7 +6097,7 @@ impl Compiler {
                 let v = self.pop_vstack_and_decay_array()?;
                 let v = self.coerce_for_assign(v, ret_ty)?;
                 let r = self.force_gp(v)?;
-                self.buf.mov_rr(Reg::Rax, r);
+                self.code.mov_rr(Reg::Rax, r);
                 self.regs.free(r);
             }
         }
@@ -6105,9 +6105,9 @@ impl Compiler {
         if has_parens { self.expect(TK::RParen, "')'")?; }
 
         self.expect(TK::SemiColon, "';'")?;
-        self.buf.mov_rr(Reg::Rsp, Reg::Rbp);
-        self.buf.pop_r(Reg::Rbp);
-        self.buf.ret();
+        self.code.mov_rr(Reg::Rsp, Reg::Rbp);
+        self.code.pop_r(Reg::Rbp);
+        self.code.ret();
 
         Ok(())
     }
@@ -6121,21 +6121,21 @@ impl Compiler {
         self.expect(TK::RParen, "')'")?; // )
 
         let (r, _) = self.pop_reg()?;
-        self.buf.test_rr(r);
+        self.code.test_rr(r);
         self.free_reg(ValReg::Gp(r));
 
-        let je_patch = self.buf.je_rel32(); // je .else_or_end
+        let je_patch = self.code.je_rel32(); // je .else_or_end
 
         self.compile_stmt()?; // then
 
         if self.current_token.hash == HASH_ELSE {
             self.next(); // else
-            let jmp_patch = self.buf.jmp_rel32(); // jmp .end
-            self.buf.patch_rel32(je_patch, self.buf.pos());
+            let jmp_patch = self.code.jmp_rel32(); // jmp .end
+            self.code.patch_rel32(je_patch, self.code.pos());
             self.compile_stmt()?;  // else-body
-            self.buf.patch_rel32(jmp_patch, self.buf.pos());
+            self.code.patch_rel32(jmp_patch, self.code.pos());
         } else {
-            self.buf.patch_rel32(je_patch, self.buf.pos());
+            self.code.patch_rel32(je_patch, self.code.pos());
         }
 
         Ok(())
@@ -6147,7 +6147,7 @@ impl Compiler {
         self.expect(TK::SemiColon, "';'")?;
 
         let ctx = self.loop_stack.last_mut().ok_or(CError::BreakOutsideLoop { span })?;
-        let patch = self.buf.jmp_rel32();
+        let patch = self.code.jmp_rel32();
         ctx.break_patches.push(patch as _);
 
         Ok(())
@@ -6159,7 +6159,7 @@ impl Compiler {
         self.expect(TK::SemiColon, "';'")?;
 
         let ctx = self.loop_stack.last_mut().ok_or(CError::ContinueOutsideLoop { span })?;
-        let patch = self.buf.jmp_rel32();
+        let patch = self.code.jmp_rel32();
         ctx.continue_patches.push(patch as _);
 
         Ok(())
@@ -6176,8 +6176,8 @@ impl Compiler {
         //
         // Jmp to cond
         //
-        let jmp_cond = self.buf.jmp_rel32();
-        let loop_top = self.buf.pos();
+        let jmp_cond = self.code.jmp_rel32();
+        let loop_top = self.code.pos();
 
         //
         // Body
@@ -6189,16 +6189,16 @@ impl Compiler {
 
         let ctx = self.loop_stack.pop().unwrap();
 
-        let cond_top = self.buf.pos();
+        let cond_top = self.code.pos();
         for patch in ctx.continue_patches {
-            self.buf.patch_rel32(patch as _, cond_top);
+            self.code.patch_rel32(patch as _, cond_top);
         }
 
         // @Cutnpaste from compile_for
         //
         // Cond
         //
-        self.buf.patch_rel32(jmp_cond, self.buf.pos());
+        self.code.patch_rel32(jmp_cond, self.code.pos());
         if !cond_toks.is_empty() {
             let saved_cur  = self.pp.current_token;
             let saved_peek = self.pp.next_token;
@@ -6213,16 +6213,16 @@ impl Compiler {
 
             self.compile_expr_no_comma()?;
             let (r, _) = self.pop_reg()?;
-            self.buf.test_rr(r);
+            self.code.test_rr(r);
             self.regs.free(r);
         }
 
-        let jne_patch = self.buf.jne_rel32();
-        self.buf.patch_rel32(jne_patch, loop_top);
+        let jne_patch = self.code.jne_rel32();
+        self.code.patch_rel32(jne_patch, loop_top);
 
         // Patch all break jumps to here
         for patch in ctx.break_patches {
-            self.buf.patch_rel32(patch as _, self.buf.pos());
+            self.code.patch_rel32(patch as _, self.code.pos());
         }
 
         Ok(())
@@ -6280,8 +6280,8 @@ impl Compiler {
         //
         // Jmp to cond
         //
-        let jmp_cond = self.buf.jmp_rel32();
-        let loop_top = self.buf.pos();
+        let jmp_cond = self.code.jmp_rel32();
+        let loop_top = self.code.pos();
 
         //
         // Body
@@ -6295,13 +6295,13 @@ impl Compiler {
         // Post
         //
 
-        let post_top = self.buf.pos();
+        let post_top = self.code.pos();
 
         let ctx = self.loop_stack.pop().unwrap();
 
         // Patch continue jumps to post
         for patch in ctx.continue_patches {
-            self.buf.patch_rel32(patch as _, post_top);
+            self.code.patch_rel32(patch as _, post_top);
         }
 
         if !post_toks.is_empty() {
@@ -6326,15 +6326,15 @@ impl Compiler {
         //
         // Cond
         //
-        self.buf.patch_rel32(jmp_cond, self.buf.pos());
+        self.code.patch_rel32(jmp_cond, self.code.pos());
         if cond_toks.is_empty() {
             //
             // Cond tokens are empty: for (.. ;; ..)
             // this is an infinite loop.
             //
 
-            let jmp = self.buf.jmp_rel32();
-            self.buf.patch_rel32(jmp, loop_top);
+            let jmp = self.code.jmp_rel32();
+            self.code.patch_rel32(jmp, loop_top);
         } else {
             let saved_cur  = self.pp.current_token;
             let saved_peek = self.pp.next_token;
@@ -6349,16 +6349,16 @@ impl Compiler {
 
             self.compile_expr_no_comma()?;
             let (r, _) = self.pop_reg()?;
-            self.buf.test_rr(r);
+            self.code.test_rr(r);
             self.regs.free(r);
         }
 
-        let jne_patch = self.buf.jne_rel32();
-        self.buf.patch_rel32(jne_patch, loop_top);
+        let jne_patch = self.code.jne_rel32();
+        self.code.patch_rel32(jne_patch, loop_top);
 
         // Patch continue jumps to end
         for patch in ctx.break_patches {
-            self.buf.patch_rel32(patch as _, self.buf.pos());
+            self.code.patch_rel32(patch as _, self.code.pos());
         }
 
         // Exit init's scope
@@ -6370,11 +6370,11 @@ impl Compiler {
     #[inline]
     fn emit_extend(&mut self, r: Reg, from_size: u32, to_size: u32, is_signed: bool) {
         match (from_size, to_size, is_signed) {
-            (1, _, true)  => self.buf.movsx_r8(r, r),
-            (2, _, true)  => self.buf.movsx_r16(r, r),
-            (4, 8, true)  => self.buf.movsxd(r, r),
-            (1, _, false) => self.buf.movzx_r8(r, r),
-            (2, _, false) => self.buf.movzx_r16(r, r),
+            (1, _, true)  => self.code.movsx_r8(r, r),
+            (2, _, true)  => self.code.movsx_r16(r, r),
+            (4, 8, true)  => self.code.movsxd(r, r),
+            (1, _, false) => self.code.movzx_r8(r, r),
+            (2, _, false) => self.code.movzx_r16(r, r),
             (4, 8, false) => {} // mov r32, r32 is a no-op since mov_rr skips dst==src,
             // but zero-extension is implicit on x86-64 for any 32-bit write
             // so just leave the value as-is
@@ -6404,7 +6404,7 @@ impl Compiler {
 
             if keep {
                 let dst_r = self.regs.alloc(Span::POISONED)?;
-                self.buf.lea(dst_r, base, off);
+                self.code.lea(dst_r, base, off);
                 self.vstack.push(CValue::regind(ty, dst_r, 0));
             }
 
@@ -6877,7 +6877,7 @@ impl Compiler {
                     // @CodeOptimization: Use a memset here if the struct is big
                     if i < count as usize {
                         let tmp = self.regs.alloc(Span::POISONED)?;
-                        self.buf.xor_rr(tmp, tmp);
+                        self.code.xor_rr(tmp, tmp);
                         for j in i..count as usize {
                             let field = *self.types.get_field_from_start(start, j as _);
                             let foff = base_off + field.offset as i32;
@@ -6955,8 +6955,8 @@ impl Compiler {
 
                 // store byte: mov byte [rbp + off], imm
                 let tmp = self.regs.alloc(Span::POISONED)?;
-                self.buf.mov_ri64(tmp, b as i64);
-                self.buf.mov_store8(Reg::Rbp, off, tmp);
+                self.code.mov_ri64(tmp, b as i64);
+                self.code.mov_store8(Reg::Rbp, off, tmp);
                 self.regs.free(tmp);
 
                 off += 1;
@@ -6966,8 +6966,8 @@ impl Compiler {
             // Null terminator
             if (off - base_off) < arr_len * elem_sz {
                 let tmp = self.regs.alloc(Span::POISONED)?;
-                self.buf.xor_rr(tmp, tmp);
-                self.buf.mov_store8(Reg::Rbp, off, tmp);
+                self.code.xor_rr(tmp, tmp);
+                self.code.mov_store8(Reg::Rbp, off, tmp);
                 self.regs.free(tmp);
             }
 
@@ -6998,7 +6998,7 @@ impl Compiler {
         // Zero pad remaining if sized
         if !inferred && idx < arr_len {  // @CodeOptimization: Use memset here?
             let tmp = self.regs.alloc(Span::POISONED)?;
-            self.buf.xor_rr(tmp, tmp);
+            self.code.xor_rr(tmp, tmp);
             for i in idx..arr_len {
                 let off = base_off + i * elem_sz;
                 self.emit_int_store(Reg::Rbp, off, tmp, elem_ty);
@@ -7060,7 +7060,7 @@ impl Compiler {
     #[inline]
     fn compute_vla_flat_size(&mut self, ty: TypeRef, span: Span) -> CResult<Reg> {
         let r = self.regs.alloc(span)?;
-        self.buf.mov_ri64(r, 1);
+        self.code.mov_ri64(r, 1);
         self.accumulate_vla_size(ty, r, span)?;
         Ok(r)
     }
@@ -7069,7 +7069,7 @@ impl Compiler {
     fn accumulate_vla_size(&mut self, ty: TypeRef, acc: Reg, span: Span) -> CResult<()> {
         if self.types.get_kind(ty) != TypeKind::Array {
             let sz = self.types.size_of(ty) as i32;
-            if sz > 1 { self.buf.imul_ri(acc, sz); }
+            if sz > 1 { self.code.imul_ri(acc, sz); }
             return Ok(());
         }
 
@@ -7081,15 +7081,15 @@ impl Compiler {
             //
 
             let tmp = self.regs.alloc(span)?;
-            self.buf.mov_load(tmp, Reg::Rbp, e.vla_dim_off(), true);
-            self.buf.imul_rr(acc, tmp);
+            self.code.mov_load(tmp, Reg::Rbp, e.vla_dim_off(), true);
+            self.code.imul_rr(acc, tmp);
             self.regs.free(tmp);
         } else {
             //
             // Comptime dim
             //
 
-            self.buf.imul_ri(acc, e.array_len() as i32);
+            self.code.imul_ri(acc, e.array_len() as i32);
         }
 
         self.accumulate_vla_size(elem, acc, span)
@@ -7105,22 +7105,22 @@ impl Compiler {
         // Compute total size
         //
         let total_r = self.regs.alloc(name_tok.span)?;
-        self.buf.mov_ri64(total_r, 1);   // So we don't multiply 0
+        self.code.mov_ri64(total_r, 1);   // So we don't multiply 0
         self.accumulate_vla_size(outermost_ty, total_r, name_tok.span)?;
 
         //
         // Cache total size
         //
         let size_off = self.locals.alloc_vla(HASH_HIDDEN_LOCAL, TYPE_LONG);
-        self.buf.mov_store(Reg::Rbp, size_off, total_r, true);
+        self.code.mov_store(Reg::Rbp, size_off, total_r, true);
         self.vla_sizes.insert(outermost_ty, size_off);
 
         //
         // Align to 16 (SYSV) and allocate on stack
         //
-        self.buf.add_ri8(total_r, 15);
-        self.buf.and_ri(total_r, -16);
-        self.buf.sub_rr(Reg::Rsp, total_r);
+        self.code.add_ri8(total_r, 15);
+        self.code.and_ri(total_r, -16);
+        self.code.sub_rr(Reg::Rsp, total_r);
         self.regs.free(total_r);
 
         //
@@ -7128,7 +7128,7 @@ impl Compiler {
         //
         let ptr_off = self.locals.alloc_vla(name_tok.hash, outermost_ty);
         let array_base = Reg::Rsp;
-        self.buf.mov_store(Reg::Rbp, ptr_off, array_base, true);
+        self.code.mov_store(Reg::Rbp, ptr_off, array_base, true);
 
         Ok(())
     }
@@ -7286,7 +7286,7 @@ impl Compiler {
         let (lhs, lhs_addr_spill) = if lhs.kind() == VK::RegInd && lhs.reg().as_gp() != Reg::Rbp {
             let addr_off = self.locals.alloc(HASH_HIDDEN_LOCAL, TYPE_LONG, &self.types);
             let base = lhs.reg().as_gp();
-            self.buf.mov_store(Reg::Rbp, addr_off, base, true);
+            self.code.mov_store(Reg::Rbp, addr_off, base, true);
             self.regs.free(base);
             (CValue::regind(lhs.ty, Reg::Rbp, addr_off), Some(addr_off))
         } else {
@@ -7300,7 +7300,7 @@ impl Compiler {
         //
         let lhs = if let Some(addr_off) = lhs_addr_spill {
             let r = self.regs.alloc(span)?;
-            self.buf.mov_load(r, Reg::Rbp, addr_off, true);
+            self.code.mov_load(r, Reg::Rbp, addr_off, true);
             CValue::regind(lhs.ty, r, 0)
         } else {
             lhs
@@ -7340,24 +7340,24 @@ impl Compiler {
     #[inline]
     fn compile_logical_and(&mut self, prec: u8, span: Span) -> CResult<()> {
         let (l, _) = self.pop_reg()?;
-        self.buf.test_rr(l);
+        self.code.test_rr(l);
         self.regs.free(l);
 
-        let short = self.buf.je_rel32();  // Skip if lhs false
+        let short = self.code.je_rel32();  // Skip if lhs false
 
         self.compile_expr_impl(prec + 1)?;
         let (r, _) = self.pop_reg()?;
-        self.buf.test_rr(r);
+        self.code.test_rr(r);
         self.regs.free(r);
 
         let result = self.regs.alloc(span)?;
-        self.buf.setcc(result, 0x95); // setne
-        self.buf.movzx_rr(result, result);
+        self.code.setcc(result, 0x95); // setne
+        self.code.movzx_rr(result, result);
 
-        let done = self.buf.jmp_rel32();
-        self.buf.patch_rel32(short, self.buf.pos());
-        self.buf.xor_rr(result, result); // false
-        self.buf.patch_rel32(done, self.buf.pos());
+        let done = self.code.jmp_rel32();
+        self.code.patch_rel32(short, self.code.pos());
+        self.code.xor_rr(result, result); // false
+        self.code.patch_rel32(done, self.code.pos());
 
         self.vstack.push(CValue::gp(TYPE_INT, result));
         Ok(())
@@ -7368,24 +7368,24 @@ impl Compiler {
         // @Cutnpaste from compile_logical_and
 
         let (l, _) = self.pop_reg()?;
-        self.buf.test_rr(l);
+        self.code.test_rr(l);
         self.regs.free(l);
 
-        let short = self.buf.jne_rel32();  // Skip if lhs true
+        let short = self.code.jne_rel32();  // Skip if lhs true
 
         self.compile_expr_impl(prec + 1)?;
         let (r, _) = self.pop_reg()?;
-        self.buf.test_rr(r);
+        self.code.test_rr(r);
         self.regs.free(r);
 
         let result = self.regs.alloc(span)?;
-        self.buf.setcc(result, 0x95); // setne
-        self.buf.movzx_rr(result, result);
+        self.code.setcc(result, 0x95); // setne
+        self.code.movzx_rr(result, result);
 
-        let done = self.buf.jmp_rel32();
-        self.buf.patch_rel32(short, self.buf.pos());
-        self.buf.mov_ri64(result, 1); // true
-        self.buf.patch_rel32(done, self.buf.pos());
+        let done = self.code.jmp_rel32();
+        self.code.patch_rel32(short, self.code.pos());
+        self.code.mov_ri64(result, 1); // true
+        self.code.patch_rel32(done, self.code.pos());
 
         self.vstack.push(CValue::gp(TYPE_INT, result));
         Ok(())
@@ -7428,7 +7428,7 @@ impl Compiler {
         if self.types.get(v.ty).is_vla() {
             // rbp_off holds pointer to array base - load it
             let r = self.regs.alloc(Span::POISONED)?;
-            self.buf.mov_load(r, Reg::Rbp, v.offset(), true);
+            self.code.mov_load(r, Reg::Rbp, v.offset(), true);
             let elem_ty = self.types.get(v.ty).elem();
             let ptr_ty  = self.types.ptr_to(elem_ty);
             return Ok(CValue::gp(ptr_ty, r));
@@ -7443,7 +7443,7 @@ impl Compiler {
 
                 let base = v.reg().as_gp();
                 let r = self.regs.alloc(Span::POISONED)?;
-                self.buf.lea(r, base, v.offset());
+                self.code.lea(r, base, v.offset());
                 if v.kind() == VK::RegInd { self.regs.free(base); }
                 Ok(CValue::gp(ptr_ty, r))
             }
@@ -7526,8 +7526,8 @@ impl Compiler {
         let lhs = self.force_gp(vlhs)?;
         let rhs = self.force_gp(vrhs)?;
         match op {
-            TK::Plus  => self.buf.add_rr(lhs, rhs),
-            TK::Minus => self.buf.sub_rr(lhs, rhs),
+            TK::Plus  => self.code.add_rr(lhs, rhs),
+            TK::Minus => self.code.sub_rr(lhs, rhs),
             _ => unreachable!(),
         }
 
@@ -7550,23 +7550,23 @@ impl Compiler {
 
         match op {
             TK::Star  => {
-                self.buf.imul_rr(lhs, rhs);
+                self.code.imul_rr(lhs, rhs);
                 self.regs.free(rhs);
                 self.vstack.push(CValue::gp(common_ty, lhs));
             }
 
             TK::Slash => {
-                self.buf.mov_rr(Reg::Rax, lhs);
-                self.buf.cqo();
+                self.code.mov_rr(Reg::Rax, lhs);
+                self.code.cqo();
                 let actual = if rhs == Reg::Rdx {
                     let t = self.regs.alloc(span)?;
-                    self.buf.mov_rr(t, Reg::Rdx);
+                    self.code.mov_rr(t, Reg::Rdx);
                     t
                 } else {
                     rhs
                 };
 
-                self.buf.idiv_r(actual);
+                self.code.idiv_r(actual);
                 self.regs.free(lhs);
                 self.regs.free(actual);
 
@@ -7622,9 +7622,9 @@ impl Compiler {
         let lhs = self.force_gp(lhs)?;
 
         match op {
-            TK::BinAnd => self.buf.and_rr(lhs, rhs),
-            TK::BinOr  => self.buf.or_rr(lhs, rhs),
-            TK::Xor    => self.buf.xor_rr(lhs, rhs),
+            TK::BinAnd => self.code.and_rr(lhs, rhs),
+            TK::BinOr  => self.code.or_rr(lhs, rhs),
+            TK::Xor    => self.code.xor_rr(lhs, rhs),
             _ => unreachable!(),
         }
 
@@ -7668,7 +7668,7 @@ impl Compiler {
         let idx_r   = self.force_gp(idx_val)?;
 
         self.scale_index(idx_r, elem_sz);
-        self.buf.add_rr(base, idx_r);
+        self.code.add_rr(base, idx_r);
         self.regs.free(idx_r);
         self.vstack.push(CValue::gp(ptr_ty, base));
         Ok(())
@@ -7683,15 +7683,15 @@ impl Compiler {
             // ptr - ptr = ptrdiff
             let l = self.force_gp(vlhs)?;
             let r = self.force_gp(vrhs)?;
-            self.buf.sub_rr(l, r);
+            self.code.sub_rr(l, r);
             self.regs.free(r);
             if elem_sz > 1 {
                 // l = l / elem_sz
 
-                self.buf.mov_rr(Reg::Rax, l);
-                self.buf.cqo();
-                self.buf.mov_ri64(Reg::Rcx, elem_sz as i64);
-                self.buf.idiv_r(Reg::Rcx);
+                self.code.mov_rr(Reg::Rax, l);
+                self.code.cqo();
+                self.code.mov_ri64(Reg::Rcx, elem_sz as i64);
+                self.code.idiv_r(Reg::Rcx);
                 self.regs.free(l);
                 self.regs.mark(Reg::Rax);
                 self.vstack.push(CValue::gp(TYPE_LONG, Reg::Rax));
@@ -7704,7 +7704,7 @@ impl Compiler {
             let vrhs  = self.integer_promote(vrhs)?;
             let idx_r = self.force_gp(vrhs)?;
             self.scale_index(idx_r, elem_sz);
-            self.buf.sub_rr(base, idx_r);
+            self.code.sub_rr(base, idx_r);
             self.regs.free(idx_r);
             self.vstack.push(CValue::gp(vlhs.ty, base));
         }
@@ -7717,8 +7717,8 @@ impl Compiler {
     fn scale_index(&mut self, idx_r: Reg, elem_sz: i32) {
         match elem_sz {
             1 => {}
-            2 => { self.buf.add_rr(idx_r, idx_r); }
-            _ => { self.buf.imul_ri(idx_r, elem_sz); }
+            2 => { self.code.add_rr(idx_r, idx_r); }
+            _ => { self.code.imul_ri(idx_r, elem_sz); }
         }
     }
 
@@ -7728,8 +7728,8 @@ impl Compiler {
         if lty == rty { return lty; }
 
         // One is float, one is double - promote float to double
-        if self.get_kind(lty) == TypeKind::Float { self.buf.cvtss2sd(l, l); }
-        if self.get_kind(rty) == TypeKind::Float { self.buf.cvtss2sd(r, r); }
+        if self.get_kind(lty) == TypeKind::Float { self.code.cvtss2sd(l, l); }
+        if self.get_kind(rty) == TypeKind::Float { self.code.cvtss2sd(r, r); }
 
         TYPE_DOUBLE
     }
@@ -7805,15 +7805,15 @@ impl Compiler {
                 TK::GreaterEq => 0x93, // setae
                 _ => unreachable!(),
             };
-            self.buf.setcc(dst, setcc);
+            self.code.setcc(dst, setcc);
 
-            self.buf.movzx_rr(dst, dst);
+            self.code.movzx_rr(dst, dst);
             self.vstack.push(CValue::gp(TYPE_INT, dst));
         } else {
             let (lhs, rhs, _) = self.do_usual_arithmetic_conversion(lhs, rhs)?;
             let r = self.force_gp(rhs)?;
             let l = self.force_gp(lhs)?;
-            self.buf.cmp_rr(l, r);
+            self.code.cmp_rr(l, r);
 
             let setcc: u8 = match op {
                 TK::EqEq      => 0x94,
@@ -7824,8 +7824,8 @@ impl Compiler {
                 TK::GreaterEq => 0x9D,
                 _ => unreachable!(),
             };
-            self.buf.setcc(l, setcc);
-            self.buf.movzx_rr(l, l);
+            self.code.setcc(l, setcc);
+            self.code.movzx_rr(l, l);
 
             self.regs.free(r);
             self.vstack.push(CValue::gp(TYPE_INT, l));
@@ -7844,7 +7844,7 @@ impl Compiler {
                 let v = self.vstack.peek();
                 if !self.is_float(v.ty) {
                     let (r, ty) = self.pop_reg()?;
-                    self.buf.neg_r(r);
+                    self.code.neg_r(r);
                     self.vstack.push(CValue::gp(ty, r));
                     return Ok(());
                 }
@@ -7874,7 +7874,7 @@ impl Compiler {
                 let base = v.reg().as_gp();
 
                 let dst = self.regs.alloc(span)?;
-                self.buf.lea(dst, base, v.offset());
+                self.code.lea(dst, base, v.offset());
                 if v.kind() == VK::RegInd { self.regs.free(base); }
 
                 let new_type = self.types.ptr_to(v.ty);
@@ -7886,7 +7886,7 @@ impl Compiler {
                 self.compile_unary()?;
 
                 let (r, ty) = self.pop_reg()?;
-                self.buf.not_r(r);
+                self.code.not_r(r);
                 self.vstack.push(CValue::gp(ty, r));
             }
 
@@ -7894,11 +7894,11 @@ impl Compiler {
                 self.next();
                 self.compile_unary()?;
                 let (r, _) = self.pop_reg()?;
-                self.buf.test_rr(r);
+                self.code.test_rr(r);
                 self.regs.free(r);
                 let dst = self.regs.alloc(Span::POISONED)?;
-                self.buf.setcc(dst, 0x94); // sete - true if zero
-                self.buf.movzx_rr(dst, dst);
+                self.code.setcc(dst, 0x94); // sete - true if zero
+                self.code.movzx_rr(dst, dst);
                 self.vstack.push(CValue::gp(TYPE_INT, dst));
             }
 
@@ -7922,8 +7922,8 @@ impl Compiler {
                 self.emit_extend(r, from_size, self.types.size_of(promoted_ty), is_signed);
 
                 match op {
-                    TK::PlusPlus  => self.buf.add_ri8(r, 1),
-                    _             => self.buf.add_ri8(r, -1),
+                    TK::PlusPlus  => self.code.add_ri8(r, 1),
+                    _             => self.code.add_ri8(r, -1),
                 }
 
                 // Store back as original narrow type (truncation = implicit)
@@ -7962,38 +7962,38 @@ impl Compiler {
     fn emit_int_load(&mut self, dst: Reg, base: Reg, off: i32, ty: TypeRef) {
         let unsigned = self.types.is_unsigned(ty);
         match self.types.size_of(ty) {
-            1 => if unsigned { self.buf.movzx8_load(dst, base, off) }
-                 else        { self.buf.movsx8_load(dst, base, off) },
-            2 => if unsigned { self.buf.movzx16_load(dst, base, off) }
-                 else        { self.buf.movsx16_load(dst, base, off) },
-            4 => self.buf.mov_load(dst, base, off, false),
-            _ => self.buf.mov_load(dst, base, off, true),
+            1 => if unsigned { self.code.movzx8_load(dst, base, off) }
+                 else        { self.code.movsx8_load(dst, base, off) },
+            2 => if unsigned { self.code.movzx16_load(dst, base, off) }
+                 else        { self.code.movsx16_load(dst, base, off) },
+            4 => self.code.mov_load(dst, base, off, false),
+            _ => self.code.mov_load(dst, base, off, true),
         }
     }
 
     #[inline]
     fn emit_int_store(&mut self, base: Reg, off: i32, src: Reg, ty: TypeRef) {
         match self.types.size_of(ty) {
-            1 => self.buf.mov_store8(base, off, src),
-            2 => self.buf.mov_store16(base, off, src),
-            4 => self.buf.mov_store(base, off, src, false),
-            _ => self.buf.mov_store(base, off, src, true),
+            1 => self.code.mov_store8(base, off, src),
+            2 => self.code.mov_store16(base, off, src),
+            4 => self.code.mov_store(base, off, src, false),
+            _ => self.code.mov_store(base, off, src, true),
         }
     }
 
     #[inline]
     fn emit_float_load(&mut self, dst: XmmReg, base: Reg, off: i32, ty: TypeRef) {
         match self.get_kind(ty) {
-            TypeKind::Float => self.buf.movss_load(dst, base, off),
-            _               => self.buf.movsd_load(dst, base, off),
+            TypeKind::Float => self.code.movss_load(dst, base, off),
+            _               => self.code.movsd_load(dst, base, off),
         }
     }
 
     #[inline]
     fn emit_float_store(&mut self, base: Reg, off: i32, src: XmmReg, ty: TypeRef) {
         match self.get_kind(ty) {
-            TypeKind::Float => self.buf.movss_store(base, off, src),
-            _            => self.buf.movsd_store(base, off, src),
+            TypeKind::Float => self.code.movss_store(base, off, src),
+            _            => self.code.movsd_store(base, off, src),
         }
     }
 
@@ -8001,38 +8001,38 @@ impl Compiler {
     fn emit_float_mov(&mut self, dst: XmmReg, src: XmmReg, ty: TypeRef) {
         if dst == src { return; }
         match self.get_kind(ty) {
-            TypeKind::Float => self.buf.movss_rr(dst, src),
-            _            => self.buf.movsd_rr(dst, src),
+            TypeKind::Float => self.code.movss_rr(dst, src),
+            _            => self.code.movsd_rr(dst, src),
         }
     }
 
     #[inline]
     fn emit_float_load_rip(&mut self, dst: XmmReg, ty: TypeRef) -> usize {
         match self.get_kind(ty) {
-            TypeKind::Float => self.buf.movss_load_rip(dst),
-            _            => self.buf.movsd_load_rip(dst),
+            TypeKind::Float => self.code.movss_load_rip(dst),
+            _            => self.code.movsd_load_rip(dst),
         }
     }
 
     #[inline]
     fn emit_float_xor_rip(&mut self, dst: XmmReg, ty: TypeRef) -> usize {
         match self.get_kind(ty) {
-            TypeKind::Float => self.buf.xorps_rip(dst),
-            _            => self.buf.xorpd_rip(dst),
+            TypeKind::Float => self.code.xorps_rip(dst),
+            _            => self.code.xorpd_rip(dst),
         }
     }
 
     #[inline]
     fn emit_float_arith(&mut self, op: TK, dst: XmmReg, src: XmmReg, ty: TypeRef) {
         match (op, self.get_kind(ty)) {
-            (TK::Plus,  TypeKind::Float) => self.buf.addss(dst, src),
-            (TK::Plus,  _)               => self.buf.addsd(dst, src),
-            (TK::Minus, TypeKind::Float) => self.buf.subss(dst, src),
-            (TK::Minus, _)               => self.buf.subsd(dst, src),
-            (TK::Star,  TypeKind::Float) => self.buf.mulss(dst, src),
-            (TK::Star,  _)               => self.buf.mulsd(dst, src),
-            (TK::Slash, TypeKind::Float) => self.buf.divss(dst, src),
-            (TK::Slash, _)               => self.buf.divsd(dst, src),
+            (TK::Plus,  TypeKind::Float) => self.code.addss(dst, src),
+            (TK::Plus,  _)               => self.code.addsd(dst, src),
+            (TK::Minus, TypeKind::Float) => self.code.subss(dst, src),
+            (TK::Minus, _)               => self.code.subsd(dst, src),
+            (TK::Star,  TypeKind::Float) => self.code.mulss(dst, src),
+            (TK::Star,  _)               => self.code.mulsd(dst, src),
+            (TK::Slash, TypeKind::Float) => self.code.divss(dst, src),
+            (TK::Slash, _)               => self.code.divsd(dst, src),
             _ => unreachable!()
         }
     }
@@ -8040,14 +8040,14 @@ impl Compiler {
     #[inline]
     fn emit_float_cmp(&mut self, lhs: XmmReg, rhs: XmmReg, ty: TypeRef) {
         match self.get_kind(ty) {
-            TypeKind::Float => self.buf.ucomiss(lhs, rhs),
-            _               => self.buf.ucomisd(lhs, rhs),
+            TypeKind::Float => self.code.ucomiss(lhs, rhs),
+            _               => self.code.ucomisd(lhs, rhs),
         }
     }
 
     #[inline]
     fn with_rollback<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let buf_pos           = self.buf.pos();
+        let buf_pos           = self.code.pos();
         let rodata_pos        = self.rodata.len();
         let rodata_relocs_len = self.rodata_relocs.len();
         let data_relocs_len   = self.data_relocs.len();
@@ -8057,7 +8057,7 @@ impl Compiler {
 
         let result = f(self);
 
-        self.buf.bytes.truncate(buf_pos);
+        self.code.bytes.truncate(buf_pos);
         self.rodata.truncate(rodata_pos);
         self.rodata_relocs.truncate(rodata_relocs_len);
         self.data_relocs.truncate(data_relocs_len);
@@ -8164,9 +8164,9 @@ impl Compiler {
                 let r = self.force_gp(v)?;
                 let xmm = self.xmms.alloc(Span::POISONED)?;
                 if to_kind == TypeKind::Float {
-                    self.buf.cvtsi2ss(xmm, r);
+                    self.code.cvtsi2ss(xmm, r);
                 } else {
-                    self.buf.cvtsi2sd(xmm, r);
+                    self.code.cvtsi2sd(xmm, r);
                 }
                 self.regs.free(r);
                 self.vstack.push(CValue::xmm(to, xmm));
@@ -8178,9 +8178,9 @@ impl Compiler {
                 let xmm = self.force_xmm(v)?;
                 let r = self.regs.alloc(Span::POISONED)?;
                 if from_kind == TypeKind::Float {
-                    self.buf.cvttss2si(r, xmm);
+                    self.code.cvttss2si(r, xmm);
                 } else {
-                    self.buf.cvttsd2si(r, xmm);
+                    self.code.cvttsd2si(r, xmm);
                 }
                 self.xmms.free(xmm);
                 self.vstack.push(CValue::gp(to, r));
@@ -8189,12 +8189,12 @@ impl Compiler {
             // float <-> float
             (TypeKind::Float, TypeKind::Double) => {
                 let xmm = self.force_xmm(v)?;
-                self.buf.cvtss2sd(xmm, xmm);
+                self.code.cvtss2sd(xmm, xmm);
                 self.vstack.push(CValue::xmm(to, xmm));
             }
             (TypeKind::Double, TypeKind::Float) => {
                 let xmm = self.force_xmm(v)?;
-                self.buf.cvtsd2ss(xmm, xmm);
+                self.code.cvtsd2ss(xmm, xmm);
                 self.vstack.push(CValue::xmm(to, xmm));
             }
 
@@ -8250,9 +8250,9 @@ impl Compiler {
 
                 let xmm = self.xmms.alloc(t.span)?;
                 let text_off = if is_float {
-                    self.buf.movss_load_rip(xmm)
+                    self.code.movss_load_rip(xmm)
                 } else {
-                    self.buf.movsd_load_rip(xmm)
+                    self.code.movsd_load_rip(xmm)
                 } as _;
 
                 self.rodata_relocs.push(RodataReloc { text_off, rodata_off });
@@ -8310,7 +8310,7 @@ impl Compiler {
 
                 // lea dst, [rip + disp32] - displacement patched by write_elf via R_X86_64_PC32
                 let dst = self.regs.alloc(Span::POISONED)?;
-                let text_off = self.buf.lea_rip(dst) as _;
+                let text_off = self.code.lea_rip(dst) as _;
                 self.rodata_relocs.push(RodataReloc { text_off, rodata_off });
 
                 let new_type = self.types.ptr_to(TYPE_CHAR);
@@ -8390,7 +8390,7 @@ impl Compiler {
                             //
 
                             let r = self.regs.alloc(Span::POISONED)?;
-                            self.buf.mov_load(r, Reg::Rbp, size_off, true);
+                            self.code.mov_load(r, Reg::Rbp, size_off, true);
                             r
                         } else {
                             //
@@ -8416,7 +8416,7 @@ impl Compiler {
                         //
 
                         let r = self.regs.alloc(name_tok.span)?;
-                        self.buf.mov_load(r, Reg::Rbp, lv.rbp_off, true);
+                        self.code.mov_load(r, Reg::Rbp, lv.rbp_off, true);
                         self.vstack.push(CValue::regind(lv.ty, r, 0));
                     } else {
                         self.vstack.push(CValue::local(lv.ty, lv.rbp_off));
@@ -8427,7 +8427,7 @@ impl Compiler {
                     // push as a RegInd with a data/bss reloc
                     //
                     let dst = self.regs.alloc(name_tok.span)?;
-                    let text_off = self.buf.lea_rip(dst);
+                    let text_off = self.code.lea_rip(dst);
                     self.data_relocs.push(DataReloc {
                         text_off: text_off as u32,
                         data_off: gv.data_off,
@@ -8490,14 +8490,14 @@ impl Compiler {
                     // Promote, increment, store back
                     //
                     let tmp = self.regs.alloc(Span::POISONED)?;
-                    self.buf.mov_rr(tmp, old);
+                    self.code.mov_rr(tmp, old);
                     let from_size    = self.types.size_of(ty);
                     let promoted_ty  = self.promoted_type(ty);
                     let is_signed    = self.types.is_signed(ty);
                     self.emit_extend(tmp, from_size, self.types.size_of(promoted_ty), is_signed);
                     match op {
-                        TK::PlusPlus  => self.buf.add_ri8(tmp, 1),
-                        _             => self.buf.add_ri8(tmp, -1),
+                        TK::PlusPlus  => self.code.add_ri8(tmp, 1),
+                        _             => self.code.add_ri8(tmp, -1),
                     }
                     self.emit_int_store(base, v.offset(), tmp, ty); // truncates back naturally
                     self.regs.free(tmp);
@@ -8531,14 +8531,14 @@ impl Compiler {
                     let idx_r = self.force_gp(idx)?;
                     if self.types.get(elem_ty).is_vla() {
                         let stride_r = self.compute_vla_flat_size(elem_ty, Span::POISONED)?;
-                        self.buf.imul_rr(idx_r, stride_r);
+                        self.code.imul_rr(idx_r, stride_r);
                         self.regs.free(stride_r);
                     } else {
                         let elem_sz = self.types.size_of(elem_ty) as i32;
                         self.scale_index(idx_r, elem_sz);
                     }
                     self.regs.free(idx_r);
-                    self.buf.add_rr(base, idx_r);
+                    self.code.add_rr(base, idx_r);
                     self.vstack.push(CValue::regind(elem_ty, base, 0));
                 }
 
@@ -8619,9 +8619,9 @@ impl Compiler {
 
                 let (r, _) = self.pop_reg()?;
                 let ty = match hash {
-                    HASH_BUILTIN_BSWAP16 => { self.buf.bswap(r, 2); TYPE_SHORT }
-                    HASH_BUILTIN_BSWAP32 => { self.buf.bswap(r, 4); TYPE_INT   }
-                    _                    => { self.buf.bswap(r, 8); TYPE_LONG  }
+                    HASH_BUILTIN_BSWAP16 => { self.code.bswap(r, 2); TYPE_SHORT }
+                    HASH_BUILTIN_BSWAP32 => { self.code.bswap(r, 4); TYPE_INT   }
+                    _                    => { self.code.bswap(r, 8); TYPE_LONG  }
                 };
                 self.vstack.push(CValue::gp(ty, r));
                 Ok(true)
@@ -8634,7 +8634,7 @@ impl Compiler {
 
                 let (r, _) = self.pop_reg()?;
                 // lzcnt r, r  (or bsr + xor for fallback)
-                self.buf.lzcnt(r, r);
+                self.code.lzcnt(r, r);
                 self.vstack.push(CValue::gp(TYPE_INT, r));
                 Ok(true)
             }
@@ -8645,7 +8645,7 @@ impl Compiler {
                 self.expect(TK::RParen, "')'")?;
 
                 let (r, _) = self.pop_reg()?;
-                self.buf.tzcnt(r, r);
+                self.code.tzcnt(r, r);
                 self.vstack.push(CValue::gp(TYPE_INT, r));
                 Ok(true)
             }
@@ -8656,7 +8656,7 @@ impl Compiler {
                 self.expect(TK::RParen, "')'")?;
 
                 let (r, _) = self.pop_reg()?;
-                self.buf.popcnt(r, r);
+                self.code.popcnt(r, r);
                 self.vstack.push(CValue::gp(TYPE_INT, r));
                 Ok(true)
             }
@@ -8680,7 +8680,7 @@ impl Compiler {
             HASH_BUILTIN_UNREACHABLE => {
                 self.next(); // (
                 self.expect(TK::RParen, "')'")?;
-                self.buf.ud2();  // undefined instruction - trap if reached
+                self.code.ud2();  // undefined instruction - trap if reached
                 // Push a dummy value since expression context expects something
                 self.vstack.push(CValue::imm(TYPE_INT, 0));
                 Ok(true)
@@ -8689,7 +8689,7 @@ impl Compiler {
             HASH_BUILTIN_TRAP => {
                 self.next(); // (
                 self.expect(TK::RParen, "')'")?;
-                self.buf.ud2();
+                self.code.ud2();
                 self.vstack.push(CValue::imm(TYPE_INT, 0));
                 Ok(true)
             }
@@ -8700,7 +8700,7 @@ impl Compiler {
 
     #[inline]
     fn emit_memcpy_call(&mut self) -> CResult<()> {
-        let call_site = self.buf.call_rel32();
+        let call_site = self.code.call_rel32();
         let memcpy_hash = hash_ident("memcpy");
         let idx = if let Some(idx) = self.syms.find(memcpy_hash) {
             idx
@@ -8715,7 +8715,7 @@ impl Compiler {
                 addend: -4,
             });
         } else {
-            self.buf.patch_call(call_site, self.syms[idx].code_off as usize);
+            self.code.patch_call(call_site, self.syms[idx].code_off as usize);
         }
 
         self.regs.clobber_caller_save();
@@ -8740,20 +8740,20 @@ impl Compiler {
 
             let mut copied = 0i32;
             while copied + 8 <= size {
-                self.buf.mov_load(tmp, src_base, src_off + copied, true);
-                self.buf.mov_store(dst_base, dst_off + copied, tmp, true);
+                self.code.mov_load(tmp, src_base, src_off + copied, true);
+                self.code.mov_store(dst_base, dst_off + copied, tmp, true);
                 copied += 8;
             }
 
             if copied + 4 <= size {
-                self.buf.mov_load(tmp, src_base, src_off + copied, false);
-                self.buf.mov_store(dst_base, dst_off + copied, tmp, false);
+                self.code.mov_load(tmp, src_base, src_off + copied, false);
+                self.code.mov_store(dst_base, dst_off + copied, tmp, false);
                 copied += 4;
             }
 
             while copied < size {
-                self.buf.movzx8_load(tmp, src_base, src_off + copied);
-                self.buf.mov_store8(dst_base, dst_off + copied, tmp);
+                self.code.movzx8_load(tmp, src_base, src_off + copied);
+                self.code.mov_store8(dst_base, dst_off + copied, tmp);
                 copied += 1;
             }
 
@@ -8763,24 +8763,24 @@ impl Compiler {
                 // src is gonna get clobbered, alloc a temp register
                 let src_tmp = self.regs.alloc(Span::POISONED)?;
 
-                if src_off == 0 { self.buf.mov_rr(src_tmp, src_base); }
-                else            { self.buf.lea(src_tmp, src_base, src_off); }
+                if src_off == 0 { self.code.mov_rr(src_tmp, src_base); }
+                else            { self.code.lea(src_tmp, src_base, src_off); }
 
-                if dst_off == 0 { self.buf.mov_rr(Reg::Rdi, dst_base); }
-                else            { self.buf.lea(Reg::Rdi, dst_base, dst_off); }
+                if dst_off == 0 { self.code.mov_rr(Reg::Rdi, dst_base); }
+                else            { self.code.lea(Reg::Rdi, dst_base, dst_off); }
 
-                self.buf.mov_rr(Reg::Rsi, src_tmp);
+                self.code.mov_rr(Reg::Rsi, src_tmp);
 
                 // free the temp register
                 self.regs.free(src_tmp);
             } else {
-                if dst_off == 0 { self.buf.mov_rr(Reg::Rdi, dst_base); }
-                else            { self.buf.lea(Reg::Rdi, dst_base, dst_off); }
-                if src_off == 0 { self.buf.mov_rr(Reg::Rsi, src_base); }
-                else            { self.buf.lea(Reg::Rsi, src_base, src_off); }
+                if dst_off == 0 { self.code.mov_rr(Reg::Rdi, dst_base); }
+                else            { self.code.lea(Reg::Rdi, dst_base, dst_off); }
+                if src_off == 0 { self.code.mov_rr(Reg::Rsi, src_base); }
+                else            { self.code.lea(Reg::Rsi, src_base, src_off); }
             }
 
-            self.buf.mov_ri64(Reg::Rdx, size as i64);
+            self.code.mov_ri64(Reg::Rdx, size as i64);
 
             self.emit_memcpy_call()?;  // memcpy(dst(rdi), src(rsi), n(rdx))
         }
@@ -8913,8 +8913,8 @@ impl Compiler {
                 let spill = self.locals.alloc(HASH_HIDDEN_LOCAL, TYPE_LONG, &self.types);
 
                 let r = self.regs.alloc(name_tok.span)?;
-                self.buf.mov_load(r, Reg::Rbp, rbp_off, true);
-                self.buf.mov_store(Reg::Rbp, spill, r, true);
+                self.code.mov_load(r, Reg::Rbp, rbp_off, true);
+                self.code.mov_store(Reg::Rbp, spill, r, true);
                 self.regs.free(r);
 
                 Some(spill)
@@ -8924,13 +8924,13 @@ impl Compiler {
                 let spill = self.locals.alloc(HASH_HIDDEN_LOCAL, TYPE_LONG, &self.types);
 
                 let r = self.regs.alloc(name_tok.span)?;
-                let text_off = self.buf.lea_rip(r);  // lea r, [rip + global] then load the pointer value
+                let text_off = self.code.lea_rip(r);  // lea r, [rip + global] then load the pointer value
                 self.data_relocs.push(DataReloc { text_off: text_off as u32, data_off, is_bss });
                 let r2 = self.regs.alloc(name_tok.span)?;
-                self.buf.mov_load(r2, r, 0, true);
+                self.code.mov_load(r2, r, 0, true);
                 self.regs.free(r);
 
-                self.buf.mov_store(Reg::Rbp, spill, r2, true);
+                self.code.mov_store(Reg::Rbp, spill, r2, true);
                 self.regs.free(r2);
 
                 Some(spill)
@@ -9031,7 +9031,7 @@ impl Compiler {
                 argc = 1;
 
                 let ret_off = self.locals.alloc(HASH_HIDDEN_LOCAL, ret_ty, &self.types);
-                self.buf.lea(ARG_REGS[0], Reg::Rbp, ret_off);
+                self.code.lea(ARG_REGS[0], Reg::Rbp, ret_off);
 
                 Some((ret_off, true))
             } else {
@@ -9075,8 +9075,8 @@ impl Compiler {
                     //
                     // Load as float then promote to double (SYSV)
                     //
-                    self.buf.movss_load(dst, Reg::Rbp, spill_off);
-                    self.buf.cvtss2sd(dst, dst);
+                    self.code.movss_load(dst, Reg::Rbp, spill_off);
+                    self.code.cvtss2sd(dst, dst);
                 } else {
                     self.emit_float_load(dst, Reg::Rbp, spill_off, ty);
                 }
@@ -9105,9 +9105,9 @@ impl Compiler {
         //
         if is_variadic {
             if xmm_argc == 0 {
-                self.buf.xor_rr(Reg::Rax, Reg::Rax);
+                self.code.xor_rr(Reg::Rax, Reg::Rax);
             } else {
-                self.buf.mov_ri64(Reg::Rax, xmm_argc as i64);
+                self.code.mov_ri64(Reg::Rax, xmm_argc as i64);
             }
         }
 
@@ -9119,8 +9119,8 @@ impl Compiler {
             // Function pointer call - reload into r11 (not an arg reg, caller-save)
             //
             let r = self.regs.alloc(name_tok.span)?;
-            self.buf.mov_load(r, Reg::Rbp, spill, true);
-            self.buf.call_r(r);
+            self.code.mov_load(r, Reg::Rbp, spill, true);
+            self.code.call_r(r);
             self.regs.free(r);
         } else {
             let CalleeKind::Sym(sym_index) = callee_kind else {
@@ -9128,7 +9128,7 @@ impl Compiler {
             };
 
             let sym = self.syms[sym_index];
-            let call_site = self.buf.call_rel32();
+            let call_site = self.code.call_rel32();
             if sym.flags.contains(SymFlags::EXTERN) {
                 self.call_relocs.push(CallReloc {
                     offset: call_site as u32,
@@ -9136,7 +9136,7 @@ impl Compiler {
                     addend: -4
                 });
             } else {
-                self.buf.patch_call(call_site, sym.code_off as usize);
+                self.code.patch_call(call_site, sym.code_off as usize);
             }
         }
 
@@ -9144,7 +9144,7 @@ impl Compiler {
         self.xmms.clobber_caller_save();
 
         if stack_bytes_pushed > 0 {
-            self.buf.add_ri32(Reg::Rsp, stack_bytes_pushed);
+            self.code.add_ri32(Reg::Rsp, stack_bytes_pushed);
         }
 
         if let Some((ret_off, is_memory)) = struct_ret_off {
@@ -9178,18 +9178,18 @@ impl Compiler {
                     let src = if i == 0 { Reg::Rax } else { Reg::Rdx };
 
                     if chunk >= 8 {
-                        self.buf.mov_store(Reg::Rbp, ret_off + offset, src, true);
+                        self.code.mov_store(Reg::Rbp, ret_off + offset, src, true);
                     } else if chunk >= 4 {
-                        self.buf.mov_store(Reg::Rbp, ret_off + offset, src, false);
+                        self.code.mov_store(Reg::Rbp, ret_off + offset, src, false);
                     } else {
-                        self.buf.mov_store8(Reg::Rbp, ret_off + offset, src);
+                        self.code.mov_store8(Reg::Rbp, ret_off + offset, src);
                     }
                 }
 
                 SysVClass::Sse => {
                     let xmm = if i == 0 { XmmReg::Xmm0 } else { XmmReg::Xmm1 };
 
-                    self.buf.movq_xmm_store(Reg::Rbp, ret_off + offset, xmm);
+                    self.code.movq_xmm_store(Reg::Rbp, ret_off + offset, xmm);
                 }
 
                 SysVClass::Memory => unreachable!(),
@@ -9212,19 +9212,19 @@ impl Compiler {
                 SysVClass::Integer => {
                     let dst = if i == 0 { Reg::Rax } else { Reg::Rdx };
 
-                    self.buf.xor_rr(dst, dst);
+                    self.code.xor_rr(dst, dst);
 
                     if chunk >= 8 {
-                        self.buf.mov_load(dst, src_base, src_off + offset, true);
+                        self.code.mov_load(dst, src_base, src_off + offset, true);
                     } else if chunk >= 4 {
-                        self.buf.mov_load(dst, src_base, src_off + offset, false);
+                        self.code.mov_load(dst, src_base, src_off + offset, false);
                     } else {
                         let tmp = self.regs.alloc(Span::POISONED)?;
                         let mut b = 0i32;
                         while b < chunk {
-                            self.buf.movzx8_load(tmp, src_base, src_off + offset + b);
-                            self.buf.shl_ri(dst, 8);
-                            self.buf.or_rr(dst, tmp);
+                            self.code.movzx8_load(tmp, src_base, src_off + offset + b);
+                            self.code.shl_ri(dst, 8);
+                            self.code.or_rr(dst, tmp);
                             b += 1;
                         }
                         self.regs.free(tmp);
@@ -9235,11 +9235,11 @@ impl Compiler {
                     let xmm = if i == 0 { XmmReg::Xmm0 } else { XmmReg::Xmm1 };
 
                     if chunk >= 8 {
-                        self.buf.movq_xmm_load(xmm, src_base, src_off + offset);
+                        self.code.movq_xmm_load(xmm, src_base, src_off + offset);
                     } else if chunk >= 4 {
-                        self.buf.movss_load(xmm, src_base, src_off + offset);
+                        self.code.movss_load(xmm, src_base, src_off + offset);
                     } else {
-                        self.buf.movss_load(xmm, src_base, src_off + offset);
+                        self.code.movss_load(xmm, src_base, src_off + offset);
                     }
                 }
 
@@ -9282,11 +9282,11 @@ impl Compiler {
                     *argc += 1;
 
                     if chunk >= 8 {
-                        self.buf.mov_store(Reg::Rbp, off + offset, src, true);
+                        self.code.mov_store(Reg::Rbp, off + offset, src, true);
                     } else if chunk >= 4 {
-                        self.buf.mov_store(Reg::Rbp, off + offset, src, false);
+                        self.code.mov_store(Reg::Rbp, off + offset, src, false);
                     } else {
-                        self.buf.mov_store8(Reg::Rbp, off + offset, src);
+                        self.code.mov_store8(Reg::Rbp, off + offset, src);
                     }
                 }
 
@@ -9301,7 +9301,7 @@ impl Compiler {
 
                     let xmm = XMM_ARG_REGS[*xmm_argc];
                     *xmm_argc += 1;
-                    self.buf.movq_xmm_store(Reg::Rbp, off + offset, xmm);
+                    self.code.movq_xmm_store(Reg::Rbp, off + offset, xmm);
                 }
 
                 SysVClass::Memory => unreachable!(),
@@ -9333,7 +9333,7 @@ impl Compiler {
 
             let size = self.types.size_of(ty) as i32;
             let aligned = (size + 15) & !15;
-            self.buf.sub_rsp(aligned);
+            self.code.sub_rsp(aligned);
             self.emit_struct_copy(Reg::Rsp, 0, Reg::Rbp, spill_off, size)?;
             return Ok(aligned);
         }
@@ -9356,14 +9356,14 @@ impl Compiler {
                     let r = ARG_REGS[*argc];
                     *argc += 1;
 
-                    self.buf.xor_rr(r, r);
+                    self.code.xor_rr(r, r);
                     if chunk >= 8 {
-                        self.buf.mov_load(r, Reg::Rbp, spill_off + offset, true);
+                        self.code.mov_load(r, Reg::Rbp, spill_off + offset, true);
                     } else if chunk >= 4 {
-                        self.buf.mov_load(r, Reg::Rbp, spill_off + offset, false);
+                        self.code.mov_load(r, Reg::Rbp, spill_off + offset, false);
                     } else {
                         // Just in case... Load 4 bytes, upper bits zeroed by xor above
-                        self.buf.mov_load(r, Reg::Rbp, spill_off + offset, false);
+                        self.code.mov_load(r, Reg::Rbp, spill_off + offset, false);
                     }
                 }
 
@@ -9377,7 +9377,7 @@ impl Compiler {
                     }
 
                     let xmm = XMM_ARG_REGS[*xmm_argc];
-                    self.buf.movq_xmm_load(xmm, Reg::Rbp, spill_off + offset);
+                    self.code.movq_xmm_load(xmm, Reg::Rbp, spill_off + offset);
                     *xmm_argc += 1;
                 }
 
@@ -9602,9 +9602,9 @@ impl Compiler {
 	            let r = self.force_gp(v)?;
 	            let xmm = self.xmms.alloc(Span::POISONED)?;
 	            if target_kind == TypeKind::Float {
-	                self.buf.cvtsi2ss(xmm, r);
+	                self.code.cvtsi2ss(xmm, r);
 	            } else {
-	                self.buf.cvtsi2sd(xmm, r);
+	                self.code.cvtsi2sd(xmm, r);
 	            }
 	            self.regs.free(r);
 	            Ok(CValue::xmm(target, xmm))
@@ -9618,9 +9618,9 @@ impl Compiler {
 	            let xmm = self.force_xmm(v)?;
 	            let r = self.regs.alloc(Span::POISONED)?;
 	            if from_kind == TypeKind::Float {
-	                self.buf.cvttss2si(r, xmm);
+	                self.code.cvttss2si(r, xmm);
 	            } else {
-	                self.buf.cvttsd2si(r, xmm);
+	                self.code.cvttsd2si(r, xmm);
 	            }
 	            self.xmms.free(xmm);
 	            // If target is narrower than 64-bit, truncate
@@ -9637,7 +9637,7 @@ impl Compiler {
 	                return Ok(CValue::fimm(target, v.get_fimm()));
 	            }
 	            let xmm = self.force_xmm(v)?;
-	            self.buf.cvtss2sd(xmm, xmm);
+	            self.code.cvtss2sd(xmm, xmm);
 	            Ok(CValue::xmm(target, xmm))
 	        }
 	        (TypeKind::Double, TypeKind::Float) => {
@@ -9646,7 +9646,7 @@ impl Compiler {
 	                return Ok(CValue::fimm(target, v.get_fimm() as f32 as f64));
 	            }
 	            let xmm = self.force_xmm(v)?;
-	            self.buf.cvtsd2ss(xmm, xmm);
+	            self.code.cvtsd2ss(xmm, xmm);
 	            Ok(CValue::xmm(target, xmm))
 	        }
 
@@ -9837,7 +9837,7 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
     const NSEC: usize = 9;
 
     let text_off    = EHSZ;
-    let text_sz     = c.buf.bytes.len();
+    let text_sz     = c.code.bytes.len();
     let rodata_off  = align(text_off   + text_sz,        16); let rodata_sz  = c.rodata.len();
     let data_off    = align(rodata_off + rodata_sz,       16); let data_sz    = c.data.len();
     let rela_off    = align(data_off   + data_sz,          8); let rela_sz    = rela.len();
@@ -9865,7 +9865,7 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
     //
     // Section data
     //
-    out[text_off  ..text_off  +text_sz  ].copy_from_slice(&c.buf.bytes);
+    out[text_off  ..text_off  +text_sz  ].copy_from_slice(&c.code.bytes);
     out[rodata_off..rodata_off+rodata_sz].copy_from_slice(&c.rodata);
     out[data_off  ..data_off  +data_sz  ].copy_from_slice(&c.data);
     // .bss has no file content - zero sized in file
@@ -9975,7 +9975,7 @@ fn main() {
         std::process::exit(1);
     });
 
-    eprintln!("wrote {out_path} ({} bytes text, {} total)", c.buf.bytes.len(), elf.len());
+    eprintln!("wrote {out_path} ({} bytes text, {} total)", c.code.bytes.len(), elf.len());
 }
 
 fn run_main(mut c: Compiler) {
@@ -9984,14 +9984,14 @@ fn run_main(mut c: Compiler) {
     //
     // Layout: [code][rodata][data][bss_zeros][trampolines]
     //
-    let rodata_base = c.buf.bytes.len();
-    c.buf.bytes.extend_from_slice(&c.rodata);
+    let rodata_base = c.code.bytes.len();
+    c.code.bytes.extend_from_slice(&c.rodata);
 
-    let data_base = c.buf.bytes.len();
-    c.buf.bytes.extend_from_slice(&c.data);
+    let data_base = c.code.bytes.len();
+    c.code.bytes.extend_from_slice(&c.data);
 
-    let bss_base = c.buf.bytes.len();
-    c.buf.bytes.extend(std::iter::repeat(0u8).take(c.bss_size));
+    let bss_base = c.code.bytes.len();
+    c.code.bytes.extend(std::iter::repeat(0u8).take(c.bss_size));
 
     //
     // Patch rodata relocs
@@ -10000,7 +10000,7 @@ fn run_main(mut c: Compiler) {
         let target    = rodata_base + r.rodata_off as usize;
         let patch_pos = r.text_off as usize;
         let rel       = (target as i64) - (patch_pos as i64 + 4);
-        c.buf.patch_i32(patch_pos, rel as i32);
+        c.code.patch_i32(patch_pos, rel as i32);
     }
 
     //
@@ -10011,7 +10011,7 @@ fn run_main(mut c: Compiler) {
         let target    = base + r.data_off as usize;
         let patch_pos = r.text_off as usize;
         let rel       = (target as i64) - (patch_pos as i64 + 4);
-        c.buf.patch_i32(patch_pos, rel as i32);
+        c.code.patch_i32(patch_pos, rel as i32);
     }
 
     //
@@ -10030,11 +10030,11 @@ fn run_main(mut c: Compiler) {
             std::process::exit(1);
         }
 
-        let trampoline_off = c.buf.bytes.len();
+        let trampoline_off = c.code.bytes.len();
         sym_to_trampoline.insert(sym_index, trampoline_off);
 
-        c.buf.mov_ri64(Reg::R11, sym_addr);
-        c.buf.jmp_r(Reg::R11);
+        c.code.mov_ri64(Reg::R11, sym_addr);
+        c.code.jmp_r(Reg::R11);
     }
 
     //
@@ -10062,8 +10062,8 @@ fn run_main(mut c: Compiler) {
     //
     // Mmap and patch extern relocs
     //
-    let mut mmap = MmapMut::map_anon(c.buf.bytes.len()).unwrap();
-    mmap.copy_from_slice(&c.buf.bytes);
+    let mut mmap = MmapMut::map_anon(c.code.bytes.len()).unwrap();
+    mmap.copy_from_slice(&c.code.bytes);
 
     let base = mmap.as_ptr() as i64;
     for r in &c.call_relocs {
