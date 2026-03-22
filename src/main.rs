@@ -84,9 +84,10 @@
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::borrow::Cow;
 use std::io;
 use std::fs::File;
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::ops::{Deref, DerefMut};
 
@@ -129,6 +130,13 @@ fn hash_bytes_for_rodata_interning(bytes: &[u8]) -> RodataHash {
 #[inline]
 const fn align(x: usize, a: usize) -> usize {
     (x + a - 1) & !(a - 1)
+}
+
+#[inline]
+fn str_into_boxed_path(s: impl AsRef<str>) -> Box<Path> {
+    let s: &str = s.as_ref();
+    let p: &Path = s.as_ref();
+    p.into()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -899,8 +907,8 @@ pub struct PP {
     stop_at_newline:   bx,  // For # directives as well
 
     // TODO(#19): Make pragma_once_paths and include_dirs in PP hashsets
-    pragma_once_paths: Vec<PathBuf>,
-    include_dirs:      Vec<PathBuf>,
+    pragma_once_paths: HashSet<Box<Path>, wyhash::WyHasherBuilder>,
+    include_dirs:      Vec<Box<Path>>,
 
     macros:            MacroTable, // Huge struct (~194 cache lines)
 }
@@ -929,7 +937,7 @@ impl PP {
                     "/usr/local/include",
                     "/usr/include/x86_64-linux-gnu",
                     "/usr/include",
-                ].into_iter().map(PathBuf::from).collect::<Vec<_>>();
+                ].into_iter().map(str_into_boxed_path).collect::<Vec<_>>();
 
                 for arg in args {
                     //
@@ -941,13 +949,13 @@ impl PP {
                         } else {
                             &include
                         };
-                        dirs.push(path.into());
+                        dirs.push(str_into_boxed_path(path));
                     }
                 }
 
                 dirs
             },
-            pragma_once_paths: Vec::new(),
+            pragma_once_paths:  Default::default(),
             at_bol:             true,
             stop_at_newline:    false,
             current_token:      Token::EOF,
@@ -960,7 +968,7 @@ impl PP {
     }
 
     #[inline]
-    pub fn add_include_dir(&mut self, p: impl Into<PathBuf>) {
+    pub fn add_include_dir(&mut self, p: impl Into<Box<Path>>) {
         self.include_dirs.push(p.into());
     }
 
@@ -1233,7 +1241,15 @@ impl PP {
                 TK::Ident => {
                     self.at_bol = false;
 
-                    let hash = hash_ident(t.s(&self.src_arena));
+                    let hash = if t.hash != 0 {
+                        // Already cooked token from exp frame - hash is valid,
+                        // and it was already macro-checked when first cooked,
+                        // so we can return it directly without another macro lookup
+                        return t;
+                    } else {
+                        hash_ident(t.s(&self.src_arena))
+                    };
+
                     let Some(index) = self.macros.find(hash) else {
                         return Token { kind: t.kind, span: t.span, hash };
                     };
@@ -1446,6 +1462,7 @@ impl PP {
 
         self.skip_line();
 
+        let resolved = resolved.into_boxed_path();
         if self.pragma_once_paths.contains(&resolved) { return Ok(()); }
 
         let file = File::open(&resolved)?;
@@ -1472,9 +1489,7 @@ impl PP {
             if let Some(ff) = self.file_stack.last() {
                 let path = Path::new(self.src_arena.files[ff.fid].path.as_ref());
                 if let Ok(canonical) = path.canonicalize() {
-                    if !self.pragma_once_paths.contains(&canonical) {
-                        self.pragma_once_paths.push(canonical);
-                    }
+                    self.pragma_once_paths.insert(canonical.into_boxed_path());
                 }
             }
         }
@@ -1541,6 +1556,49 @@ impl PP {
                 expected: def.param_count as _,
                 name: def.def_span.s(&self.src_arena).to_owned(),
             });
+        }
+
+        let all_single_and_not_macros = arg_ranges.iter().all(|&(start, len)| {
+            if len != 1 { return false; }
+
+            let t = self.macros.scratch[start as usize];
+            // Make sure the single token isn't itself a macro
+            t.kind != TK::Ident || self.macros.find(hash_ident(t.s(&self.src_arena))).is_none()
+        });
+
+        if all_single_and_not_macros {
+            //
+            // Fast path: args are single tokens, no need to cook them
+            // Just read directly from scratch and substitute into body
+            //
+
+            let frame_start = self.exp.pool.len() as u32;
+            let mut frame_len = 0u32;
+
+            let d = &self.macros.defs[index];
+
+            let body_start = d.body_start as usize;
+            let body_len   = d.body_len   as usize;
+
+            // Each body token is either a literal token (1) or a Param substituted by 1 token (1)
+            // So total pushed = body_len exactly
+            self.exp.pool.reserve(body_len);
+
+            for i in body_start..body_start + body_len {
+                let t = self.macros.tok_pool[i];
+                match t.kind {
+                    TK::Param(pi) => {
+                        let (arg_s, _) = arg_ranges[pi as usize];
+                        self.exp.pool.push(self.macros.scratch[arg_s as usize]);
+                    }
+                    _ => { self.exp.pool.push(t); }
+                }
+                frame_len += 1;
+            }
+
+            self.macros.scratch.truncate(scratch_base as usize);
+            self.exp.frames.push((frame_start, frame_start + frame_len, frame_start));
+            return Ok(());
         }
 
         //
@@ -6877,6 +6935,19 @@ impl Compiler {
         let off = self.locals.alloc(name_tok.hash, ty, &self.types);
         if self.current_token.kind == TK::Eq {
             self.next(); // =
+
+            //
+            // Fast path: scalar with no braces
+            //
+            let kind = self.get_kind(ty);
+            if !matches!(kind, TypeKind::Struct | TypeKind::Union | TypeKind::Array)
+                && self.current_token.kind != TK::LCurly
+            {
+                self.compile_expr_no_comma()?;
+                self.emit_store(Reg::Rbp, off, ty)?;
+                return Ok(());
+            }
+
             self.compile_initializer(off, ty)?;
         }
 
