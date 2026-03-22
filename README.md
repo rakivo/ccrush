@@ -8,6 +8,11 @@ It is fast because it is designed with handmade spirit: data-oriented, cache-fri
 
 ---
 
+> [!WARNING]
+> This is early and unfinished software. The eventual goal is full GNU C11 compliance and compiling the Linux kernel - but we are nowhere near that yet.
+
+---
+
 ## Benchmark
 
 > Synthetic input: 5 million lines of auto-generated C functions. Measures raw compiler throughput.
