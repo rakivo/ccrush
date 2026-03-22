@@ -4606,8 +4606,10 @@ pub struct ValueStack { vals: [CValue; VALUE_STACK_CAP], top: usize }
 impl ValueStack {
     #[inline] #[must_use]
     pub fn new() -> Self { Self { vals: [CValue::imm(TYPE_INT, 0); VALUE_STACK_CAP], top: 0 } }
-    #[inline] pub fn push(&mut self, v: CValue) { self.vals[self.top] = v; self.top += 1; }
-    #[inline] pub fn pop (&mut self) -> CValue  { self.top -= 1; self.vals[self.top] }
+    #[inline]
+    pub fn push(&mut self, v: CValue) { self.vals[self.top] = v; self.top += 1; }
+    #[inline]
+    pub fn pop (&mut self) -> CValue  { self.top -= 1; self.vals[self.top] }
     #[inline] #[must_use]
     pub fn peek(&self)     -> CValue  { self.vals[self.top - 1] }
     #[inline] #[must_use]
@@ -10226,7 +10228,7 @@ fn main() {
 
     let out_path = args.iter()
         .position(|s| s == "-o")
-        .and_then(|i| args.get(i+1)).map_or("out.o", std::string::String::as_str);
+        .and_then(|i| args.get(i+1)).map_or("out.o", String::as_str);
 
     let mut pp = match PP::new(Path::new(&args[1]), &args[1..]) {
         Ok(pp) => pp,
