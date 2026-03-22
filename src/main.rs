@@ -73,7 +73,7 @@
 // TODO(#14): GCC statement expressions
 // TODO(#16): More declarators support: `void (*(*fp)(int))(float)`
 // TODO(#17): __builtin_bswap16, __builtin_*...
-// TODO: Proper implicit coercion: int <-> float, etc
+// TODO(#24): Proper implicit coercion: int <-> float, etc
 
 // TODO(#18): Resolve the situation with sret and VLA hidden slot using the same slot...?
 
@@ -9026,4 +9026,3 @@ fn run_main(mut c: Compiler) {
     let result = f(argc, argv_ptr, envp_ptr);
     std::process::exit(result);
 }
-     
