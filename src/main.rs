@@ -299,7 +299,7 @@ pub fn emit_diag_impl(msg: &str, span: Span, arena: &SrcArena, is_warning: bool)
 }
 
 fn debug_tokens(path: &Path) {
-    let mut pp = match PP::from_path(path) {
+    let mut pp = match PP::new(path, &std::env::args().collect::<Vec<_>>()) {
         Ok(pp) => pp,
         Err(e) => { eprintln!("{e}"); return; }
     };
@@ -896,41 +896,47 @@ pub struct PP {
 }
 
 impl PP {
-    #[inline]
-    pub fn from_path(path: &Path) -> PPResult<Self> {
+    fn new(path: &Path, args: &[String]) -> PPResult<Self> {
         let mut arena = SrcArena::new();
         let fid = arena.add_path(path)?;
-        Ok(Self::init(arena, fid))
-    }
 
-    #[inline]
-    pub fn from_bytes(src: Vec<u8>) -> Self {
-        let mut arena = SrcArena::new();
-        let fid = arena.add_bytes(Path::new("<input>"), src);
-        Self::init(arena, fid)
-    }
-
-    #[inline]
-    fn init(arena: SrcArena, fid: FileRef) -> Self {
         let mut pp = Self {
             src_arena: arena,
             ifdef_stack:        Vec::new(),
             file_stack:         vec![FileFrame { fid, pos: 0 }],
             exp:                Expansions::new(),
             macros:             MacroTable::new(),
-            include_dirs: [
-                "/usr/lib/gcc/x86_64-linux-gnu/14/include",
-                "/usr/lib/gcc/x86_64-linux-gnu/13/include",
-                "/usr/lib/gcc/x86_64-linux-gnu/12/include",
-                "/usr/lib/gcc/x86_64-linux-gnu/11/include",
-                "/usr/lib/gcc/x86_64-linux-gnu/10/include",
-                "/usr/lib/gcc/x86_64-pc-linux-gnu/14/include",
-                "/usr/lib/gcc/x86_64-pc-linux-gnu/13/include",
-                "/usr/lib/gcc/x86_64-pc-linux-gnu/12/include",
-                "/usr/local/include",
-                "/usr/include/x86_64-linux-gnu",
-                "/usr/include",
-            ].into_iter().map(PathBuf::from).collect(),
+            include_dirs: {
+                let mut dirs = [
+                    "/usr/lib/gcc/x86_64-linux-gnu/14/include",
+                    "/usr/lib/gcc/x86_64-linux-gnu/13/include",
+                    "/usr/lib/gcc/x86_64-linux-gnu/12/include",
+                    "/usr/lib/gcc/x86_64-linux-gnu/11/include",
+                    "/usr/lib/gcc/x86_64-linux-gnu/10/include",
+                    "/usr/lib/gcc/x86_64-pc-linux-gnu/14/include",
+                    "/usr/lib/gcc/x86_64-pc-linux-gnu/13/include",
+                    "/usr/lib/gcc/x86_64-pc-linux-gnu/12/include",
+                    "/usr/local/include",
+                    "/usr/include/x86_64-linux-gnu",
+                    "/usr/include",
+                ].into_iter().map(PathBuf::from).collect::<Vec<_>>();
+
+                for arg in args {
+                    //
+                    // -Iinclude or -I=BAR args
+                    //
+                    if let Some(include) = arg.strip_prefix("-I") {
+                        let path = if let Some(eq) = include.find('=') {
+                            &include[eq+1..]
+                        } else {
+                            &include
+                        };
+                        dirs.push(path.into());
+                    }
+                }
+
+                dirs
+            },
             pragma_once_paths: Vec::new(),
             at_bol:             true,
             stop_at_newline:    false,
@@ -940,7 +946,7 @@ impl PP {
         pp.init_predefined_macros();
         pp.current_token  = pp.cook();
         pp.next_token = pp.cook();
-        pp
+        Ok(pp)
     }
 
     #[inline]
@@ -2889,6 +2895,12 @@ impl TypeTable {
     }
 
     #[inline]
+    pub fn patch_func_forward_decl(&mut self, ty: TypeRef, flags: TypeFlags) {
+        let e = &mut self.entries[ty];
+        e.flags = flags;
+    }
+
+    #[inline]
     pub fn patch_enum_forward_decl(&mut self, ty: TypeRef) {
         let e = &mut self.entries[ty];
         e.flags = TypeFlags::empty();
@@ -3551,6 +3563,41 @@ impl CodeBuf {
         self.emit_byte(0x89);
         self.modrm_mem(src, base, off);
     }
+    // movsx r64, r8
+    #[inline]
+    pub fn movsx_r8(&mut self, dst: Reg, src: Reg) {
+        self.rex_w(dst, src);
+        self.bytes.extend_from_slice(&[0x0F, 0xBE]);
+        self.modrm_rr(dst, src);
+    }
+    // movsx r64, r16
+    #[inline]
+    pub fn movsx_r16(&mut self, dst: Reg, src: Reg) {
+        self.rex_w(dst, src);
+        self.bytes.extend_from_slice(&[0x0F, 0xBF]);
+        self.modrm_rr(dst, src);
+    }
+    // movsxd r64, r32
+    #[inline]
+    pub fn movsxd(&mut self, dst: Reg, src: Reg) {
+        self.rex_w(dst, src);
+        self.emit_byte(0x63);
+        self.modrm_rr(dst, src);
+    }
+    // movzx r64, r8
+    #[inline]
+    pub fn movzx_r8(&mut self, dst: Reg, src: Reg) {
+        self.rex_w(dst, src);
+        self.bytes.extend_from_slice(&[0x0F, 0xB6]);
+        self.modrm_rr(dst, src);
+    }
+    // movzx r64, r16
+    #[inline]
+    pub fn movzx_r16(&mut self, dst: Reg, src: Reg) {
+        self.rex_w(dst, src);
+        self.bytes.extend_from_slice(&[0x0F, 0xB7]);
+        self.modrm_rr(dst, src);
+    }
     #[inline]
     pub fn mov_store(&mut self, base: Reg, off: i32, src: Reg, is64: bool) {
         self.rex(is64, src,  base); self.emit_byte(0x89); self.modrm_mem(src,  base, off);
@@ -3614,6 +3661,13 @@ impl CodeBuf {
     }
 
     #[inline]
+    pub fn add_ri32(&mut self, dst: Reg, imm: i32) {
+        self.rex_w(Reg::Rax, dst);
+        self.emit_byte(0x81);
+        self.emit_byte(0xC0 | dst.enc());
+        self.emit_i32(imm);
+    }
+    #[inline]
     pub fn xor_rr   (&mut self, dst: Reg, src: Reg) {
         self.rex_w(src, dst); self.emit_byte(0x31); self.modrm_rr(src, dst);
     }
@@ -3632,6 +3686,13 @@ impl CodeBuf {
     #[inline]
     pub fn sub_rr   (&mut self, dst: Reg, src: Reg) {
         self.rex_w(src, dst); self.emit_byte(0x29); self.modrm_rr(src, dst);
+    }
+    #[inline]
+    pub fn sub_ri32(&mut self, dst: Reg, imm: i32) {
+        self.rex_w(Reg::Rax, dst);
+        self.emit_byte(0x81);
+        self.emit_byte(0xE8 | dst.enc());
+        self.emit_i32(imm);
     }
     #[inline]
     pub fn imul_ri(&mut self, dst: Reg, imm: i32) {
@@ -3929,6 +3990,27 @@ impl CodeBuf {
         self.bytes.extend_from_slice(&[0xF2, rex, 0x0F, 0x2A]);
         self.bytes.push(0xC0 | (dst as u8 & 7) << 3 | src.enc());
     }
+    // cvtsi2ss: F3 0F 2A /r (int -> float)
+    #[inline]
+    pub fn cvtsi2ss(&mut self, dst: XmmReg, src: Reg) {
+        let rex = 0x48 | ((dst as u8 >= 8) as u8) << 2 | (src.ext() as u8);
+        self.bytes.extend_from_slice(&[0xF3, rex, 0x0F, 0x2A]);
+        self.bytes.push(0xC0 | (dst as u8 & 7) << 3 | src.enc());
+    }
+    // cvttss2si: F3 0F 2C /r (float -> int, truncate)
+    #[inline]
+    pub fn cvttss2si(&mut self, dst: Reg, src: XmmReg) {
+        let rex = 0x48 | (dst.ext() as u8) << 2 | ((src as u8 >= 8) as u8);
+        self.bytes.extend_from_slice(&[0xF3, rex, 0x0F, 0x2C]);
+        self.bytes.push(0xC0 | (dst.enc()) << 3 | (src as u8 & 7));
+    }
+    // cvttsd2si: F2 0F 2C /r (double -> int, truncate)
+    #[inline]
+    pub fn cvttsd2si(&mut self, dst: Reg, src: XmmReg) {
+        let rex = 0x48 | (dst.ext() as u8) << 2 | ((src as u8 >= 8) as u8);
+        self.bytes.extend_from_slice(&[0xF2, rex, 0x0F, 0x2C]);
+        self.bytes.push(0xC0 | (dst.enc()) << 3 | (src as u8 & 7));
+    }
 
     #[inline]
     pub fn movss_load_rip(&mut self, dst: XmmReg) -> usize {
@@ -4175,6 +4257,21 @@ impl SymTable {
     #[inline]
     pub fn find(&self, hash: u64) -> Option<usize> {
         self.index.get(&hash).map(|&i| i as usize)
+    }
+
+    #[inline]
+    pub fn patch_forward_declaration(
+        &mut self,
+        sym_index: usize,
+
+        code_off:  u32,
+        code_len:  u32,
+        flags:     SymFlags
+    ) {
+        let sym = &mut self.syms[sym_index];
+        sym.code_off = code_off;
+        sym.code_len = code_len;
+        sym.flags = flags;
     }
 
     #[inline]
@@ -4637,7 +4734,7 @@ impl Compiler {
         let mut field_names   = Vec::new();
         let mut field_entries = Vec::<FieldEntry>::new();
         loop {
-            let ty = match self.current_token.kind {
+            let base_ty = match self.current_token.kind {
                 TK::RCurly => break,
 
                 TK::Comma => {
@@ -4650,24 +4747,15 @@ impl Compiler {
                     continue;
                 }
 
-                _ => self.compile_type()?
+                _ => self.compile_base_type()?
             };
 
-            let name = self.eat_ident("field name")?;
-
-            let ty = if self.current_token.kind == TK::LSquare {
-                self.next(); // [
-                if self.current_token.kind == TK::RSquare {
-                    self.next();
-                    self.types.array_of(ty, 0) // flexible array member
-                } else {
-                    let len = self.try_parse_and_eval_const_int()? as u32;
-                    self.expect(TK::RSquare, "']'")?;
-                    self.parse_array_dims(ty, len)?
-                }
-            } else {
-                ty
-            };
+            let (ty, name_tok) = self.parse_declarator(base_ty)?;
+            let name = name_tok.ok_or_else(|| CError::Expected {
+                span: self.current_token.span,
+                expected: "field name",
+                got: self.s(self.current_token).to_owned(),
+            })?;
 
             if self.current_token.kind == TK::Colon {
                 // @Incomplete
@@ -4830,7 +4918,14 @@ impl Compiler {
         Ok(ty)
     }
 
+    #[inline]
     fn compile_type(&mut self) -> CResult<TypeRef> {
+        let base = self.compile_base_type()?;
+        let (ty, _) = self.parse_declarator(base)?;
+        Ok(ty)
+    }
+
+    fn compile_base_type(&mut self) -> CResult<TypeRef> {
         let mut quals = QualFlags::empty();
         let mut ty = None;
 
@@ -4915,19 +5010,33 @@ impl Compiler {
         }
 
         let ty = ty.unwrap_or(TYPE_INT); // Implicit int..................... Sigh...........
-        let mut ty = if quals.is_empty() {
+        Ok(if quals.is_empty() {
             ty
         } else if is_type_builtin(ty) && quals.difference(QualFlags::UNSIGNED).is_empty() {
             unsign_a_builtin_type(ty)
         } else {
             self.types.qualify(ty, quals)
-        };
+        })
+    }
 
+    /// Parse a declarator on top of `base_ty`.
+    /// Returns (final_type, name_token).
+    fn parse_declarator(&mut self, base_ty: TypeRef) -> CResult<(TypeRef, Option<Token>)> {
+        self.parse_declarator_impl(base_ty).map(|(ty, name, _)| (ty, name))
+    }
+
+    /// Parse a declarator on top of `base_ty`.
+    /// Returns (final_type, name_token, params).
+    fn parse_declarator_impl(
+        &mut self,
+        base_ty: TypeRef
+    ) -> CResult<(TypeRef, Option<Token>, Option<Vec<(TypeRef, u64, Span)>>)> {
         //
-        // Pointer declarators - const/volatile/restrict are all valid on pointers
+        // Collect leading pointer chain
         //
+        let mut ptr_chain = SmallVec::<[_; 8]>::new();
         while self.current_token.kind == TK::Star {
-            self.next();
+            self.next(); // *
 
             let mut ptr_quals = QualFlags::empty();
             loop {
@@ -4939,18 +5048,182 @@ impl Compiler {
                 }
             }
 
-            ty = self.types.intern(TypeKind::Ptr, ptr_quals, TypeFlags::empty(), ty, 0, 0);
+            ptr_chain.push(ptr_quals);
         }
 
         //
-        // Array dims - only in type-only contexts (sizeof, typeof, cast)
-        // @Declarator dims are handled in compile_local_decl and compile_top_level.
+        // Grouped declarator: (*name), (**name), (*name)(params) etc.
+        // Detect '(' not followed by a type.
         //
-        if !self.in_global_context && self.current_token.kind == TK::LSquare {
-            ty = self.compile_array_dim_loop(ty)?;
+        // Sigh.............................
+        //
+        let grouped = self.current_token.kind == TK::LParen
+            && !self.can_hash_start_a_type(self.next_token.hash)
+            && self.next_token.kind != TK::RParen  // () is empty params, not grouping
+            && (self.next_token.kind == TK::Star
+                || self.next_token.kind == TK::LParen
+                || (self.next_token.kind == TK::Ident
+                    && !self.can_hash_start_a_type(self.next_token.hash)));
+
+        let (inner, name_tok) = if grouped {
+            self.next(); // (
+
+            //
+            // Parse inner declarator with TYPE_VOID as placeholder base
+            //
+            let result = self.parse_declarator(TYPE_VOID)?;
+            self.expect(TK::RParen, "')'")?;
+
+            (Some(result.0), result.1)
+        } else {
+            //
+            // Direct name or anonymous
+            //
+            let name = if self.current_token.kind == TK::Ident
+                && !HASHES_THAT_START_TYPES.contains(&self.current_token.hash)
+            {
+                Some(self.next())
+            } else {
+                None
+            };
+
+            (None, name)
+        };
+
+        //
+        // Before building the suffix, apply the pointer chain to base_ty
+        // so that `void *` becomes the return type, not a wrapper around the func type.
+        //
+        let mut pointed_base = base_ty;
+        for &ptr_quals in ptr_chain.iter().rev() {
+            pointed_base = self.types.intern(
+                TypeKind::Ptr,
+                ptr_quals,
+                TypeFlags::empty(),
+                pointed_base,
+                0, 0
+            );
         }
 
-        Ok(ty)
+        let mut saved_params = None;
+
+        //
+        // Suffix: array dims or function params - applied to base_ty
+        //
+        let ty = if self.current_token.kind == TK::LParen {
+            //
+            // Function declarator suffix
+            //
+
+            self.next(); // (
+            let (params, is_variadic) = self.compile_params()?;
+            self.expect(TK::RParen, "')'")?;
+
+            let param_types = params.iter()
+                .map(|(ty, ..)| *ty)
+                .collect::<SmallVec<[_; MAX_PARAMS]>>();
+
+            let param_start = self.types.alloc_params(&param_types);
+            let param_count = params.len() as _;
+
+            saved_params = Some(params);
+
+            self.types.make_func(pointed_base, param_start, param_count, is_variadic)
+        } else if self.current_token.kind == TK::LSquare {
+            self.next(); // [
+
+            if self.current_token.kind == TK::RSquare {
+                // int arr[]
+
+                self.next(); // ]
+                self.types.array_of(pointed_base, 0)
+            } else if self.current_token.kind == TK::Number
+                || !self.is_hash_a_local_or_a_global(self.current_token.hash)
+            {
+                // int arr[1]
+
+                let len = self.try_parse_and_eval_const_int()? as u32;
+                self.expect(TK::RSquare, "']'")?;
+                let ty = self.types.array_of(pointed_base, len);
+                self.compile_array_dim_loop(ty)?
+            } else {
+                // int n = 10;
+                // int arr[n];
+
+                //
+                // No VLAs in global context!
+                //
+                if self.in_global_context {
+                    return Err(CError::VlaInGlobalContext { span: self.current_token.span });
+                }
+
+                self.compile_expr_no_comma()?;
+                self.expect(TK::RSquare, "']'")?;
+
+                let (r, _) = self.pop_reg()?;
+                let dim_off = self.locals.alloc_vla(HASH_HIDDEN_LOCAL, TYPE_LONG);
+                self.buf.mov_store(Reg::Rbp, dim_off, r, true);
+                self.regs.free(r);
+
+                let ty = self.types.alloc_fresh(
+                    TypeKind::Array, QualFlags::empty(), TypeFlags::empty(),
+                    pointed_base, 0, dim_off as u32
+                );
+                self.compile_array_dim_loop(ty)?
+            }
+        } else {
+            pointed_base
+        };
+
+        //
+        // Patch grouped declarator: replace TYPE_VOID placeholder with ty
+        //
+        let ty = if let Some(inner_ty) = inner {
+            self.patch_declarator_base(inner_ty, ty)
+        } else {
+            ty
+        };
+
+        Ok((ty, name_tok, saved_params))
+    }
+
+    /// Replace TYPE_VOID placeholder leaves (from grouped declarator parsing)
+    /// with real_base throughout the type chain.
+    #[inline]
+    fn patch_declarator_base(&mut self, ty: TypeRef, real_base: TypeRef) -> TypeRef {
+        if ty == TYPE_VOID { return real_base; }
+
+        match self.get_kind(ty) {
+            TypeKind::Ptr => {
+                let e = *self.types.get(ty);
+                let patched = self.patch_declarator_base(e.ref_, real_base);
+                self.types.intern(TypeKind::Ptr, e.quals, TypeFlags::empty(), patched, 0, 0)
+            }
+
+            TypeKind::Array => {
+                let e = *self.types.get(ty);
+                let patched = self.patch_declarator_base(e.elem(), real_base);
+                if e.is_vla() {
+                    self.types.alloc_fresh(
+                        TypeKind::Array, e.quals, e.flags,
+                        patched, 0, e.extra2
+                    )
+                } else {
+                    self.types.array_of(patched, e.array_len())
+                }
+            }
+
+            TypeKind::Func => {
+                let e = *self.types.get(ty);
+                let patched_ret = self.patch_declarator_base(e.ret_ty(), real_base);
+                self.types.make_func(
+                    patched_ret, e.param_start(), e.param_count(),
+                    e.flags.contains(TypeFlags::VARIADIC)
+                )
+            }
+
+            _ => ty
+        }
     }
 
     // Materialize a CValue into a register
@@ -5122,11 +5395,10 @@ impl Compiler {
             return Ok(());
         }
 
-        let mut top_flags = TopLevelFlags::empty();
-
         //
         // Consume specifiers
         //
+        let mut top_flags = TopLevelFlags::empty();
         loop {
             match self.current_token.hash {
                 HASH_EXTERN => { top_flags.insert(TopLevelFlags::EXTERN); self.next(); }
@@ -5136,67 +5408,59 @@ impl Compiler {
             }
         }
 
-        let ret_ty   = self.compile_type()?;
-        let name_tok = self.eat_ident("function or variable name")?;
-        let hash     = name_tok.hash;
-
-        if self.current_token.kind != TK::LParen {
-            //
-            // @Cold
-            //
-
-            self.compile_global_decl(
-                ret_ty,
-                name_tok,
-                top_flags.contains(TopLevelFlags::EXTERN),
-                top_flags.contains(TopLevelFlags::STATIC),
-            )?;
-            return Ok(());
-        }
-
-        self.next(); // '('
-        let (params, is_variadic) = self.compile_params()?;
-        self.expect(TK::RParen, "')'")?;
+        let base_ty = self.compile_base_type()?;
+        let (decl_ty, name_tok_opt, params_opt) = self.parse_declarator_impl(base_ty)?;
+        let name_tok = name_tok_opt.ok_or_else(|| CError::Expected {
+            span: self.current_token.span,
+            expected: "function or variable name",
+            got: self.s(self.current_token).to_owned(),
+        })?;
 
         let mut flags = SymFlags::empty();
-        flags.set(SymFlags::VARIADIC, is_variadic);
+        if top_flags.contains(TopLevelFlags::STATIC) { flags.insert(SymFlags::STATIC); }
+        if top_flags.contains(TopLevelFlags::EXTERN) { flags.insert(SymFlags::EXTERN); }
 
-        if top_flags.contains(TopLevelFlags::STATIC) { flags.insert(SymFlags::STATIC) };
-        if top_flags.contains(TopLevelFlags::EXTERN) { flags.insert(SymFlags::EXTERN) };
+        if let Some(params) = params_opt {
+            //
+            // Function declaration
+            //
 
-        let param_types = params.iter().map(|(ty, ..)| *ty).collect::<SmallVec<[_; MAX_PARAMS]>>();
-        let param_start = self.types.alloc_params(&param_types);
+            let func_ty = decl_ty;
+            let is_variadic = self.types.get(func_ty).flags.contains(TypeFlags::VARIADIC);
 
-        let func_ty = self.types.make_func(ret_ty, param_start, params.len() as _, is_variadic);
+            flags.set(SymFlags::VARIADIC, is_variadic);
 
-        if flags.contains(SymFlags::EXTERN) || self.current_token.kind == TK::SemiColon {
-            self.expect(TK::SemiColon, "';'")?;
+            if self.current_token.kind == TK::SemiColon {
+                self.expect(TK::SemiColon, "';'")?;
+                let name: SmallString<[_; 24]> = name_tok.s(&self.src_arena).into();
+                flags.insert(SymFlags::EXTERN);  // Forward declaration should always be extern.
+                self.syms.insert(&name, 0, 0, flags, Some(func_ty));
+                return Ok(());
+            }
 
-            let name: SmallString<[_; 24]> = name_tok.s(&self.src_arena).into(); // @Borrow
-            self.syms.insert(&name, 0, 0, flags, Some(func_ty));
-
-            return Ok(());
+            flags.insert(SymFlags::DEFINED);
+            return self.compile_func(name_tok.span, name_tok.hash, func_ty, params, flags);
         }
 
-        flags.insert(SymFlags::DEFINED);
-        self.compile_func(name_tok.span, hash, ret_ty, func_ty, params, flags)
+        //
+        // Global variable
+        //
+
+        self.compile_global_decl(
+            decl_ty, name_tok,
+            top_flags.contains(TopLevelFlags::EXTERN),
+            top_flags.contains(TopLevelFlags::STATIC)
+        )
     }
 
     fn compile_func(
         &mut self,
         name_span: Span,
-        _hash: u64,
-        ret_ty: TypeRef,
+        hash: u64,
         func_ty: TypeRef,
         params: Vec<(TypeRef, u64, Span)>,
-        flags: SymFlags
+        flags: SymFlags,
     ) -> CResult<()> {
-        self.locals = LocalTable::new();
-        self.regs   = RegAlloc::new();
-        self.ret_ty = ret_ty;
-        self.vla_sizes = Default::default();
-        self.in_global_context = false;
-
         let code_off = self.buf.pos() as u32;
         let mut code_len = 0;
 
@@ -5206,13 +5470,41 @@ impl Compiler {
         // Store code length as 0 for now (patch up later)
         //
 
-        let sym_index = self.syms.insert(
-            &name,
-            code_off,
-            code_len,
-            flags,
-            Some(func_ty)
-        );
+        let (sym_index, func_ty) = if let Some(forward_declaration_symbol_index) = self.syms.find(hash) {
+            // @Incomplete
+            // TODO: Verify that func's forward decl and definition signatures match
+
+            self.syms.patch_forward_declaration(
+                forward_declaration_symbol_index,
+                code_off, code_len, flags
+            );
+
+            let forward_func_ty = self.syms[forward_declaration_symbol_index].func_ty;
+            self.types.patch_func_forward_decl(
+                forward_func_ty,
+                if flags.contains(SymFlags::VARIADIC) { TypeFlags::VARIADIC } else { TypeFlags::empty() }
+            );
+
+            (forward_declaration_symbol_index, forward_func_ty)
+        } else {
+            let sym_index = self.syms.insert(
+                &name,
+                code_off,
+                code_len,
+                flags,
+                Some(func_ty)
+            );
+
+            (sym_index, func_ty)
+        };
+
+        let ret_ty = self.types.get(func_ty).ret_ty();
+
+        self.locals = LocalTable::new();
+        self.regs   = RegAlloc::new();
+        self.ret_ty = ret_ty;
+        self.vla_sizes = Default::default();
+        self.in_global_context = false;
 
         //
         // Prologue
@@ -5224,6 +5516,7 @@ impl Compiler {
 
         let mut argc     = 0usize;
         let mut xmm_argc = 0usize;
+        let mut stack_param_off = 16i32; // rbp+0 = saved rbp, rbp+8 = return addr, rbp+16 = first stack param
 
         //
         //
@@ -5264,11 +5557,13 @@ impl Compiler {
                     // Param arrived as pointer in integer reg - copy into local
                     //
 
-                    let ptr_r = ARG_REGS[argc];
-                    argc += 1;
+                    let size = self.types.size_of(param_ty) as i32;
+                    let aligned = (size + 15) & !15;
 
-                    let ptr_off = self.locals.alloc_indirect(param_hash, param_ty);
-                    self.buf.mov_store(Reg::Rbp, ptr_off, ptr_r, true);
+                    let off = self.locals.alloc(param_hash, param_ty, &self.types);
+                    self.emit_struct_copy(Reg::Rbp, off, Reg::Rbp, stack_param_off, size)?;
+
+                    stack_param_off += aligned;
                 } else {
                     //
                     // Param arrived in registers - unpack into local
@@ -5324,56 +5619,31 @@ impl Compiler {
     #[inline]
     fn compile_params(&mut self) -> CResult<(Vec<(TypeRef, u64, Span)>, bool)> {
         let mut params = Vec::new();
+
         if self.current_token.kind == TK::RParen {
             return Ok((params, false));
         }
-
-        if self.current_token.hash == HASH_VOID &&
-           self.next_token.kind    == TK::RParen
-        {
-            self.next(); return Ok((params, false));
+        if self.current_token.hash == HASH_VOID && self.next_token.kind    == TK::RParen {
+            self.next();
+            return Ok((params, false));
         }
 
         let mut variadic = false;
         loop {
-            let ty   = self.compile_type()?;
-            let (hash, span) = if self.current_token.kind == TK::Ident {
-                let t = self.next();
-                (t.hash, t.span)
-            } else {
-                (0, Span::POISONED)
-            };
+            let base = self.compile_base_type()?;
+            let (ty, name_tok) = self.parse_declarator(base)?;
 
-            //
-            // Array @Declarator on parameter: char[N] or char arr[N]
-            //
-            let ty = if self.current_token.kind == TK::LSquare {
-                self.next(); // [
-                if self.current_token.kind == TK::RSquare {
-                    self.next();
-
-                    // char[] param - decays to char*
-                    self.types.ptr_to(ty)
-                } else {
-                    // char[N] - consume the size expr, still decays to char *
-                    // just skip the expression... Sigh.......
-                    let mut depth = 0;
-                    loop {
-                        match self.current_token.kind {
-                            TK::LSquare => { depth += 1; self.next(); }
-                            TK::RSquare if depth > 0 => { depth -= 1; self.next(); }
-                            TK::RSquare => { self.next(); break; }
-                            TK::Eof => break,
-                            _ => { self.next(); }
-                        }
-                    }
-
-                    self.types.ptr_to(ty)
-                }
+            // Array params decay to pointer
+            let ty = if self.types.get_kind(ty) == TypeKind::Array {
+                self.types.ptr_to(self.types.get(ty).elem())
             } else {
                 ty
             };
 
+            let (hash, span) = match name_tok {
+                Some(t) => (t.hash, t.span),
+                None    => (0, Span::POISONED),
+            };
             params.push((ty, hash, span));
 
             if self.current_token.kind != TK::Comma { break; }
@@ -5547,16 +5817,11 @@ impl Compiler {
 
     fn compile_while(&mut self) -> CResult<()> {
         self.next(); // while
-        self.expect(TK::LParen, "'('")?;
 
         //
         // Collect cond tokens
         //
-        let mut cond_toks = Vec::new();
-        while self.current_token.kind != TK::RParen && !self.at_eof() {
-            cond_toks.push(self.next());
-        }
-        self.expect(TK::RParen, "')'")?;
+        let (_, cond_toks) = self.collect_tokens_inside_parens()?;
 
         //
         // Jmp to cond
@@ -5753,6 +6018,21 @@ impl Compiler {
     }
 
     #[inline]
+    fn emit_extend(&mut self, r: Reg, from_size: u32, to_size: u32, is_signed: bool) {
+        match (from_size, to_size, is_signed) {
+            (1, _, true)  => self.buf.movsx_r8(r, r),
+            (2, _, true)  => self.buf.movsx_r16(r, r),
+            (4, 8, true)  => self.buf.movsxd(r, r),
+            (1, _, false) => self.buf.movzx_r8(r, r),
+            (2, _, false) => self.buf.movzx_r16(r, r),
+            (4, 8, false) => {} // mov r32, r32 is a no-op since mov_rr skips dst==src,
+            // but zero-extension is implicit on x86-64 for any 32-bit write
+            // so just leave the value as-is
+            _ => {}
+        }
+    }
+
+    #[inline]
     fn emit_store_impl(&mut self, base: Reg, off: i32, ty: TypeRef, keep: bool) -> CResult<()> {
         if matches!(self.get_kind(ty), TypeKind::Struct | TypeKind::Union) {
             let v = self.vstack.pop();
@@ -5824,43 +6104,24 @@ impl Compiler {
     fn compile_typedef(&mut self) -> CResult<()> {
         self.next(); // typedef
 
-        let base_ty = self.compile_type()?;
+        let base_ty = self.compile_base_type()?;
+
         if self.current_token.kind == TK::SemiColon {
             emit_diag_warning("typedef requires a name", self.current_token.span, &self.src_arena);
             self.next();
             return Ok(());
         }
 
-        let name = self.eat_ident("ident")?;
-
-        // @Declarator
-        let ty = if self.current_token.kind == TK::LSquare {
-            self.next(); // [
-            let len = self.try_parse_and_eval_const_int()? as u32;
-            self.expect(TK::RSquare, "']'")?;
-            self.parse_array_dims(base_ty, len)?
-        } else if self.current_token.kind == TK::LParen {
-            //
-            // Function type typedef: typedef ret_ty name(params);
-            //
-
-            self.next(); // (
-            let (params, is_variadic) = self.compile_params()?;
-            self.expect(TK::RParen, "')'")?;
-
-            let param_types = params.iter()
-                .map(|(ty, ..)| *ty)
-                .collect::<SmallVec<[_; MAX_PARAMS]>>();
-            let param_start = self.types.alloc_params(&param_types);
-
-            self.types.make_func(base_ty, param_start, params.len() as _, is_variadic)
-        } else {
-            base_ty
-        };
+        let (ty, name_tok) = self.parse_declarator(base_ty)?;
+        let name_tok = name_tok.ok_or_else(|| CError::Expected {
+            span: self.current_token.span,
+            expected: "typedef name",
+            got: self.s(self.current_token).to_owned(),
+        })?;
 
         self.expect(TK::SemiColon, "';'")?;
 
-        self.typedefs.insert(name.hash, ty);
+        self.typedefs.insert(name_tok.hash, ty);
 
         if matches!(
             self.get_kind(ty),
@@ -5870,7 +6131,7 @@ impl Compiler {
             // @Note: See typenames note in TypeTable's struct definition.
             //
 
-            let name: SmallString<_> = name.s(&self.src_arena).into();
+            let name: SmallString<_> = name_tok.s(&self.src_arena).into();
             self.types.set_type_name(ty, name);
         }
 
@@ -5879,38 +6140,32 @@ impl Compiler {
 
     fn compile_global_decl(
         &mut self,
-        base_ty: TypeRef,
+        first_ty: TypeRef,
         first_name_tok: Token,
         is_extern: bool,
         is_static: bool,
     ) -> CResult<()> {
+        let mut ty       = first_ty;
         let mut name_tok = first_name_tok;
-        loop {
-            let name: SmallString<[_; 24]> = name_tok.s(&self.src_arena).into(); // @Borrow
-            let hash = name_tok.hash;
 
-            //
-            // Parse @Declarator dims after the name (lengths must be const integers)
-            //
-            let ty = if self.current_token.kind == TK::LSquare {
-                self.next(); // [
-                if self.current_token.kind == TK::RSquare {
-                    self.next();
-                    self.types.array_of(base_ty, 0)
-                } else {
-                    let len = self.try_parse_and_eval_const_int()? as u32;
-                    self.expect(TK::RSquare, "']'")?;
-                    self.parse_array_dims(base_ty, len)?
-                }
-            } else {
-                base_ty
-            };
+        loop {
+            let name: SmallString<[_; 24]> = name_tok.s(&self.src_arena).into();
+            let hash = name_tok.hash;
 
             self.compile_global_decl_impl(ty, &name, hash, is_extern, is_static)?;
 
             if self.current_token.kind != TK::Comma { break; }
             self.next(); // ,
-            name_tok = self.eat_ident("variable name")?;
+
+            // Parse the next declarator in the comma list
+            // base type is already known - parse_declarator gives us name + type modifier
+            let (next_ty, next_name_opt) = self.parse_declarator(first_ty)?;
+            name_tok = next_name_opt.ok_or_else(|| CError::Expected {
+                span: self.current_token.span,
+                expected: "variable name",
+                got: self.s(self.current_token).to_owned(),
+            })?;
+            ty = next_ty;
         }
 
         self.expect(TK::SemiColon, "';'").map(|_| ())
@@ -6121,7 +6376,7 @@ impl Compiler {
     }
 
     #[inline]
-    fn collect_brace_initializer(&mut self) -> CResult<(u32, Vec<Token>)> {
+    fn collect_tokens_inside_curlies(&mut self) -> CResult<(u32, Vec<Token>)> {
         let mut toks = Vec::new();
         toks.push(self.expect(TK::LCurly, "'{'")?);
 
@@ -6135,6 +6390,33 @@ impl Compiler {
                 TK::LCurly => { depth += 1; toks.push(self.next()); }
                 TK::RCurly if depth > 1 => { depth -= 1; toks.push(self.next()); }
                 TK::RCurly => { toks.push(self.next()); break; }
+                TK::Comma if depth == 1 => { expect_val = true; toks.push(self.next()); }
+                TK::Eof => break,
+                _ => {
+                    if expect_val && depth == 1 { count += 1; expect_val = false; }
+                    toks.push(self.next());
+                }
+            }
+        }
+
+        Ok((count, toks))
+    }
+
+    #[inline]
+    fn collect_tokens_inside_parens(&mut self) -> CResult<(u32, Vec<Token>)> {
+        let mut toks = Vec::new();
+        toks.push(self.expect(TK::LParen, "'('")?);
+
+        let mut depth  = 1usize;
+        let mut count  = 0u32;
+        let mut expect_val = true;
+
+        loop {
+            let t = self.current_token;
+            match t.kind {
+                TK::LParen => { depth += 1; toks.push(self.next()); }
+                TK::RParen if depth > 1 => { depth -= 1; toks.push(self.next()); }
+                TK::RParen => { toks.push(self.next()); break; }
                 TK::Comma if depth == 1 => { expect_val = true; toks.push(self.next()); }
                 TK::Eof => break,
                 _ => {
@@ -6265,7 +6547,7 @@ impl Compiler {
         }
 
         // Collect initializer tokens to count and replay
-        let (elem_count, toks) = self.collect_brace_initializer()?;
+        let (elem_count, toks) = self.collect_tokens_inside_curlies()?;
 
         let real_ty = self.types.array_of(ty, elem_count);
         let off = self.locals.alloc(name_tok.hash, real_ty, &self.types);
@@ -6328,27 +6610,6 @@ impl Compiler {
         self.accumulate_vla_size(elem, acc, span)
     }
 
-    /// Parse `[len][len]...` dimensions (all must be constant expressions).
-    /// Caller has already consumed the first `[` and verified it's not `[]` or VLA.
-    #[inline]
-    fn parse_array_dims(&mut self, base_ty: TypeRef, first_len: u32) -> CResult<TypeRef> {
-        let mut dims: SmallVec<[_; 4]> = smallvec![first_len];
-        while self.current_token.kind == TK::LSquare {
-            self.next(); // [
-            let len = self.try_parse_and_eval_const_int()? as u32;
-            self.expect(TK::RSquare, "']'")?;
-            dims.push(len);
-        }
-
-        // Build inside-out: rightmost is innermost
-        let mut ty = base_ty;
-        for &len in dims.iter().rev() {
-            ty = self.types.array_of(ty, len);
-        }
-
-        Ok(ty)
-    }
-
     #[inline]
     fn finish_vla_local_decl(&mut self, outermost_ty: TypeRef, name_tok: Token) -> CResult<()> {
         if self.current_token.kind == TK::Eq {
@@ -6389,7 +6650,7 @@ impl Compiler {
 
     #[inline]
     fn compile_local_decl(&mut self) -> CResult<()> {
-        let base_ty = self.compile_type()?;
+        let base_ty = self.compile_base_type()?;
         loop {
             self.compile_local_decl_impl(base_ty)?;
             if self.current_token.kind != TK::Comma { break; }
@@ -6402,61 +6663,29 @@ impl Compiler {
 
     #[inline]
     fn compile_local_decl_impl(&mut self, base_ty: TypeRef) -> CResult<()> {
-        let name_tok = self.eat_ident("variable name")?;
+        let (ty, name_tok) = self.parse_declarator(base_ty)?;
+        let name_tok = name_tok.ok_or_else(|| CError::Expected {
+            span: self.current_token.span,
+            expected: "variable name",
+            got: self.s(self.current_token).to_owned(),
+        })?;
 
-        //
-        // Array @Declarator dims after the name
-        //
+        // Inferred array: int arr[] = {...}
+        if self.types.get_kind(ty) == TypeKind::Array
+            && self.types.get(ty).array_len() == 0
+            && self.current_token.kind == TK::Eq
+        {
+            self.next(); // =
+            return self.compile_inferred_array_length_local_decl(
+                self.types.get(ty).elem(), name_tok
+            );
+        }
 
-        let ty = if self.current_token.kind == TK::LSquare {
-            self.next(); // [
-            if self.current_token.kind == TK::RSquare {
-                // int arr[] = {...}
-                self.next();
-                self.expect(TK::Eq, "'='")?;
-                return self.compile_inferred_array_length_local_decl(base_ty, name_tok);
-            }
-
-            //
-            // Parse first dim then loop for the rest
-            //
-
-            if self.current_token.kind == TK::Number || !self.is_hash_a_local_or_a_global(self.current_token.hash) {
-                let len = self.try_parse_and_eval_const_int()? as u32;
-                self.expect(TK::RSquare, "']'")?;
-
-                let ty = self.types.array_of(base_ty, len);
-                self.compile_array_dim_loop(ty)?
-            } else {
-                //
-                // First dim is a VLA
-                //
-
-                self.compile_expr_no_comma()?;
-                self.expect(TK::RSquare, "']'")?;
-
-                let (r, _) = self.pop_reg()?;
-                let dim_off = self.locals.alloc_vla(HASH_HIDDEN_LOCAL, TYPE_LONG);
-                self.buf.mov_store(Reg::Rbp, dim_off, r, true);
-                self.regs.free(r);
-
-                let ty = self.types.alloc_fresh(
-                    TypeKind::Array, QualFlags::empty(), TypeFlags::empty(),
-                    base_ty, 0, dim_off as u32
-                );
-                self.compile_array_dim_loop(ty)?
-            }
-        } else {
-            base_ty
-        };
-
-        // VLA
         if self.types.get(ty).is_vla() {
             return self.finish_vla_local_decl(ty, name_tok);
         }
 
-        let hash = name_tok.hash;
-        let off  = self.locals.alloc(hash, ty, &self.types);
+        let off = self.locals.alloc(name_tok.hash, ty, &self.types);
         if self.current_token.kind == TK::Eq {
             self.next();
             if self.types.get_kind(ty) == TypeKind::Array {
@@ -6515,7 +6744,7 @@ impl Compiler {
     #[inline]
     fn compile_expr_impl(&mut self, min_prec: u8) -> CResult<()> {
         match self.current_token.kind {
-            TK::Minus | TK::BinAnd | TK::Star | TK::BitNot | TK::PlusPlus | TK::MinusMinus
+            TK::Minus | TK::BinAnd | TK::Not | TK::Star | TK::BitNot | TK::PlusPlus | TK::MinusMinus
                 => self.compile_unary()?,
             _   => self.compile_primary()?,
         }
@@ -7109,6 +7338,18 @@ impl Compiler {
                 self.vstack.push(CValue::gp(ty, r));
             }
 
+            TK::Not => {
+                self.next();
+                self.compile_unary()?;
+                let (r, _) = self.pop_reg()?;
+                self.buf.test_rr(r);
+                self.regs.free(r);
+                let dst = self.regs.alloc(Span::POISONED)?;
+                self.buf.setcc(dst, 0x94); // sete - true if zero
+                self.buf.movzx_rr(dst, dst);
+                self.vstack.push(CValue::gp(TYPE_INT, dst));
+            }
+
             TK::PlusPlus | TK::MinusMinus => {
                 let op = self.current_token.kind;
                 self.next();
@@ -7329,6 +7570,93 @@ impl Compiler {
         })
     }
 
+    fn emit_cast(&mut self, v: CValue, to: TypeRef) -> CResult<()> {
+        let from = v.ty;
+
+        // Same type - no-op
+        if from == to {
+            self.vstack.push(v);
+            return Ok(());
+        }
+
+        let from_kind = self.get_kind(from);
+        let to_kind   = self.get_kind(to);
+
+        match (from_kind, to_kind) {
+            // int -> int: sign/zero extend or truncate
+            (TypeKind::Int | TypeKind::Char | TypeKind::Short | TypeKind::Long | TypeKind::LLong,
+             TypeKind::Int | TypeKind::Char | TypeKind::Short | TypeKind::Long | TypeKind::LLong) => {
+                let r = self.force_gp(v)?;
+                let to_size   = self.types.size_of(to);
+                let from_size = self.types.size_of(from);
+                let is_signed = !self.types.get(from).quals.contains(QualFlags::UNSIGNED);
+                if to_size > from_size {
+                    self.emit_extend(r, from_size, to_size, is_signed);
+                }
+                // truncation is a no-op on x86-64, the upper bits just get ignored
+                self.vstack.push(CValue::gp(to, r));
+            }
+
+            // int -> float
+            (TypeKind::Int | TypeKind::Long | TypeKind::LLong,
+             TypeKind::Float | TypeKind::Double) => {
+                let r = self.force_gp(v)?;
+                let xmm = self.xmms.alloc(Span::POISONED)?;
+                if to_kind == TypeKind::Float {
+                    self.buf.cvtsi2ss(xmm, r);
+                } else {
+                    self.buf.cvtsi2sd(xmm, r);
+                }
+                self.regs.free(r);
+                self.vstack.push(CValue::xmm(to, xmm));
+            }
+
+            // float -> int
+            (TypeKind::Float | TypeKind::Double,
+             TypeKind::Int | TypeKind::Long | TypeKind::LLong) => {
+                let xmm = self.force_xmm(v)?;
+                let r = self.regs.alloc(Span::POISONED)?;
+                if from_kind == TypeKind::Float {
+                    self.buf.cvttss2si(r, xmm);
+                } else {
+                    self.buf.cvttsd2si(r, xmm);
+                }
+                self.xmms.free(xmm);
+                self.vstack.push(CValue::gp(to, r));
+            }
+
+            // float <-> float
+            (TypeKind::Float, TypeKind::Double) => {
+                let xmm = self.force_xmm(v)?;
+                self.buf.cvtss2sd(xmm, xmm);
+                self.vstack.push(CValue::xmm(to, xmm));
+            }
+            (TypeKind::Double, TypeKind::Float) => {
+                let xmm = self.force_xmm(v)?;
+                self.buf.cvtsd2ss(xmm, xmm);
+                self.vstack.push(CValue::xmm(to, xmm));
+            }
+
+            // ptr -> ptr, ptr -> int, int -> ptr: just retag
+            (TypeKind::Ptr, TypeKind::Ptr) |
+            (TypeKind::Ptr, TypeKind::Int) | (TypeKind::Ptr, TypeKind::Long) | (TypeKind::Ptr, TypeKind::LLong) |
+            (TypeKind::Int, TypeKind::Ptr) | (TypeKind::Long, TypeKind::Ptr) | (TypeKind::LLong, TypeKind::Ptr) => {
+                let r = self.force_gp(v)?;
+                self.vstack.push(CValue::gp(to, r));
+            }
+
+            // void cast - evaluate for side effects, discard
+            (_, TypeKind::Void) => {
+                self.force_gp(v)?; // materialize and discard
+                // push nothing, or a sentinel void value if your vstack needs it
+            }
+
+            _ => todo!() // nocheckin
+        }
+
+        Ok(())
+    }
+
     fn compile_primary(&mut self) -> CResult<()> {
         match self.current_token.kind {
             TK::Number => {
@@ -7429,6 +7757,24 @@ impl Compiler {
                 };
 
                 self.vstack.push(CValue::imm(TYPE_INT, val));
+            }
+
+            TK::LParen if self.can_hash_start_a_type(self.next_token.hash) => {
+                self.next(); // (
+
+                let cast_ty = self.compile_type()?;
+                self.expect(TK::RParen, "')'")?;
+
+                self.compile_unary()?;
+
+                let v = self.vstack.pop();
+                self.emit_cast(v, cast_ty)?;
+            }
+
+            TK::LParen => {
+                self.next();
+                self.compile_expr()?;
+                self.expect(TK::RParen, "')'")?;
             }
 
             TK::Ident => {
@@ -7541,12 +7887,6 @@ impl Compiler {
                         name: self.s(name_tok).to_owned()
                     });
                 }
-            }
-
-            TK::LParen => {
-                self.next();
-                self.compile_expr()?;
-                self.expect(TK::RParen, "')'")?;
             }
 
             other => {
@@ -7864,7 +8204,7 @@ impl Compiler {
                 v.ty  // variadic, use value type
             };
 
-            let spill_off = self.locals.alloc(0, declared_ty, &self.types);
+            let spill_off = self.locals.alloc(HASH_HIDDEN_LOCAL, declared_ty, &self.types);
 
             self.vstack.push(v);  // emit_store pops from vstack
             self.emit_store(Reg::Rbp, spill_off, declared_ty)?;
@@ -7908,6 +8248,7 @@ impl Compiler {
         //
         let mut argc     = 0usize;
         let mut xmm_argc = 0usize;
+        let mut stack_bytes_pushed = 0i32;
 
         //
         // Handle struct return
@@ -7944,7 +8285,7 @@ impl Compiler {
                 // Struct argument
                 //
 
-                self.pass_struct_arg(
+                stack_bytes_pushed += self.pass_struct_arg(
                     spill_off, ty,
                     &mut argc, &mut xmm_argc,
                     call_span, arg_span,
@@ -8016,6 +8357,10 @@ impl Compiler {
 
         self.regs.clobber_caller_save();
         self.xmms.clobber_caller_save();
+
+        if stack_bytes_pushed > 0 {
+            self.buf.add_ri32(Reg::Rsp, stack_bytes_pushed);
+        }
 
         if let Some((ret_off, is_memory)) = struct_ret_off {
             if !is_memory {
@@ -8193,25 +8538,19 @@ impl Compiler {
         // For errors
         call_span: Span,
         arg_span: Span,
-    ) -> CResult<()> {
+    ) -> CResult<i32> {
         let classes = self.classify_struct(ty);
 
         if classes[0] == SysVClass::Memory {
             //
-            // Pass pointer to the spilled copy (C value semantics)
+            // Copy the struct to the stack space
             //
 
-            if *argc >= ARG_REGS.len() {
-                return Err(CError::ArgumentCountMismatch {
-                    span: call_span,
-                    expected: ARG_REGS.len(),
-                    name: arg_span.s(&self.src_arena).to_owned()
-                });
-            }
-            self.buf.lea(ARG_REGS[*argc], Reg::Rbp, spill_off);
-            *argc += 1;
-
-            return Ok(());
+            let size = self.types.size_of(ty) as i32;
+            let aligned = (size + 15) & !15;
+            self.buf.sub_rsp(aligned);
+            self.emit_struct_copy(Reg::Rsp, 0, Reg::Rbp, spill_off, size)?;
+            return Ok(aligned);
         }
 
         let size = self.types.size_of(ty);
@@ -8261,7 +8600,7 @@ impl Compiler {
             }
         }
 
-        Ok(())
+        Ok(0)
     }
 }
 
@@ -8527,7 +8866,7 @@ fn main() {
         .position(|s| s == "-o")
         .and_then(|i| args.get(i+1)).map(|s| s.as_str()).unwrap_or("out.o");
 
-    let mut pp = match PP::from_path(Path::new(&args[1])) {
+    let mut pp = match PP::new(Path::new(&args[1]), &args[1..]) {
         Ok(pp) => pp,
         Err(e) => { e.emit(&SrcArena::new()); std::process::exit(1); }
     };
@@ -8543,18 +8882,6 @@ fn main() {
                 (def, "1")
             };
             pp.define_simple(name, val);
-        }
-
-        //
-        // -Iinclude or -I=BAR args
-        //
-        if let Some(include) = arg.strip_prefix("-I") {
-            let path = if let Some(eq) = include.find('=') {
-                &include[eq+1..]
-            } else {
-                &include
-            };
-            pp.include_dirs.push(path.into());
         }
     }
 
