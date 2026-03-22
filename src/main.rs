@@ -2769,6 +2769,11 @@ impl TypeTable {
     }
 
     #[inline]
+    pub fn get_field_from_start(&self, start: u32, field_index: u32) -> &FieldEntry {
+        &self.field_pool[start as usize + field_index as usize]
+    }
+
+    #[inline]
     pub fn get(&self, id: TypeRef) -> &TypeEntry {
         &self.entries[id]
     }
@@ -6183,8 +6188,11 @@ impl Compiler {
             if self.current_token.kind != TK::Comma { break; }
             self.next(); // ,
 
+            //
             // Parse the next declarator in the comma list
             // base type is already known - parse_declarator gives us name + type modifier
+            //
+
             let (next_ty, next_name_opt) = self.parse_declarator(first_ty)?;
             name_tok = next_name_opt.ok_or_else(|| CError::Expected {
                 span: self.current_token.span,
@@ -6246,7 +6254,18 @@ impl Compiler {
             return Ok(())
         }
 
-        self.next();
+        self.next(); // =
+
+        // Strip compound literal prefix: (Type){...} → {..}
+        if self.current_token.kind == TK::LParen
+            && self.can_hash_start_a_type(self.next_token.hash)
+        {
+            self.next(); // (
+            let _ = self.compile_type()?;
+            if self.current_token.kind == TK::RParen {
+                self.next(); // )
+            }
+        }
 
         //
         // Constant initializer only (@Incomplete: Check for that)
@@ -6387,6 +6406,57 @@ impl Compiler {
                 return Ok(());
             }
 
+            TypeKind::Struct | TypeKind::Union => {
+                let off = self.data.len() as u32;
+                let size = self.types.size_of(ty_ref) as usize;
+
+                // Reserve space
+                let start = self.data.len();
+                self.data.resize(start + size, 0u8);
+
+                self.expect(TK::LCurly, "'{'")?;
+
+                let e = self.types.get(ty_ref);
+                let (fstart, count) = (e.field_start(), e.field_count());
+                let mut i = 0usize;
+
+                while self.current_token.kind != TK::RCurly && !self.at_eof() {
+                    if i < count as usize {
+                        let field = *self.types.get_field_from_start(fstart, i as _);
+                        let field_off = field.offset as usize;
+                        let field_sz  = self.types.size_of(field.ty) as usize;
+
+                        match self.get_kind(field.ty) {
+                            TypeKind::Float | TypeKind::Double => {
+                                let v = self.try_parse_eval_const_float()?;
+                                let bytes = match self.get_kind(field.ty) {
+                                    TypeKind::Float => (v as f32).to_bits().to_le_bytes().to_vec(),
+                                    _               => v.to_bits().to_le_bytes().to_vec(),
+                                };
+                                self.data[start + field_off..start + field_off + field_sz]
+                                    .copy_from_slice(&bytes);
+                            }
+                            _ => {
+                                let v = self.try_parse_and_eval_const_int()?;
+                                let bytes = v.to_le_bytes();
+                                self.data[start + field_off..start + field_off + field_sz]
+                                    .copy_from_slice(&bytes[..field_sz]);
+                            }
+                        }
+                        i += 1;
+                    } else {
+                        // Too many - skip
+                        self.try_parse_and_eval_const_int()?;
+                    }
+
+                    if self.current_token.kind == TK::Comma { self.next(); }
+                }
+
+                self.expect(TK::RCurly, "'}'")?;
+                self.globals.insert(name, hash, ty_ref, off, false, is_static);
+                return Ok(());
+            }
+
             _ => {  // @Incomplete: Just skip this one
                 while !matches!( // @Cutnpaste from above
                     self.current_token.kind,
@@ -6454,6 +6524,73 @@ impl Compiler {
         }
 
         Ok((count, toks))
+    }
+
+    fn compile_initializer(&mut self, base_off: i32, ty: TypeRef) -> CResult<()> {
+        match self.get_kind(ty) {
+            TypeKind::Struct | TypeKind::Union => {
+                if self.current_token.kind == TK::LCurly {
+                    self.next(); // {
+
+                    let e = self.types.get(ty);
+                    let (start, count) = (e.field_start(), e.field_count());
+
+                    let mut i = 0usize;
+                    while self.current_token.kind != TK::RCurly && !self.at_eof() {
+                        if i < count as usize {
+                            let field = *self.types.get_field_from_start(start, i as _);
+                            let field_off = base_off + field.offset as i32;
+                            self.compile_initializer(field_off, field.ty)?;
+                            i += 1;
+                        } else {
+                            self.compile_expr_no_comma()?;
+                            self.vstack.pop();
+                        }
+
+                        if self.current_token.kind == TK::Comma { self.next(); }
+                    }
+
+                    //
+                    // Zero remaining fields
+                    //
+                    // @CodeOptimization: Use a memset here if the struct is big
+                    if i < count as usize {
+                        let tmp = self.regs.alloc(Span::POISONED)?;
+                        self.buf.xor_rr(tmp, tmp);
+                        for j in i..count as usize {
+                            let field = *self.types.get_field_from_start(start, j as _);
+                            let foff = base_off + field.offset as i32;
+                            self.emit_int_store(Reg::Rbp, foff, tmp, field.ty);
+                        }
+                        self.regs.free(tmp);
+                    }
+
+                    self.expect(TK::RCurly, "'}'")?;
+                } else {
+                    // No braces - assign from expression
+                    self.compile_expr_no_comma()?;
+                    self.emit_store(Reg::Rbp, base_off, ty)?;
+                }
+            }
+
+            TypeKind::Array => {
+                self.compile_array_initializer(base_off, ty)?;
+            }
+
+            _ => {
+                // Scalar - strip optional braces
+                if self.current_token.kind == TK::LCurly {
+                    self.next(); // {
+                    self.compile_expr_no_comma()?;
+                    if self.current_token.kind == TK::Comma { self.next(); }
+                    self.expect(TK::RCurly, "'}'")?;
+                } else {
+                    self.compile_expr_no_comma()?;
+                }
+                self.emit_store(Reg::Rbp, base_off, ty)?;
+            }
+        }
+        Ok(())
     }
 
     fn compile_array_initializer(&mut self, base_off: i32, arr_ty: TypeRef) -> CResult<u32> {
@@ -6714,13 +6851,8 @@ impl Compiler {
 
         let off = self.locals.alloc(name_tok.hash, ty, &self.types);
         if self.current_token.kind == TK::Eq {
-            self.next();
-            if self.types.get_kind(ty) == TypeKind::Array {
-                self.compile_array_initializer(off, ty)?;
-            } else {
-                self.compile_expr_no_comma()?;
-                self.emit_store(Reg::Rbp, off, ty)?;
-            }
+            self.next(); // =
+            self.compile_initializer(off, ty)?;
         }
 
         Ok(())
@@ -7790,10 +7922,17 @@ impl Compiler {
                 let cast_ty = self.compile_type()?;
                 self.expect(TK::RParen, "')'")?;
 
-                self.compile_unary()?;
-
-                let v = self.vstack.pop();
-                self.emit_cast(v, cast_ty)?;
+                if self.current_token.kind == TK::LCurly {
+                    // Compound literal
+                    let off = self.locals.alloc(0, cast_ty, &self.types);
+                    self.compile_initializer(off, cast_ty)?;
+                    self.vstack.push(CValue::local(cast_ty, off));
+                } else {
+                    // Regular cast
+                    self.compile_unary()?;
+                    let v = self.vstack.pop();
+                    self.emit_cast(v, cast_ty)?;
+                }
             }
 
             TK::LParen => {
