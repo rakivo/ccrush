@@ -4204,10 +4204,8 @@ impl LocalTable {
 bitflags::bitflags! {
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
     pub struct SymFlags: u8 {
-        const DEFINED  = 0x1;
-        const EXTERN   = 0x2;
-        const VARIADIC = 0x4;
-        const STATIC   = 0x8;
+        const EXTERN = 0x1;
+        const STATIC = 0x2;
     }
 }
 
@@ -5457,9 +5455,6 @@ impl Compiler {
             //
 
             let func_ty = decl_ty;
-            let is_variadic = self.types.get(func_ty).flags.contains(TypeFlags::VARIADIC);
-
-            flags.set(SymFlags::VARIADIC, is_variadic);
 
             if self.current_token.kind == TK::SemiColon {
                 self.expect(TK::SemiColon, "';'")?;
@@ -5469,7 +5464,7 @@ impl Compiler {
                 return Ok(());
             }
 
-            flags.insert(SymFlags::DEFINED);
+            flags -= SymFlags::EXTERN;
             return self.compile_func(name_tok.span, name_tok.hash, func_ty, params, flags);
         }
 
@@ -5507,13 +5502,13 @@ impl Compiler {
 
             self.syms.patch_forward_declaration(
                 forward_declaration_symbol_index,
-                code_off, code_len, flags
+                code_off, code_len, flags - SymFlags::EXTERN
             );
 
             let forward_func_ty = self.syms[forward_declaration_symbol_index].func_ty;
             self.types.patch_func_forward_decl(
                 forward_func_ty,
-                if flags.contains(SymFlags::VARIADIC) { TypeFlags::VARIADIC } else { TypeFlags::empty() }
+                if self.get(func_ty).is_variadic() { TypeFlags::VARIADIC } else { TypeFlags::empty() }
             );
 
             (forward_declaration_symbol_index, forward_func_ty)
@@ -8332,8 +8327,7 @@ impl Compiler {
         let func_type_entry = self.types.get(sym.func_ty);
         let param_count = func_type_entry.param_count();
         let ret_ty = func_type_entry.ret_ty();
-
-        let is_variadic = sym.flags.contains(SymFlags::VARIADIC);
+        let is_variadic = func_type_entry.is_variadic();
 
         //
         // Evaluate all args and spill to locals
@@ -8385,7 +8379,7 @@ impl Compiler {
         // Check arg counts
         //
         let total_argc = arg_spills.len();
-        if sym.flags.contains(SymFlags::VARIADIC) {
+        if is_variadic {
             if total_argc < param_count as usize {
                 return Err(CError::ArgumentCountMismatch {
                     span: call_span,
@@ -8857,8 +8851,7 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
     // First go static functions and globals
     //
     for (i, sym) in c.syms.iter().enumerate() {
-        if !sym.flags.contains(SymFlags::DEFINED) { continue; }
-
+        if sym.flags.contains(SymFlags::EXTERN) { continue; }
         if !sym.flags.contains(SymFlags::STATIC)  { continue; }
 
         push_sym(&mut symtab, sym_name_index[i], (STB_LOCAL<<4)|STT_FUNC, SHN_TEXT, sym.code_off as u64, sym.code_len as u64);
@@ -8877,7 +8870,7 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
     let first_global_sym = symtab.len() / 24; // sh_info = this
 
     for (i, sym) in c.syms.iter().enumerate() {
-        if !sym.flags.contains(SymFlags::DEFINED) { continue; }
+        if sym.flags.contains(SymFlags::EXTERN) { continue; }
         if sym.flags.contains(SymFlags::STATIC)  { continue; }
 
         push_sym(&mut symtab, sym_name_index[i], (STB_GLOBAL<<4)|STT_FUNC, SHN_TEXT, sym.code_off as u64, sym.code_len as u64);
@@ -9144,7 +9137,7 @@ fn run_main(mut c: Compiler) {
         eprintln!("no main function"); std::process::exit(1);
     };
     let main_sym = &c.syms[main_idx];
-    if !main_sym.flags.contains(SymFlags::DEFINED) {
+    if main_sym.flags.contains(SymFlags::EXTERN) {
         eprintln!("main not defined"); std::process::exit(1);
     }
     let main_off = main_sym.code_off as usize;
