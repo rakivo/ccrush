@@ -83,6 +83,31 @@
 // @Cleanup: There's lots of unnecessary std::process::exit calls.
 //
 
+#![warn(clippy::all, clippy::pedantic, clippy::cargo, dead_code)]
+
+#![allow(
+    clippy::identity_op,
+    clippy::inline_always,
+    clippy::similar_names,
+    clippy::too_many_lines,  // I DONT GIVE A FUCK ABOUT YOUR CLEAN CODE SLOPPPPPPPP
+    clippy::items_after_statements,
+    clippy::match_same_arms,
+    clippy::cast_sign_loss,
+    clippy::collapsible_if,
+    clippy::default_trait_access,
+    clippy::match_wildcard_for_single_variants,
+    clippy::pub_underscore_fields,
+    clippy::cast_possible_wrap,
+    clippy::used_underscore_binding,
+    clippy::module_inception,
+    clippy::missing_errors_doc,
+    clippy::collapsible_else_if,
+    clippy::new_without_default,
+    clippy::only_used_in_recursion,
+    clippy::cast_possible_truncation,
+    clippy::doc_overindented_list_items,
+)]
+
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -94,8 +119,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::ops::{Deref, DerefMut};
 
-use smallstr::SmallString;
 use thiserror::Error;
+use smallstr::SmallString;
 use smallvec::{SmallVec, smallvec};
 use nohash_hasher::{IntMap, IntSet};
 use memmap2::{Mmap, MmapMut, MmapOptions};
@@ -114,10 +139,10 @@ pub use {
 #[inline(always)]
 const fn hash_ident(s: &str) -> u64 {
     let b = s.as_bytes();
-    let mut h = 0xcbf29ce484222325u64;
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
     let mut i = 0;
     while i < b.len() {
-        h = (h ^ b[i] as u64).wrapping_mul(0x100000001b3);
+        h = (h ^ b[i] as u64).wrapping_mul(0x0100_0000_01b3);
         i += 1;
     }
     h
@@ -144,7 +169,8 @@ fn str_into_boxed_path(s: impl AsRef<str>) -> Box<Path> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct FileRef(pub u16);
-entity_impl!(FileRef, "FileRef", f, FileRef(f as _), f.0 as u32);
+
+entity_impl!(FileRef, "FileRef", f, FileRef(f as _), u32::from(f.0));
 
 pub struct FileInfo {
     pub path: Box<str>,
@@ -166,7 +192,7 @@ impl AsRef<[u8]> for FileData {
 impl FileData {
     #[inline]
     fn slice(&self) -> &[u8] {
-        match self { FileData::Mapped(m) => &m, FileData::Owned(v) => v }
+        match self { FileData::Mapped(m) => m, FileData::Owned(v) => v }
     }
 }
 
@@ -176,6 +202,7 @@ pub struct SrcArena {
 
 impl SrcArena {
     #[inline]
+    #[must_use]
     pub fn new() -> Self {
         Self { files: PrimaryMap::with_capacity(64) }
     }
@@ -206,6 +233,7 @@ impl SrcArena {
     }
 
     #[inline]
+    #[must_use]
     pub fn slice(&self, fid: FileRef) -> &[u8] {
         self.files[fid].data.slice()
     }
@@ -222,6 +250,7 @@ impl Span {
     pub const POISONED: Self = unsafe { core::mem::zeroed() };
 
     #[inline]
+    #[must_use]
     pub fn s<'a>(&self, arena: &'a SrcArena) -> &'a str {
         let src = arena.slice(self.file);
         let s   = self.start as usize;
@@ -229,8 +258,9 @@ impl Span {
     }
 
     #[inline]
+    #[must_use]
     pub fn merge(self, o: Span) -> Span {
-        let end = (o.start + o.len as u32).max(self.start + self.len as u32);
+        let end = (o.start + u32::from(o.len)).max(self.start + u32::from(self.len));
         Span {
             file: self.file,
             start: self.start.min(o.start),
@@ -241,12 +271,12 @@ impl Span {
 
 #[inline]
 pub fn emit_diag(msg: &str, span: Span, arena: &SrcArena) {
-    emit_diag_impl(msg, span, arena, false)
+    emit_diag_impl(msg, span, arena, false);
 }
 
 #[inline]
 pub fn emit_diag_warning(msg: &str, span: Span, arena: &SrcArena) {
-    emit_diag_impl(msg, span, arena, true)
+    emit_diag_impl(msg, span, arena, true);
 }
 
 pub fn emit_diag_impl(msg: &str, span: Span, arena: &SrcArena, is_warning: bool) {
@@ -266,7 +296,7 @@ pub fn emit_diag_impl(msg: &str, span: Span, arena: &SrcArena, is_warning: bool)
     let path   = &arena.files[span.file].path;
     let before = &src[..span.start as usize];
 
-    let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
+    let line = bytecount::count(before, b'\n') + 1;
     let col  = {
         let mut c = 0usize;
         for &b in before.iter().rev().take_while(|&&b| b != b'\n') {
@@ -276,8 +306,8 @@ pub fn emit_diag_impl(msg: &str, span: Span, arena: &SrcArena, is_warning: bool)
     };
     eprintln!("  {C}-->{X} {path}:{line}:{col}");
 
-    let ls = before.iter().rposition(|&b| b == b'\n').map(|i| i+1).unwrap_or(0);
-    let le = src[ls..].iter().position(|&b| b == b'\n').map(|i| ls+i).unwrap_or(src.len());
+    let ls = before.iter().rposition(|&b| b == b'\n').map_or(0, |i| i+1);
+    let le = src[ls..].iter().position(|&b| b == b'\n').map_or(src.len(), |i| ls+i);
 
     //
     // Visual column of span start within the line
@@ -363,11 +393,12 @@ impl PPError {
     fn span(&self) -> Span {
         match self {
             PPError::Io(_)                     => Span::POISONED,
-            PPError::Error       { span, .. }  => *span,
-            PPError::NotFound    { span, .. }  => *span,
-            PPError::Unterminated{ span, .. }  => *span,
-            PPError::ArgumentCountMismatch { span, .. }  => *span,
-            PPError::IncludeDepth{ span, .. }  => *span,
+
+            PPError::Error       { span, .. }           |
+            PPError::NotFound    { span, .. }           |
+            PPError::Unterminated{ span, .. }           |
+            PPError::ArgumentCountMismatch { span, .. } |
+            PPError::IncludeDepth{ span, .. }           |
             PPError::BadDirective{ span, .. }  => *span,
         }
     }
@@ -418,18 +449,19 @@ pub enum CError {
 
 impl CError {
     #[inline]
+    #[must_use]
     pub fn span(&self) -> Span {
         match self {
-            CError::Expected    { span, .. } => *span,
-            CError::UnknownType { span, .. } => *span,
-            CError::UnknownField { span, .. } => *span,
-            CError::Undefined   { span, .. } => *span,
-            CError::NotLvalue   { span, .. } => *span,
-            CError::ArgumentCountMismatch { span, .. } => *span,
-            CError::BreakOutsideLoop { span, .. } => *span,
-            CError::ContinueOutsideLoop { span, .. } => *span,
-            CError::VlaWithInitializer { span, .. } => *span,
-            CError::VlaInGlobalContext { span, .. } => *span,
+            CError::Expected    { span, .. }           |
+            CError::UnknownType { span, .. }           |
+            CError::UnknownField { span, .. }          |
+            CError::Undefined   { span, .. }           |
+            CError::NotLvalue   { span, .. }           |
+            CError::ArgumentCountMismatch { span, .. } |
+            CError::BreakOutsideLoop { span, .. }      |
+            CError::ContinueOutsideLoop { span, .. }   |
+            CError::VlaWithInitializer { span, .. }    |
+            CError::VlaInGlobalContext { span, .. }    |
             CError::RegSpill    { span, .. } => *span,
         }
     }
@@ -470,6 +502,7 @@ pub enum TK {
 
 impl TK {
     #[inline]
+    #[must_use]
     pub const fn compound_to_binop(self) -> TK {
         match self {
             TK::PlusEq   => TK::Plus,
@@ -488,7 +521,7 @@ impl TK {
 pub struct Token {
     pub kind: TK,
     pub span: Span,
-    /// Pre-computed fnv1a hash of the identifier text, set once in cook().
+    /// Pre-computed fnv1a hash of the identifier text, set once in `cook()`.
     /// Zero for all non-Ident tokens.
     pub hash: u64,
 }
@@ -497,6 +530,7 @@ impl Token {
     pub const EOF: Token = Token { kind: TK::Eof, span: Span::POISONED, hash: 0 };
 
     #[inline]
+    #[must_use]
     pub fn s<'a>(&self, arena: &'a SrcArena) -> &'a str {
         self.span.s(arena)
     }
@@ -665,7 +699,7 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileRef) -> Token {
                     span: Span { file: fid, start: start as u32, len: (*pos - start) as u16 },
                     hash: 0,
                 }
-            } else if *pos + 1 <= src.len() && src[*pos] == b'*' {
+            } else if *pos < src.len() && src[*pos] == b'*' {
                 // Block comment
 
                 *pos += 1; // *
@@ -741,7 +775,7 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileRef) -> Token {
 
 #[inline]
 fn parse_number_int(s: &str) -> i64 {
-    let s = s.trim_end_matches(|c| matches!(c, 'u'|'U'|'l'|'L'));  // @Incomplete
+    let s = s.trim_end_matches(['u', 'U', 'l', 'L']);
 
     if s.starts_with("0x") || s.starts_with("0X") {
         u64::from_str_radix(&s[2..], 16).unwrap_or(0) as i64
@@ -754,7 +788,7 @@ fn parse_number_int(s: &str) -> i64 {
 
 #[inline]
 fn parse_number_float(s: &str) -> f64 {
-    let s = if s.ends_with('f') { &s[..s.len()-1] } else { s };
+    let s = s.strip_suffix('f').unwrap_or(s); // @Incomplete
     s.parse().unwrap_or(0.0)
 }
 
@@ -974,7 +1008,7 @@ impl PP {
                         let path = if let Some(eq) = include.find('=') {
                             &include[eq+1..]
                         } else {
-                            &include
+                            include
                         };
                         dirs.push(str_into_boxed_path(path));
                     }
@@ -1193,7 +1227,7 @@ impl PP {
 
     #[inline]
     fn define_noop_func_macro(&mut self, name: &str, params: &[&str]) {
-        self.define_func_macro(name, params, &[]);
+        self.define_func_macro(name, params, []);
     }
 
     #[inline]
@@ -1262,11 +1296,6 @@ impl PP {
                         e.emit(&self.src_arena);
                         std::process::exit(1);
                     }
-                }
-
-                TK::Hash => {
-                    self.at_bol = false;
-                    return t;
                 }
 
                 TK::Ident => {
@@ -1367,6 +1396,7 @@ impl PP {
 
     // Slide window, return consumed token.
     #[inline]
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Token {
         let t = self.current_token;
         self.current_token  = self.next_token;
@@ -1375,6 +1405,7 @@ impl PP {
     }
 
     #[inline]
+    #[must_use]
     pub fn s(&self, t: Token) -> &str { t.s(&self.src_arena) }
 
     #[inline]
@@ -1388,7 +1419,7 @@ impl PP {
         name.hash = hash_ident(name.s(&self.src_arena));
 
         match name.hash {
-            HASH_DEFINE  => self.pp_define(),
+            HASH_DEFINE  => { self.pp_define(); Ok(()) }
             HASH_INCLUDE => self.pp_include(name.span),
             HASH_PRAGMA  => { self.pp_pragma(); Ok(()) }
             HASH_UNDEF   => { self.pp_undef();  Ok(()) }
@@ -1398,11 +1429,11 @@ impl PP {
             HASH_ELSE    => { self.pp_else(); Ok(()) }
             HASH_ENDIF   => { self.pp_endif(); Ok(()) }
             HASH_ERROR   => self.pp_error(name),
-            HASH_WARNING => self.pp_warning(name),
+            HASH_WARNING => { self.pp_warning(name); Ok(()) }
             HASH_IF      => {
                 self.ifdef_stack.push(IfdefState::Inactive);
 
-                let val = self.pp_eval_expr()?;
+                let val = self.pp_eval_expr();
                 if val != 0 {
                     *self.ifdef_stack.last_mut().unwrap() = IfdefState::Active;
                 } else {
@@ -1429,9 +1460,9 @@ impl PP {
         }
     }
 
-    fn pp_define(&mut self) -> PPResult<()> {
+    fn pp_define(&mut self) {
         let name_tok = self.raw();
-        if name_tok.kind != TK::Ident { self.skip_line(); return Ok(()); }
+        if name_tok.kind != TK::Ident { self.skip_line(); return; }
 
         let name_hash = hash_ident(name_tok.s(&self.src_arena));
         let def_span  = name_tok.span;
@@ -1439,7 +1470,7 @@ impl PP {
 
         let is_func = next.kind == TK::LParen
             && next.span.file  == name_tok.span.file
-            && next.span.start == name_tok.span.start + name_tok.span.len as u32;
+            && next.span.start == name_tok.span.start + u32::from(name_tok.span.len);
 
         let mut param_hashes = SmallVec::<[u64; MAX_PARAMS]>::new();
         let mut is_variadic = false;
@@ -1470,10 +1501,9 @@ impl PP {
                 let t = self.raw();
                 match t.kind {
                     TK::RParen            => break,
-                    TK::Comma             => {}
                     TK::Ident             => { param_hashes.push(hash_ident(t.s(&self.src_arena))); }
                     TK::TripleDot         => { is_variadic = true; }
-                    TK::Newline | TK::Eof => { self.skip_line(); return Ok(()); }
+                    TK::Newline | TK::Eof => { self.skip_line(); return; }
                     _ => {}
                 }
             }
@@ -1481,7 +1511,7 @@ impl PP {
 
         // For object macros `next` is the first body token (or newline/eof).
         // For func macros we start reading fresh.
-        let mut pending = if !is_func { Some(next) } else { None };
+        let mut pending = if is_func { None } else { Some(next) };
 
         loop {
             let t = match pending.take() {
@@ -1504,17 +1534,16 @@ impl PP {
                     } else {
                         // # param - stringification
                         let subst = try_param_subst(next2, &param_hashes, is_variadic, &self.src_arena);
-                        match subst.kind {
-                            TK::Param(pi) => body.push(Token {
+                        if let TK::Param(pi) = subst.kind {
+                            body.push(Token {
                                 kind: TK::Stringify,
                                 span: t.span,
-                                hash: pi as u64,
-                            }),
-                            _ => {
-                                // # non-param: not standard but be permissive
-                                body.push(t);
-                                body.push(subst);
-                            }
+                                hash: u64::from(pi),
+                            });
+                        } else {
+                            // # non-param: not standard but be permissive
+                            body.push(t);
+                            body.push(subst);
                         }
                     }
                 }
@@ -1524,8 +1553,6 @@ impl PP {
         }
 
         self.macros.define(name_hash, def_span, is_variadic, &param_hashes, &body);
-
-        Ok(())
     }
 
     #[inline]
@@ -1566,7 +1593,7 @@ impl PP {
         };
 
         let cur_dir = {
-            let fid  = self.file_stack.last().map(|f| f.fid).unwrap_or(FileRef(0));
+            let fid  = self.file_stack.last().map_or(FileRef(0), |f| f.fid);
             let parent_dir_opt = Path::new(self.src_arena.files[fid].path.as_ref()).parent();
             parent_dir_opt.unwrap_or(Path::new(".")).to_owned()
         };
@@ -1658,7 +1685,7 @@ impl PP {
                     arg_ranges.push((arg_start, self.macros.scratch.len() as u32 - arg_start));
                     arg_index += 1;
 
-                    let named_params = def.param_count as usize - if def.is_variadic { 1 } else { 0 };
+                    let named_params = def.param_count as usize - usize::from(def.is_variadic);
 
                     if arg_index >= named_params && !def.is_variadic {
                         self.macros.scratch.truncate(scratch_base as usize);
@@ -1683,7 +1710,7 @@ impl PP {
             }
         }
 
-        let named_params = def.param_count as usize - if def.is_variadic { 1 } else { 0 };
+        let named_params = def.param_count as usize - usize::from(def.is_variadic);
 
         if arg_ranges.len() < named_params {
             self.macros.scratch.truncate(scratch_base as usize);
@@ -1914,7 +1941,7 @@ impl PP {
 
             match t.kind {
                 TK::Eof => return SkipResult::Endif,
-                TK::Newline => { self.at_bol = true; continue; }
+                TK::Newline => { self.at_bol = true; }
 
                 TK::Hash if self.at_bol => {
                     self.at_bol = false;
@@ -1998,7 +2025,7 @@ impl PP {
                 self.ifdef_stack.pop();
             }
 
-            Some(IfdefState::Done) | Some(IfdefState::Inactive) => {
+            Some(IfdefState::Done | IfdefState::Inactive) => {
                 // Else branch is active
                 *self.ifdef_stack.last_mut().unwrap() = IfdefState::Active;
             }
@@ -2029,7 +2056,7 @@ impl PP {
             }
 
             Some(IfdefState::Inactive) => {
-                let val = self.pp_eval_expr()?;
+                let val = self.pp_eval_expr();
                 if val != 0 {
                     *self.ifdef_stack.last_mut().unwrap() = IfdefState::Active;
                 } else {
@@ -2076,7 +2103,7 @@ impl PP {
     }
 
     #[inline]
-    fn pp_warning(&mut self, warning_token: Token) -> PPResult<()> {
+    fn pp_warning(&mut self, warning_token: Token) {
         let mut msg = String::new();
         loop {
             let t = self.raw();
@@ -2087,11 +2114,9 @@ impl PP {
         }
 
         emit_diag_warning(&msg, warning_token.span, &self.src_arena);
-
-        Ok(())
     }
 
-    fn pp_eval_expr(&mut self) -> PPResult<i64> {
+    fn pp_eval_expr(&mut self) -> i64 {
         //
         // Collect raw line - stops at newline
         //
@@ -2105,7 +2130,7 @@ impl PP {
         }
 
         // Replace defined(X) / defined X with synthetic 0/1 tokens
-        let mut processed = self.pp_replace_defined(raw_line);
+        let mut processed = self.pp_replace_defined(&raw_line);
         processed.push(Token::EOF);
 
         // Expand macros using frame-only reads, collect tokens
@@ -2113,7 +2138,7 @@ impl PP {
         exp_push_body(&mut self.exp, &processed);
 
         let toks = self.pp_eval_collect(frame_depth_before);
-        Ok(self.eval_const_expr(&toks, &mut 0))
+        self.eval_const_expr(&toks, &mut 0)
     }
 
     // Uses pp_eval_raw (frame-only) to avoid consuming real source tokens.
@@ -2171,7 +2196,7 @@ impl PP {
     }
 
     #[inline]
-    fn pp_replace_defined(&self, raw_line: Vec<Token>) -> Vec<Token> {
+    fn pp_replace_defined(&self, raw_line: &[Token]) -> Vec<Token> {
         let mut out = Vec::with_capacity(raw_line.len());
 
         let mut i = 0;
@@ -2192,7 +2217,7 @@ impl PP {
                 if i < raw_line.len() { i += 1 }
                 if has_paren && i < raw_line.len() && raw_line[i].kind == TK::RParen { i += 1 }
 
-                let val = self.macros.find(name_hash).is_some() as u64;
+                let val = u64::from(self.macros.find(name_hash).is_some());
                 Token { kind: TK::Number, span: Span::POISONED, hash: val }
             } else {
                 t
@@ -2284,7 +2309,7 @@ impl PP {
         while *pos < toks.len() && toks[*pos].kind == TK::Or {
             *pos += 1;
             let r = self.eval_and(toks, pos);
-            v = if v != 0 || r != 0 { 1 } else { 0 };
+            v = i64::from(v != 0 || r != 0);
         }
 
         v
@@ -2296,7 +2321,7 @@ impl PP {
         while *pos < toks.len() && toks[*pos].kind == TK::And {
             *pos += 1;
             let r = self.eval_bitor(toks, pos);
-            v = if v != 0 && r != 0 { 1 } else { 0 };
+            v = i64::from(v != 0 && r != 0);
         }
 
         v
@@ -2342,8 +2367,8 @@ impl PP {
             if *pos >= toks.len() { break; }
 
             match toks[*pos].kind {
-                TK::EqEq  => { *pos += 1; v = (v == self.eval_cmp(toks, pos)) as i64; }
-                TK::NotEq => { *pos += 1; v = (v != self.eval_cmp(toks, pos)) as i64; }
+                TK::EqEq  => { *pos += 1; v = i64::from(v == self.eval_cmp(toks, pos)); }
+                TK::NotEq => { *pos += 1; v = i64::from(v != self.eval_cmp(toks, pos)); }
                 _ => break,
             }
         }
@@ -2358,10 +2383,10 @@ impl PP {
             if *pos >= toks.len() { break; }
 
             match toks[*pos].kind {
-                TK::Less      => { *pos += 1; v = (v <  self.eval_add(toks, pos)) as i64; }
-                TK::Greater   => { *pos += 1; v = (v >  self.eval_add(toks, pos)) as i64; }
-                TK::LessEq    => { *pos += 1; v = (v <= self.eval_add(toks, pos)) as i64; }
-                TK::GreaterEq => { *pos += 1; v = (v >= self.eval_add(toks, pos)) as i64; }
+                TK::Less      => { *pos += 1; v = i64::from(v < self.eval_add(toks, pos)); }
+                TK::Greater   => { *pos += 1; v = i64::from(v > self.eval_add(toks, pos)); }
+                TK::LessEq    => { *pos += 1; v = i64::from(v <= self.eval_add(toks, pos)); }
+                TK::GreaterEq => { *pos += 1; v = i64::from(v >= self.eval_add(toks, pos)); }
                 _ => break,
             }
         }
@@ -2376,8 +2401,8 @@ impl PP {
             if *pos >= toks.len() { break; }
 
             match toks[*pos].kind {
-                TK::LessLess       => { *pos += 1; let r = self.eval_add(toks, pos); v = v << r; }
-                TK::GreaterGreater => { *pos += 1; let r = self.eval_add(toks, pos); v = v >> r; }
+                TK::LessLess       => { *pos += 1; let r = self.eval_add(toks, pos); v <<= r; }
+                TK::GreaterGreater => { *pos += 1; let r = self.eval_add(toks, pos); v >>= r; }
                 _ => break,
             }
         }
@@ -2423,7 +2448,7 @@ impl PP {
 
         match toks[*pos].kind {
             TK::Minus  => { *pos += 1; -self.eval_unary(toks, pos) }
-            TK::Not    => { *pos += 1; (self.eval_unary(toks, pos) == 0) as i64 }
+            TK::Not    => { *pos += 1; i64::from(self.eval_unary(toks, pos) == 0) }
             TK::BitNot => { *pos += 1; !self.eval_unary(toks, pos) }
             _          => self.eval_primary(toks, pos),
         }
@@ -2470,7 +2495,7 @@ impl PP {
                     h
                 };
 
-                self.macros.find(name_hash).is_some() as i64
+                i64::from(self.macros.find(name_hash).is_some())
             }
 
             TK::LParen => {
@@ -2532,16 +2557,19 @@ pub enum TypeKind {
 
 impl TypeKind {
     #[inline]
+    #[must_use]
     pub fn is_signed_int(self, is_unsigned: bool) -> bool {
         self.is_integer() && !is_unsigned
     }
 
     #[inline]
+    #[must_use]
     pub fn is_float(self) -> bool {
         matches!(self, TypeKind::Float | TypeKind::Double | TypeKind::LDouble)
     }
 
     #[inline]
+    #[must_use]
     pub fn is_integer(self) -> bool {
         matches!(
             self,
@@ -2551,16 +2579,19 @@ impl TypeKind {
     }
 
     #[inline]
+    #[must_use]
     pub fn is_ptr(self) -> bool {
         self == TypeKind::Ptr
     }
 
     #[inline]
+    #[must_use]
     pub fn is_array(self) -> bool {
         self == TypeKind::Array
     }
 
     #[inline]
+    #[must_use]
     pub fn is_scalar(self) -> bool {
         self.is_integer() || self.is_float() || self.is_ptr()
     }
@@ -2614,84 +2645,99 @@ impl TypeEntry {
     // Typed accessors with debug assertions
     #[inline]
     #[track_caller]
+    #[must_use]
     pub fn pointee(&self) -> TypeRef {
         debug_assert!(self.kind == TypeKind::Ptr);
         self.ref_
     }
 
     #[inline]
+    #[must_use]
     pub fn elem(&self) -> TypeRef {
         debug_assert!(self.kind == TypeKind::Array);
         self.ref_
     }
 
     #[inline]
+    #[must_use]
     pub fn array_len(&self) -> u32 {
         debug_assert!(self.kind == TypeKind::Array);
         self.extra
     }
 
     #[inline]
+    #[must_use]
     pub fn ret_ty(&self) -> TypeRef {
         debug_assert!(self.kind == TypeKind::Func);
         self.ref_
     }
 
     #[inline]
+    #[must_use]
     pub fn param_start(&self) -> u32 {
         debug_assert!(self.kind == TypeKind::Func);
         self.extra
     }
 
     #[inline]
+    #[must_use]
     pub fn param_count(&self) -> u32 {
         debug_assert!(self.kind == TypeKind::Func);
         self.extra2
     }
 
     #[inline]
+    #[must_use]
     pub fn field_start(&self) -> u32 {
         debug_assert!(matches!(self.kind, TypeKind::Struct | TypeKind::Union));
         self.extra
     }
 
     #[inline]
+    #[must_use]
     pub fn field_count(&self) -> u32 {
         debug_assert!(matches!(self.kind, TypeKind::Struct | TypeKind::Union));
         self.extra2
     }
 
     #[inline]
+    #[must_use]
     pub fn is_signed_int(self) -> bool {
         self.kind.is_signed_int(self.is_unsigned())
     }
 
     #[inline]
+    #[must_use]
     pub fn is_unsigned(&self) -> bool {
         self.quals.contains(QualFlags::UNSIGNED)
     }
 
     #[inline]
+    #[must_use]
     pub fn is_signed(&self) -> bool {
         !self.is_unsigned()
     }
 
     #[inline]
+    #[must_use]
     pub fn is_variadic(&self) -> bool {
         self.flags.contains(TypeFlags::VARIADIC)
     }
 
     #[inline]
+    #[must_use]
     pub fn is_noreturn(&self) -> bool {
         self.flags.contains(TypeFlags::NORETURN)
     }
 
     #[inline]
+    #[must_use]
     pub fn is_vla(&self) -> bool {
         self.kind == TypeKind::Array && self.extra == 0
     }
 
     #[inline]
+    #[must_use]
     pub fn vla_dim_off(&self) -> i32 {
         debug_assert!(self.is_vla());
         self.extra2 as i32
@@ -2715,11 +2761,13 @@ pub const TYPE_DOUBLE:  TypeRef = TypeRef(13);
 pub const TYPE_LDOUBLE: TypeRef = TypeRef(14);
 
 #[inline(always)]
+#[must_use]
 pub const fn is_type_builtin(ty: TypeRef) -> bool {
     ty.0 <= 14
 }
 
 #[inline(always)]
+#[must_use]
 pub const fn unsign_a_builtin_type(ty: TypeRef) -> TypeRef {
     match ty {
         TYPE_VOID    => TYPE_VOID,
@@ -2799,6 +2847,7 @@ impl TypeTable {
     const LOAD_DEN:  usize = 4; // 75% load factor
 
     #[inline]
+    #[must_use]
     pub fn new() -> Self {
         let cap = 256usize;
         let mut t = Self {
@@ -2821,7 +2870,7 @@ impl TypeTable {
 
     #[inline]
     fn init_primitives(&mut self) {
-        use TypeKind::*;
+        use TypeKind::{Void, Bool, Char, Short, Int, Long, LLong, Float, Double, LDouble};
         use QualFlags as Q;
 
         for (kind, quals) in [
@@ -2853,17 +2902,17 @@ impl TypeTable {
     #[inline(always)]
     fn pack_key(e: &TypeEntry) -> u64 {
         let lo = (e.kind as u64)
-            | ((e.quals.bits() as u64) << 8)
-            | ((e.flags.bits() as u64) << 16)
-            | ((e.ref_.0       as u64) << 24)
-            | ((e.extra        as u64) << 32)
-            | ((e.extra2       as u64) << 48);
+            | (u64::from(e.quals.bits()) << 8)
+            | (u64::from(e.flags.bits()) << 16)
+            | (u64::from(e.ref_.0) << 24)
+            | (u64::from(e.extra) << 32)
+            | (u64::from(e.extra2) << 48);
 
         // Finalizer from wyhash/murmur - better avalanche than xor-shift
         let lo = lo ^ (lo >> 30);
-        let lo = lo.wrapping_mul(0xbf58476d1ce4e5b9);
+        let lo = lo.wrapping_mul(0xbf58_476d_1ce4_e5b9);
         let lo = lo ^ (lo >> 27);
-        let lo = lo.wrapping_mul(0x94d049bb133111eb);
+        let lo = lo.wrapping_mul(0x94d0_49bb_1331_11eb);
         lo ^ (lo >> 31)
     }
 
@@ -2992,6 +3041,7 @@ impl TypeTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn get_type_name(&self, ty: TypeRef) -> Option<&str> {
         self.type_names.get(ty).map(|e| e.s.as_str())
     }
@@ -3006,27 +3056,31 @@ impl TypeTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn get_param(&self, func_ty: TypeRef, param_index: u32) -> TypeRef {
         let e = self.get(func_ty);
         self.param_slice(e.param_start() as _, e.param_count() as _)[param_index as usize]
     }
 
     #[inline]
+    #[must_use]
     pub fn get_field_from_start(&self, start: u32, field_index: u32) -> &FieldEntry {
         &self.field_pool[start as usize + field_index as usize]
     }
 
     #[inline]
+    #[must_use]
     pub fn get(&self, id: TypeRef) -> &TypeEntry {
         &self.entries[id]
     }
 
     #[inline]
+    #[must_use]
     pub fn get_kind(&self, id: TypeRef) -> TypeKind {
         self.entries[id].kind
     }
 
-    /// If `ty` is a function pointer or bare function type, returns the Func TypeRef.
+    /// If `ty` is a function pointer or bare function type, returns the Func `TypeRef`.
     #[inline]
     fn resolve_func_ptr_type(&self, ty: TypeRef) -> Option<TypeRef> {
         match self.get_kind(ty) {
@@ -3045,26 +3099,31 @@ impl TypeTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn is_integer(&self, id: TypeRef) -> bool {
         matches!(self.get(id).kind, TypeKind::Bool | TypeKind::Int | TypeKind::Long | TypeKind::LLong)
     }
 
     #[inline]
+    #[must_use]
     pub fn is_float(&self, id: TypeRef) -> bool {
         matches!(self.get(id).kind, TypeKind::Float | TypeKind::Double | TypeKind::LDouble)
     }
 
     #[inline]
+    #[must_use]
     pub fn is_ptr(&self, id: TypeRef) -> bool {
         self.get(id).kind == TypeKind::Ptr
     }
 
     #[inline]
+    #[must_use]
     pub fn is_unsigned(&self, id: TypeRef) -> bool {
         self.get(id).is_unsigned()
     }
 
     #[inline]
+    #[must_use]
     pub fn is_signed(&self, id: TypeRef) -> bool {
         self.get(id).is_signed()
     }
@@ -3082,6 +3141,7 @@ impl TypeTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn deref(&self, id: TypeRef) -> TypeRef {
         let e = self.get(id);
         debug_assert!(e.kind == TypeKind::Ptr);
@@ -3089,6 +3149,7 @@ impl TypeTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn size_of(&self, id: TypeRef) -> u32 {
         let e = self.get(id);
         match e.kind {
@@ -3110,6 +3171,7 @@ impl TypeTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn align_of(&self, id: TypeRef) -> u32 {
         let e = self.get(id);
         match e.kind {
@@ -3139,6 +3201,7 @@ impl TypeTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn field_slice(&self, start: u32, count: u32) -> &[FieldEntry] {
         let s = start as usize;
         let e = s + count as usize;
@@ -3146,6 +3209,7 @@ impl TypeTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn field_span_slice(&self, start: u32, count: u32) -> &[Span] {
         let s = start as usize;
         let e = s + count as usize;
@@ -3153,6 +3217,7 @@ impl TypeTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn field_name_slice(&self, start: u32, count: u32) -> &[u64] {
         let s = start as usize;
         let e = s + count as usize;
@@ -3165,6 +3230,7 @@ impl TypeTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn find_field(&self, start: u32, count: u32, name: u64) -> Option<&FieldEntry> {
         let relative_index = self.field_name_slice(start, count).iter()
             .position(|_name| *_name == name)?;
@@ -3252,6 +3318,7 @@ impl TypeTable {
     //
 
     #[inline]
+    #[must_use]
     pub fn struct_size(&self, start: u32, count: u32) -> u32 {
         if count == 0 { return 0; }
 
@@ -3266,6 +3333,7 @@ impl TypeTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn struct_align(&self, start: u32, count: u32) -> u32 {
         self.field_slice(start, count)
             .iter()
@@ -3275,6 +3343,7 @@ impl TypeTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn union_size(&self, start: u32, count: u32) -> u32 {
         let max_size  = self.field_slice(start, count)
             .iter()
@@ -3287,6 +3356,7 @@ impl TypeTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn union_align(&self, start: u32, count: u32) -> u32 {
         self.field_slice(start, count)
             .iter()
@@ -3353,6 +3423,7 @@ impl TypeTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn param_slice(&self, start: u32, count: u32) -> &[TypeRef] {
         let s = start as usize;
         &self.param_pool[s..s + count as usize]
@@ -3399,7 +3470,7 @@ impl TypeTable {
 
     fn build_type_parts(&self, id: TypeRef, left: &mut String, right: &mut String) {
         use core::fmt::Write as _;
-        use TypeKind::*;
+        use TypeKind::{Void, Bool, Char, Int, Short, Long, LLong, Float, Double, LDouble, Struct, Union, Enum, Ptr, Array, Func};
 
         let e = self.get(id);
 
@@ -3510,7 +3581,11 @@ impl TypeTable {
         write!(f, "{left}{right}")
     }
 
+    /// # Panics
+    ///
+    /// Will panic if write!() fails
     #[inline]
+    #[must_use]
     pub fn to_string(&self, id: TypeRef) -> String {
         let mut s = String::new();
         self.display_type(id, &mut s).unwrap();
@@ -3533,9 +3608,11 @@ pub enum Reg {
 
 impl Reg {
     #[inline]
+    #[must_use]
     pub const fn enc(self) -> u8 { self as u8 & 7 }
 
     #[inline]
+    #[must_use]
     pub const fn ext(self) -> bool { self as u8 >= 8 }
 }
 
@@ -3551,6 +3628,7 @@ pub enum ValReg { Gp(Reg), Xmm(XmmReg) }
 
 impl ValReg {
     #[inline]
+    #[must_use]
     pub const fn as_gp(self) -> Reg {
         match self {
             Self::Gp(gp) => gp,
@@ -3559,6 +3637,7 @@ impl ValReg {
     }
 
     #[inline]
+    #[must_use]
     pub const fn as_xmm(self) -> XmmReg {
         match self {
             Self::Xmm(xmm) => xmm,
@@ -3571,15 +3650,16 @@ impl ValReg {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VK { Imm, Reg, Local, RegInd }
 
-/// Packed byte: bits [6..5] = VK, bit [4] = is_xmm, bits [3..0] = reg index
+/// Packed byte: bits [6..5] = VK, bit [4] = `is_xmm`, bits [3..0] = reg index
 ///
 ///  7    6  5    4      3  2  1  0
-/// [unused][VK: 2][is_xmm][reg: 4]
+/// [unused][VK: 2][`is_xmm`][reg: 4]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedKindReg(u8);
 
 impl PackedKindReg {
     #[inline]
+    #[must_use]
     pub const fn new(kind: VK, reg: ValReg) -> Self {
         let (is_xmm, idx) = match reg {
             ValReg::Gp(r)  => (0u8, r as u8),
@@ -3589,6 +3669,7 @@ impl PackedKindReg {
     }
 
     #[inline]
+    #[must_use]
     pub const fn kind(self) -> VK {
         match self.0 >> 5 {
             0 => VK::Imm,
@@ -3600,6 +3681,7 @@ impl PackedKindReg {
     }
 
     #[inline]
+    #[must_use]
     pub const fn reg(self) -> ValReg {
         let idx = self.0 & 0xF;
         if self.0 & 0x10 != 0 {
@@ -3610,11 +3692,13 @@ impl PackedKindReg {
     }
 
     #[inline]
+    #[must_use]
     pub const fn as_gp(self) -> Reg {
         unsafe { std::mem::transmute::<u8, Reg>(self.0 & 0xF) }
     }
 
     #[inline]
+    #[must_use]
     pub const fn as_xmm(self) -> XmmReg {
         unsafe { std::mem::transmute::<u8, XmmReg>(self.0 & 0xF) }
     }
@@ -3642,45 +3726,58 @@ pub struct CValue {
 }
 
 impl CValue {
-    #[inline] pub const fn kind(self)   -> VK     { self.kr.kind() }
-    #[inline] pub const fn reg(self)    -> ValReg { self.kr.reg()  }
-    #[inline] pub const fn as_gp(self)  -> Reg    { self.kr.as_gp()  }
-    #[inline] pub const fn as_xmm(self) -> XmmReg { self.kr.as_xmm() }
+    #[inline] #[must_use]
+    pub const fn kind(self)   -> VK     { self.kr.kind() }
+    #[inline] #[must_use]
+    pub const fn reg(self)    -> ValReg { self.kr.reg()  }
+    #[inline] #[must_use]
+    pub const fn as_gp(self)  -> Reg    { self.kr.as_gp()  }
+    #[inline] #[must_use]
+    pub const fn as_xmm(self) -> XmmReg { self.kr.as_xmm() }
 
-    #[inline] pub const fn get_fimm(self)   -> f64 { f64::from_bits(self.imm as u64) }
-    #[inline] pub const fn offset(self) -> i32 { self.imm as i32 }
+    #[inline] #[must_use]
+    pub const fn get_fimm(self)   -> f64 { f64::from_bits(self.imm.cast_unsigned()) }
+    #[inline] #[must_use]
+    pub const fn offset(self) -> i32 { self.imm as i32 }
 
     #[inline]
+    #[must_use]
     pub const fn imm(ty: TypeRef, imm: i64) -> Self {
         Self { imm, ty, kr: PackedKindReg::new(VK::Imm, ValReg::Gp(Reg::Rax)) }
     }
 
     #[inline]
+    #[must_use]
     pub const fn fimm(ty: TypeRef, v: f64) -> Self {
         Self { imm: v.to_bits() as i64, ty, kr: PackedKindReg::new(VK::Imm, ValReg::Gp(Reg::Rax)) }
     }
 
     #[inline]
+    #[must_use]
     pub const fn gp(ty: TypeRef, reg: Reg) -> Self {
         Self { imm: 0, ty, kr: PackedKindReg::new(VK::Reg, ValReg::Gp(reg)) }
     }
 
     #[inline]
+    #[must_use]
     pub const fn xmm(ty: TypeRef, reg: XmmReg) -> Self {
         Self { imm: 0, ty, kr: PackedKindReg::new(VK::Reg, ValReg::Xmm(reg)) }
     }
 
     #[inline]
+    #[must_use]
     pub const fn local(ty: TypeRef, offset: i32) -> Self {
         Self { imm: offset as i64, ty, kr: PackedKindReg::new(VK::Local, ValReg::Gp(Reg::Rbp)) }
     }
 
     #[inline]
+    #[must_use]
     pub const fn regind(ty: TypeRef, reg: Reg, offset: i32) -> Self {
         Self { imm: offset as i64, ty, kr: PackedKindReg::new(VK::RegInd, ValReg::Gp(reg)) }
     }
 
     #[inline]
+    #[must_use]
     pub const fn is_lvalue(self) -> bool {
         matches!(self.kind(), VK::Local | VK::RegInd)
     }
@@ -3690,6 +3787,7 @@ pub struct XmmAlloc { used: u8 }
 
 impl XmmAlloc {
     #[inline]
+    #[must_use]
     pub fn new() -> Self { Self { used: 0 } }
 
     #[inline]
@@ -3697,7 +3795,7 @@ impl XmmAlloc {
         for i in 0..8u8 {
             if self.used & (1 << i) == 0 {
                 self.used |= 1 << i;
-                return Ok(unsafe { core::mem::transmute(i) });
+                return Ok(unsafe { core::mem::transmute::<u8, XmmReg>(i) });
             }
         }
 
@@ -3724,6 +3822,7 @@ pub struct RegAlloc { used: u16 }
 
 impl RegAlloc {
     #[inline]
+    #[must_use]
     pub fn new() -> Self { Self { used: 0 } }
 
     #[inline]
@@ -3756,11 +3855,13 @@ pub struct CodeBuf {
 
 impl CodeBuf {
     #[inline]
+    #[must_use]
     pub fn new() -> Self {
         Self { bytes: Vec::with_capacity(4 * 1024 * 1024) }
     }
 
     #[inline]
+    #[must_use]
     pub fn pos(&self) -> usize { self.bytes.len() }
 
     #[inline]
@@ -3778,7 +3879,7 @@ impl CodeBuf {
     // REX prefix - emit only when W=1 or any extension bit is needed
     #[inline]
     fn rex(&mut self, w: bool, r: Reg, b: Reg) {
-        let byte = 0x40 | ((w as u8)<<3) | ((r.ext() as u8)<<2) | (b.ext() as u8);
+        let byte = 0x40 | (u8::from(w)<<3) | (u8::from(r.ext())<<2) | u8::from(b.ext());
         if byte != 0x40 { self.emit_byte(byte); }
     }
 
@@ -3838,7 +3939,7 @@ impl CodeBuf {
     #[inline]
     pub fn lzcnt(&mut self, dst: Reg, src: Reg) {
         self.bytes.push(0xF3);
-        let rex = 0x48 | ((dst.ext() as u8) << 2) | (src.ext() as u8);
+        let rex = 0x48 | (u8::from(dst.ext()) << 2) | u8::from(src.ext());
         self.bytes.push(rex);
         self.bytes.push(0x0F);
         self.bytes.push(0xBD);
@@ -3849,7 +3950,7 @@ impl CodeBuf {
     #[inline]
     pub fn tzcnt(&mut self, dst: Reg, src: Reg) {
         self.bytes.push(0xF3);
-        let rex = 0x48 | ((dst.ext() as u8) << 2) | (src.ext() as u8);
+        let rex = 0x48 | (u8::from(dst.ext()) << 2) | u8::from(src.ext());
         self.bytes.push(rex);
         self.bytes.push(0x0F);
         self.bytes.push(0xBC);
@@ -3860,7 +3961,7 @@ impl CodeBuf {
     #[inline]
     pub fn popcnt(&mut self, dst: Reg, src: Reg) {
         self.bytes.push(0xF3);
-        let rex = 0x48 | ((dst.ext() as u8) << 2) | (src.ext() as u8);
+        let rex = 0x48 | (u8::from(dst.ext()) << 2) | u8::from(src.ext());
         self.bytes.push(rex);
         self.bytes.push(0x0F);
         self.bytes.push(0xB8);
@@ -3962,7 +4063,7 @@ impl CodeBuf {
     pub fn mov_store8(&mut self, base: Reg, off: i32, src: Reg) {
         // need REX if src is sil/dil/spl/bpl (rsi/rdi/rsp/rbp low byte)
         if src.ext() || src as u8 >= 4 {
-            self.emit_byte(0x40 | (src.ext() as u8));
+            self.emit_byte(0x40 | u8::from(src.ext()));
         }
         self.emit_byte(0x88);
         self.modrm_mem(src, base, off);
@@ -4023,7 +4124,7 @@ impl CodeBuf {
     pub fn movq_xmm_load(&mut self, dst: XmmReg, base: Reg, off: i32) {
         // REX byte: 0100 W R X B
         // W=1 (64-bit), R=xmm>=8, B=base>=8
-        let rex = 0x48 | ((dst as u8 >= 8) as u8) << 2 | ((base as u8 >= 8) as u8);
+        let rex = 0x48 | u8::from(dst as u8 >= 8) << 2 | u8::from(base as u8 >= 8);
         self.emit_byte(0x66);
         self.emit_byte(rex);
         self.emit_byte(0x0F);
@@ -4032,7 +4133,7 @@ impl CodeBuf {
     }
     #[inline]
     pub fn movq_xmm_store(&mut self, base: Reg, off: i32, src: XmmReg) {
-        let rex = 0x48 | ((src as u8 >= 8) as u8) << 2 | ((base as u8 >= 8) as u8);
+        let rex = 0x48 | u8::from(src as u8 >= 8) << 2 | u8::from(base as u8 >= 8);
         self.emit_byte(0x66);
         self.emit_byte(rex);
         self.emit_byte(0x0F);
@@ -4309,11 +4410,11 @@ impl CodeBuf {
 
     #[inline]
     fn xmm_rex(&mut self, dst: XmmReg, src: XmmReg) {
-        let byte = 0x40 | ((dst as u8 >= 8) as u8) << 2 | ((src as u8 >= 8) as u8);
+        let byte = 0x40 | u8::from(dst as u8 >= 8) << 2 | u8::from(src as u8 >= 8);
         if byte != 0x40 { self.emit_byte(byte); }
     }
     #[inline]
-    fn xmm_modrm(&self, dst: XmmReg, src: XmmReg) -> u8 {
+    fn xmm_modrm(dst: XmmReg, src: XmmReg) -> u8 {
         0xC0 | (dst as u8 & 7) << 3 | (src as u8 & 7)
     }
 
@@ -4321,105 +4422,105 @@ impl CodeBuf {
     #[inline]
     pub fn addsd(&mut self, dst: XmmReg, src: XmmReg) {
         self.xmm_rex(dst, src);
-        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x58, self.xmm_modrm(dst, src)]);
+        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x58, Self::xmm_modrm(dst, src)]);
     }
     #[inline]
     pub fn subsd(&mut self, dst: XmmReg, src: XmmReg) {
         self.xmm_rex(dst, src);
-        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x5C, self.xmm_modrm(dst, src)]);
+        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x5C, Self::xmm_modrm(dst, src)]);
     }
     #[inline]
     pub fn mulsd(&mut self, dst: XmmReg, src: XmmReg) {
         self.xmm_rex(dst, src);
-        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x59, self.xmm_modrm(dst, src)]);
+        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x59, Self::xmm_modrm(dst, src)]);
     }
     #[inline]
     pub fn divsd(&mut self, dst: XmmReg, src: XmmReg) {
         self.xmm_rex(dst, src);
-        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x5E, self.xmm_modrm(dst, src)]);
+        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x5E, Self::xmm_modrm(dst, src)]);
     }
 
     // Scalar float arithmetic
     #[inline]
     pub fn addss(&mut self, dst: XmmReg, src: XmmReg) {
         self.xmm_rex(dst, src);
-        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x58, self.xmm_modrm(dst, src)]);
+        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x58, Self::xmm_modrm(dst, src)]);
     }
     #[inline]
     pub fn subss(&mut self, dst: XmmReg, src: XmmReg) {
         self.xmm_rex(dst, src);
-        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x5C, self.xmm_modrm(dst, src)]);
+        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x5C, Self::xmm_modrm(dst, src)]);
     }
     #[inline]
     pub fn mulss(&mut self, dst: XmmReg, src: XmmReg) {
         self.xmm_rex(dst, src);
-        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x59, self.xmm_modrm(dst, src)]);
+        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x59, Self::xmm_modrm(dst, src)]);
     }
     #[inline]
     pub fn divss(&mut self, dst: XmmReg, src: XmmReg) {
         self.xmm_rex(dst, src);
-        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x5E, self.xmm_modrm(dst, src)]);
+        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x5E, Self::xmm_modrm(dst, src)]);
     }
 
     #[inline]
     pub fn ucomiss(&mut self, lhs: XmmReg, rhs: XmmReg) {
         self.xmm_rex(lhs, rhs);
-        self.bytes.extend_from_slice(&[0x0F, 0x2E, self.xmm_modrm(lhs, rhs)]);
+        self.bytes.extend_from_slice(&[0x0F, 0x2E, Self::xmm_modrm(lhs, rhs)]);
     }
     #[inline]
     pub fn ucomisd(&mut self, lhs: XmmReg, rhs: XmmReg) {
         self.xmm_rex(lhs, rhs);
-        self.bytes.extend_from_slice(&[0x66, 0x0F, 0x2E, self.xmm_modrm(lhs, rhs)]);
+        self.bytes.extend_from_slice(&[0x66, 0x0F, 0x2E, Self::xmm_modrm(lhs, rhs)]);
     }
 
     #[inline]
     pub fn movss_rr(&mut self, dst: XmmReg, src: XmmReg) {
         if dst == src { return; }
         self.xmm_rex(dst, src);
-        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x10, self.xmm_modrm(dst, src)]);
+        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x10, Self::xmm_modrm(dst, src)]);
     }
     #[inline]
     pub fn movsd_rr(&mut self, dst: XmmReg, src: XmmReg) {
         if dst == src { return; }
         self.xmm_rex(dst, src);
-        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x10, self.xmm_modrm(dst, src)]);
+        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x10, Self::xmm_modrm(dst, src)]);
     }
 
     #[inline]
     pub fn cvtss2sd(&mut self, dst: XmmReg, src: XmmReg) {
         self.xmm_rex(dst, src);
-        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x5A, self.xmm_modrm(dst, src)]);
+        self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x5A, Self::xmm_modrm(dst, src)]);
     }
     #[inline]
     pub fn cvtsd2ss(&mut self, dst: XmmReg, src: XmmReg) {
         self.xmm_rex(dst, src);
-        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x5A, self.xmm_modrm(dst, src)]);
+        self.bytes.extend_from_slice(&[0xF2, 0x0F, 0x5A, Self::xmm_modrm(dst, src)]);
     }
     #[inline]
     pub fn cvtsi2sd(&mut self, dst: XmmReg, src: Reg) {
         // REX.W=1 for 64-bit int src, REX.R if dst>=8, REX.B if src>=8
-        let rex = 0x48 | ((dst as u8 >= 8) as u8) << 2 | (src.ext() as u8);
+        let rex = 0x48 | u8::from(dst as u8 >= 8) << 2 | u8::from(src.ext());
         self.bytes.extend_from_slice(&[0xF2, rex, 0x0F, 0x2A]);
         self.bytes.push(0xC0 | (dst as u8 & 7) << 3 | src.enc());
     }
     // cvtsi2ss: F3 0F 2A /r (int -> float)
     #[inline]
     pub fn cvtsi2ss(&mut self, dst: XmmReg, src: Reg) {
-        let rex = 0x48 | ((dst as u8 >= 8) as u8) << 2 | (src.ext() as u8);
+        let rex = 0x48 | u8::from(dst as u8 >= 8) << 2 | u8::from(src.ext());
         self.bytes.extend_from_slice(&[0xF3, rex, 0x0F, 0x2A]);
         self.bytes.push(0xC0 | (dst as u8 & 7) << 3 | src.enc());
     }
     // cvttss2si: F3 0F 2C /r (float -> int, truncate)
     #[inline]
     pub fn cvttss2si(&mut self, dst: Reg, src: XmmReg) {
-        let rex = 0x48 | (dst.ext() as u8) << 2 | ((src as u8 >= 8) as u8);
+        let rex = 0x48 | u8::from(dst.ext()) << 2 | u8::from(src as u8 >= 8);
         self.bytes.extend_from_slice(&[0xF3, rex, 0x0F, 0x2C]);
         self.bytes.push(0xC0 | (dst.enc()) << 3 | (src as u8 & 7));
     }
     // cvttsd2si: F2 0F 2C /r (double -> int, truncate)
     #[inline]
     pub fn cvttsd2si(&mut self, dst: Reg, src: XmmReg) {
-        let rex = 0x48 | (dst.ext() as u8) << 2 | ((src as u8 >= 8) as u8);
+        let rex = 0x48 | u8::from(dst.ext()) << 2 | u8::from(src as u8 >= 8);
         self.bytes.extend_from_slice(&[0xF2, rex, 0x0F, 0x2C]);
         self.bytes.push(0xC0 | (dst.enc()) << 3 | (src as u8 & 7));
     }
@@ -4427,7 +4528,7 @@ impl CodeBuf {
     // mov r64, [rip + disp32] - REX.W 8B /r with ModRM = 05 (RIP-relative)
     #[inline]
     pub fn mov_load_rip(&mut self, dst: Reg) -> usize {
-        let rex = 0x48 | ((dst.ext() as u8) << 2);
+        let rex = 0x48 | (u8::from(dst.ext()) << 2);
         self.bytes.push(rex);
         self.bytes.push(0x8B);
         self.bytes.push(0x05 | (dst.enc() << 3));
@@ -4503,12 +4604,16 @@ const VALUE_STACK_CAP: usize = 64;
 pub struct ValueStack { vals: [CValue; VALUE_STACK_CAP], top: usize }
 
 impl ValueStack {
+    #[inline] #[must_use]
     pub fn new() -> Self { Self { vals: [CValue::imm(TYPE_INT, 0); VALUE_STACK_CAP], top: 0 } }
-    pub fn push(&mut self, v: CValue) { self.vals[self.top] = v; self.top += 1; }
-    #[track_caller]
-    pub fn pop (&mut self) -> CValue  { self.top -= 1; self.vals[self.top] }
+    #[inline] pub fn push(&mut self, v: CValue) { self.vals[self.top] = v; self.top += 1; }
+    #[inline] pub fn pop (&mut self) -> CValue  { self.top -= 1; self.vals[self.top] }
+    #[inline] #[must_use]
     pub fn peek(&self)     -> CValue  { self.vals[self.top - 1] }
+    #[inline] #[must_use]
     pub fn len (&self)     -> usize   { self.top }
+    #[inline] #[must_use]
+    pub fn is_empty(&self) -> bool    { self.len() == 0 }
 }
 
 const MAX_LOCALS: usize = 128;
@@ -4531,6 +4636,7 @@ pub struct LocalTable {
 
 impl LocalTable {
     #[inline]
+    #[must_use]
     pub fn new() -> Self {
         Self {
             locals: SmallVec::new(),
@@ -4582,6 +4688,7 @@ impl LocalTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn find(&self, hash: u64) -> Option<LocalEntry> {
         self.index.get(&hash).map(|&i| self.locals[i as usize])
     }
@@ -4651,6 +4758,7 @@ impl DerefMut for SymTable {
 
 impl SymTable {
     #[inline]
+    #[must_use]
     pub fn new() -> Self {
         Self {
             syms: SmallVec::new(),
@@ -4662,6 +4770,7 @@ impl SymTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn find(&self, hash: u64) -> Option<usize> {
         self.index.get(&hash).map(|&i| i as usize)
     }
@@ -4714,6 +4823,7 @@ impl SymTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn s(&self, i: usize) -> &str {
         let name_off = self.name_offs[i] as usize;
         let name_len = self.name_lens[i] as usize;
@@ -4771,9 +4881,9 @@ pub struct GlobalEntry {
     pub name_off: u32,     // 4
     pub name_len: u16,     // 2
 
-    /// flags==IS_IN_BSS     :  Offset into bss
-    /// flags==IS_EXTERN     :  Symbol index (for GOT relocs)
-    /// flags==IS_STATIC     :  For symbol visibility
+    /// `flags==IS_IN_BSS`     :  Offset into bss
+    /// `flags==IS_EXTERN`     :  Symbol index (for GOT relocs)
+    /// `flags==IS_STATIC`     :  For symbol visibility
     pub extra: u32,        // 4
 
     pub flags: GlobalEntryFlags, // 1
@@ -4781,18 +4891,21 @@ pub struct GlobalEntry {
 
 impl GlobalEntry {
     #[inline]
+    #[must_use]
     pub fn data_off(&self) -> u32 {
         debug_assert!(!self.flags.contains(GlobalEntryFlags::EXTERN));
         self.extra
     }
 
     #[inline]
+    #[must_use]
     pub fn sym_index(&self) -> u32 {
         debug_assert!(self.flags.contains(GlobalEntryFlags::EXTERN));
         self.extra
     }
 
     #[inline]
+    #[must_use]
     pub fn s<'a>(&self, buf: &'a [u8]) -> &'a str {
         unsafe {
             std::str::from_utf8_unchecked(
@@ -4815,6 +4928,7 @@ pub struct GlobalTable {
 
 impl GlobalTable {
     #[inline]
+    #[must_use]
     pub fn new() -> Self {
         Self {
             vars: SmallVec::new(),
@@ -4824,6 +4938,7 @@ impl GlobalTable {
     }
 
     #[inline]
+    #[must_use]
     pub fn find(&self, hash: u64) -> Option<GlobalEntry> {
         self.index.get(&hash).map(|&i| self.vars[i as usize])
     }
@@ -5002,7 +5117,7 @@ impl Compiler {
             return smallvec![SysVClass::Memory];
         }
 
-        let n_eightbytes = (size + 7) / 8;
+        let n_eightbytes = size.div_ceil(8);
         let mut classes = SmallVec::new();
 
         for i in 0..n_eightbytes {
@@ -5017,6 +5132,7 @@ impl Compiler {
 
 impl Compiler {
     #[inline]
+    #[must_use]
     pub fn new(pp: PP) -> Self {
         let mut c = Self {
             pp,
@@ -5496,13 +5612,14 @@ impl Compiler {
     }
 
     /// Parse a declarator on top of `base_ty`.
-    /// Returns (final_type, name_token).
+    /// Returns (`final_type`, `name_token`).
     fn parse_declarator(&mut self, base_ty: TypeRef) -> CResult<(TypeRef, Option<Token>)> {
         self.parse_declarator_impl(base_ty).map(|(ty, name, _)| (ty, name))
     }
 
     /// Parse a declarator on top of `base_ty`.
-    /// Returns (final_type, name_token, params).
+    /// Returns (`final_type`, `name_token`, params).
+    #[allow(clippy::type_complexity)] // @Cleanup
     fn parse_declarator_impl(
         &mut self,
         base_ty: TypeRef
@@ -5663,8 +5780,8 @@ impl Compiler {
         Ok((ty, name_tok, saved_params))
     }
 
-    /// Replace TYPE_VOID placeholder leaves (from grouped declarator parsing)
-    /// with real_base throughout the type chain.
+    /// Replace `TYPE_VOID` placeholder leaves (from grouped declarator parsing)
+    /// with `real_base` throughout the type chain.
     #[inline]
     fn patch_declarator_base(&mut self, ty: TypeRef, real_base: TypeRef) -> TypeRef {
         if ty == TYPE_VOID { return real_base; }
@@ -5750,7 +5867,7 @@ impl Compiler {
             }
 
             VK::Local | VK::RegInd => {
-                let base = match v.reg() { ValReg::Gp(r) => r, _ => unreachable!() };
+                let base = v.reg().as_gp();
                 let xmm = self.xmms.alloc(Span::POISONED)?;
                 self.emit_float_load(xmm, base, v.offset(), v.ty);
                 if v.kind() == VK::RegInd { self.regs.free(base); }
@@ -5826,7 +5943,7 @@ impl Compiler {
             eprintln!("warning: {} unclosed #if/#ifdef at end of file",
                       self.pp.ifdef_stack.len());
             for (i, s) in self.pp.ifdef_stack.iter().enumerate() {
-                eprintln!("  [{}] {:?}", i, s);
+                eprintln!("  [{i}] {s:?}");
             }
         }
     }
@@ -5909,7 +6026,7 @@ impl Compiler {
             }
 
             flags -= SymFlags::EXTERN;
-            return self.compile_func(name_tok.span, name_tok.hash, func_ty, params, flags);
+            return self.compile_func(name_tok.span, name_tok.hash, func_ty, &params, flags);
         }
 
         //
@@ -5928,7 +6045,7 @@ impl Compiler {
         name_span: Span,
         hash: u64,
         func_ty: TypeRef,
-        params: Vec<(TypeRef, u64, Span)>,
+        params: &[(TypeRef, u64, Span)],
         flags: SymFlags,
     ) -> CResult<()> {
         let code_off = self.code.pos() as u32;
@@ -6018,7 +6135,7 @@ impl Compiler {
         // Spill params to stack (convenience, for pop_reg)
         //
 
-        for &(param_ty, param_hash, param_span) in &params {
+        for &(param_ty, param_hash, param_span) in params {
             if matches!(self.get_kind(param_ty), TypeKind::Struct | TypeKind::Union) {
                 let classes = self.classify_struct(param_ty);
 
@@ -6087,6 +6204,7 @@ impl Compiler {
     }
 
     #[inline]
+    #[allow(clippy::type_complexity)] // @Cleanup
     fn compile_params(&mut self) -> CResult<(Vec<(TypeRef, u64, Span)>, bool)> {
         let mut params = Vec::new();
 
@@ -6363,7 +6481,9 @@ impl Compiler {
         // Init has its own scope
         self.locals.push_scope();
 
-        if self.current_token.kind != TK::SemiColon {
+        if self.current_token.kind == TK::SemiColon {
+            self.next(); // ';'
+        } else {
             let h = self.current_token.hash;
             if self.can_hash_start_a_type(h) {
                 self.compile_local_decl()?;
@@ -6373,8 +6493,6 @@ impl Compiler {
                 if v.kind() == VK::Reg { self.free_reg(v.reg()); }
                 self.expect(TK::SemiColon, "';'")?;
             }
-        } else {
-            self.next(); // ';'
         }
 
         //
@@ -6795,7 +6913,7 @@ impl Compiler {
 
                     // Zero pad remaining if sized
                     if !inferred && actual_len < arr_len {
-                        self.data.extend(std::iter::repeat(0u8).take(arr_len - actual_len));
+                        self.data.extend(std::iter::repeat_n(0u8, arr_len - actual_len));
                     }
 
                     actual_len
@@ -6832,8 +6950,8 @@ impl Compiler {
 
                     // Zero pad remaining if sized
                     if !inferred && count < arr_len {
-                        let remaining = (arr_len - count) as usize * elem_sz;
-                        self.data.extend(std::iter::repeat(0u8).take(remaining));
+                        let remaining = (arr_len - count) * elem_sz;
+                        self.data.extend(std::iter::repeat_n(0u8, remaining));
                     }
 
                     actual_len
@@ -7076,7 +7194,7 @@ impl Compiler {
 
                 // store byte: mov byte [rbp + off], imm
                 let tmp = self.regs.alloc(Span::POISONED)?;
-                self.code.mov_ri64(tmp, b as i64);
+                self.code.mov_ri64(tmp, i64::from(b));
                 self.code.mov_store8(Reg::Rbp, off, tmp);
                 self.regs.free(tmp);
 
@@ -7812,7 +7930,7 @@ impl Compiler {
 
                 self.code.mov_rr(Reg::Rax, l);
                 self.code.cqo();
-                self.code.mov_ri64(Reg::Rcx, elem_sz as i64);
+                self.code.mov_ri64(Reg::Rcx, i64::from(elem_sz));
                 self.code.idiv_r(Reg::Rcx);
                 self.regs.free(l);
                 self.regs.mark(Reg::Rax);
@@ -7873,22 +7991,22 @@ impl Compiler {
                 let l = lhs.imm as u64;
                 let r = rhs.imm as u64;
                 match op {
-                    TK::EqEq      => (l == r) as i64,
-                    TK::NotEq     => (l != r) as i64,
-                    TK::Less      => (l <  r) as i64,
-                    TK::Greater   => (l >  r) as i64,
-                    TK::LessEq    => (l <= r) as i64,
-                    TK::GreaterEq => (l >= r) as i64,
+                    TK::EqEq      => i64::from(l == r),
+                    TK::NotEq     => i64::from(l != r),
+                    TK::Less      => i64::from(l < r),
+                    TK::Greater   => i64::from(l > r),
+                    TK::LessEq    => i64::from(l <= r),
+                    TK::GreaterEq => i64::from(l >= r),
                     _ => unreachable!(),
                 }
             } else {
                 match op {
-                    TK::EqEq      => (lhs.imm == rhs.imm) as i64,
-                    TK::NotEq     => (lhs.imm != rhs.imm) as i64,
-                    TK::Less      => (lhs.imm <  rhs.imm) as i64,
-                    TK::Greater   => (lhs.imm >  rhs.imm) as i64,
-                    TK::LessEq    => (lhs.imm <= rhs.imm) as i64,
-                    TK::GreaterEq => (lhs.imm >= rhs.imm) as i64,
+                    TK::EqEq      => i64::from(lhs.imm == rhs.imm),
+                    TK::NotEq     => i64::from(lhs.imm != rhs.imm),
+                    TK::Less      => i64::from(lhs.imm < rhs.imm),
+                    TK::Greater   => i64::from(lhs.imm > rhs.imm),
+                    TK::LessEq    => i64::from(lhs.imm <= rhs.imm),
+                    TK::GreaterEq => i64::from(lhs.imm >= rhs.imm),
                     _ => unreachable!(),
                 }
             };
@@ -7976,8 +8094,8 @@ impl Compiler {
                 // xorpd xmm, [rip + sign_mask] - flip sign bit
                 let rodata_off = self.rodata.len() as u32;
                 match self.get_kind(ty) {
-                    TypeKind::Float => self.rodata.extend_from_slice(&0x80000000u32.to_le_bytes()),
-                    _               => self.rodata.extend_from_slice(&0x8000000000000000u64.to_le_bytes()),
+                    TypeKind::Float => self.rodata.extend_from_slice(&0x8000_0000_u32.to_le_bytes()),
+                    _               => self.rodata.extend_from_slice(&0x8000_0000_0000_0000_u64.to_le_bytes()),
                 }
 
                 let text_off = self.emit_float_xor_rip(r, ty) as _;
@@ -8206,7 +8324,7 @@ impl Compiler {
         if matches!(v.kind(), VK::Imm) {
             Ok(v.imm)
         } else {
-            return Err(CError::Expected {
+            Err(CError::Expected {
                 span: expr_start_span,
                 expected: "constant integer expression",
                 got: format!("{:?}", v.kind()),
@@ -8232,15 +8350,12 @@ impl Compiler {
 
                 VK::Reg => {
                     let rodata_off = rodata_before;
-                    match c.types.get_kind(v.ty) {
-                        TypeKind::Float => {
-                            let bytes = &c.rodata[rodata_off..rodata_off+4];
-                            f32::from_bits(u32::from_le_bytes(bytes.try_into().unwrap())) as f64
-                        }
-                        _ => {
-                            let bytes = &c.rodata[rodata_off..rodata_off+8];
-                            f64::from_bits(u64::from_le_bytes(bytes.try_into().unwrap()))
-                        }
+                    if c.types.get_kind(v.ty) == TypeKind::Float {
+                        let bytes = &c.rodata[rodata_off..rodata_off+4];
+                        f64::from(f32::from_bits(u32::from_le_bytes(bytes.try_into().unwrap())))
+                    } else {
+                        let bytes = &c.rodata[rodata_off..rodata_off+8];
+                        f64::from_bits(u64::from_le_bytes(bytes.try_into().unwrap()))
                     }
                 }
 
@@ -8321,9 +8436,9 @@ impl Compiler {
             }
 
             // ptr -> ptr, ptr -> int, int -> ptr: just retag
-            (TypeKind::Ptr, TypeKind::Ptr) |
-            (TypeKind::Ptr, TypeKind::Int) | (TypeKind::Ptr, TypeKind::Long) | (TypeKind::Ptr, TypeKind::LLong) |
-            (TypeKind::Int, TypeKind::Ptr) | (TypeKind::Long, TypeKind::Ptr) | (TypeKind::LLong, TypeKind::Ptr) => {
+            (TypeKind::Ptr | TypeKind::Int | TypeKind::Long | TypeKind::LLong,
+TypeKind::Ptr) |
+(TypeKind::Ptr, TypeKind::Int | TypeKind::Long | TypeKind::LLong) => {
                 let r = self.force_gp(v)?;
                 self.vstack.push(CValue::gp(to, r));
             }
@@ -8447,18 +8562,18 @@ impl Compiler {
 
                 let val = if s.starts_with('\\') {
                     match s.as_bytes().get(1) {
-                        Some(b'n')  => b'\n' as i64,
-                        Some(b't')  => b'\t' as i64,
-                        Some(b'r')  => b'\r' as i64,
-                        Some(b'0')  => b'\0' as i64,
-                        Some(b'\\') => b'\\' as i64,
-                        Some(b'\'') => b'\'' as i64,
-                        Some(b'"')  => b'"'  as i64,
-                        Some(&b)    => b as i64,
+                        Some(b'n')  => i64::from(b'\n'),
+                        Some(b't')  => i64::from(b'\t'),
+                        Some(b'r')  => i64::from(b'\r'),
+                        Some(b'0')  => i64::from(b'\0'),
+                        Some(b'\\') => i64::from(b'\\'),
+                        Some(b'\'') => i64::from(b'\''),
+                        Some(b'"')  => i64::from(b'"'),
+                        Some(&b)    => i64::from(b),
                         None        => 0,
                     }
                 } else {
-                    s.as_bytes()[0] as i64
+                    i64::from(s.as_bytes()[0])
                 };
 
                 self.vstack.push(CValue::imm(TYPE_INT, val));
@@ -8525,7 +8640,7 @@ impl Compiler {
                         self.vstack.push(CValue::gp(TYPE_INT, r));
                     } else {
                         let size = self.types.size_of(ty);
-                        self.vstack.push(CValue::imm(TYPE_INT, size as _));
+                        self.vstack.push(CValue::imm(TYPE_INT, size.into()));
                     }
                 } else if self.current_token.kind == TK::LParen {
                     if !self.try_compile_builtin(hash)? {
@@ -8834,7 +8949,7 @@ impl Compiler {
     }
 
     #[inline]
-    fn emit_memcpy_call(&mut self) -> CResult<()> {
+    fn emit_memcpy_call(&mut self) {
         let call_site = self.code.call_rel32();
         let memcpy_hash = hash_ident("memcpy");
         let idx = if let Some(idx) = self.syms.find(memcpy_hash) {
@@ -8855,8 +8970,6 @@ impl Compiler {
 
         self.regs.clobber_caller_save();
         self.xmms.clobber_caller_save();
-
-        Ok(())
     }
 
     fn emit_struct_copy(
@@ -8915,9 +9028,9 @@ impl Compiler {
                 else            { self.code.lea(Reg::Rsi, src_base, src_off); }
             }
 
-            self.code.mov_ri64(Reg::Rdx, size as i64);
+            self.code.mov_ri64(Reg::Rdx, i64::from(size));
 
-            self.emit_memcpy_call()?;  // memcpy(dst(rdi), src(rsi), n(rdx))
+            self.emit_memcpy_call();  // memcpy(dst(rdi), src(rsi), n(rdx))
         }
 
         Ok(())
@@ -9315,7 +9428,7 @@ impl Compiler {
 
         if let Some((ret_off, is_memory)) = struct_ret_off {
             if !is_memory {
-                self.unpack_struct_return_regs(ret_off, ret_ty)?;
+                self.unpack_struct_return_regs(ret_off, ret_ty);
             }
 
             self.vstack.push(CValue::local(ret_ty, ret_off));
@@ -9331,7 +9444,7 @@ impl Compiler {
     }
 
     #[inline]
-    fn unpack_struct_return_regs(&mut self, ret_off: i32, ret_ty: TypeRef) -> CResult<()> {
+    fn unpack_struct_return_regs(&mut self, ret_off: i32, ret_ty: TypeRef) {
         let classes = self.classify_struct(ret_ty);
         let size = self.types.size_of(ret_ty) as i32;
 
@@ -9361,8 +9474,6 @@ impl Compiler {
                 SysVClass::Memory => unreachable!(),
             }
         }
-
-        Ok(())
     }
 
     #[inline]
@@ -9402,8 +9513,6 @@ impl Compiler {
 
                     if chunk >= 8 {
                         self.code.movq_xmm_load(xmm, src_base, src_off + offset);
-                    } else if chunk >= 4 {
-                        self.code.movss_load(xmm, src_base, src_off + offset);
                     } else {
                         self.code.movss_load(xmm, src_base, src_off + offset);
                     }
@@ -9558,7 +9667,7 @@ impl Compiler {
 	// Type Coercion Infrastructure
     //
 
-	/// Pure-type UAC: returns the common TypeRef without emitting any code.
+	/// Pure-type UAC: returns the common `TypeRef` without emitting any code.
 	/// Used for constant-folding fast paths where we just need the result type.
 	#[inline]
 	fn get_usual_arithmetic_conversion_type(&self, lty: TypeRef, rty: TypeRef) -> TypeRef {
@@ -9647,7 +9756,7 @@ impl Compiler {
 	}
 
 	/// Usual arithmetic conversions (C11 $6.3.1.8).
-	/// Returns (coerced_lhs, coerced_rhs, common_type).
+	/// Returns (`coerced_lhs`, `coerced_rhs`, `common_type`).
 	///
 	/// Float dominance:
 	///   double > float (long double omitted - no hw regs yet)
@@ -9714,7 +9823,7 @@ impl Compiler {
 	    Ok((lv, rv, common_ty))
 	}
 
-	/// Coerce an integer CValue to `target` integer type.
+	/// Coerce an integer `CValue` to `target` integer type.
 	/// Extends (sign/zero) upward, truncation is implicit on x86-64.
 	#[inline]
 	fn coerce_int(&mut self, v: CValue, target: TypeRef) -> CResult<CValue> {
@@ -9761,7 +9870,7 @@ impl Compiler {
                     //
 	                // Constant fold: store bits in a fresh Imm with fimm set
                     //
-	                let fval = v.imm as f64;
+	                let fval = v.get_fimm();
 	                return Ok(CValue::fimm(target, fval));
 	            }
 
@@ -9809,7 +9918,7 @@ impl Compiler {
 	        (TypeKind::Double, TypeKind::Float) => {
 	            // TODO(flags): warn on precision loss if -Wfloat-conversion
 	            if v.kind() == VK::Imm {
-	                return Ok(CValue::fimm(target, v.get_fimm() as f32 as f64));
+	                return Ok(CValue::fimm(target, f64::from(v.get_fimm() as f32)));
 	            }
 	            let xmm = self.force_xmm(v)?;
 	            self.code.cvtsd2ss(xmm, xmm);
@@ -9845,6 +9954,7 @@ impl Compiler {
 	}
 }
 
+#[must_use]
 pub fn write_elf(c: &Compiler) -> Vec<u8> {
     let nsyms = c.syms.len();
     let ngvars = c.globals.vars.len();
@@ -9864,7 +9974,7 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
         strtab.extend_from_slice(c.syms.s(i).as_bytes());
         strtab.push(0);
     }
-    for gv in c.globals.vars.iter() {
+    for gv in &c.globals.vars {
         gvar_name_index.push(strtab.len() as u32);
         strtab.extend_from_slice(gv.s(&c.globals.name_buf).as_bytes());
         strtab.push(0);
@@ -9937,13 +10047,13 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
         if sym.flags.contains(SymFlags::EXTERN) { continue; }
         if !sym.flags.contains(SymFlags::STATIC)  { continue; }
 
-        push_sym(&mut symtab, sym_name_index[i], (STB_LOCAL<<4)|STT_FUNC, SHN_TEXT, sym.code_off as u64, sym.code_len as u64);
+        push_sym(&mut symtab, sym_name_index[i], (STB_LOCAL<<4)|STT_FUNC, SHN_TEXT, u64::from(sym.code_off), u64::from(sym.code_len));
     }
     for (i, gv) in c.globals.vars.iter().enumerate() {
         if !gv.flags.contains(GlobalEntryFlags::STATIC) { continue; }
 
         let shndx = if gv.flags.contains(GlobalEntryFlags::BSS) { SHN_BSS } else { SHN_DATA };
-        push_sym(&mut symtab, gvar_name_index[i], (STB_LOCAL<<4)|STT_OBJECT, shndx, gv.data_off() as u64, c.size_of(gv.ty) as u64);
+        push_sym(&mut symtab, gvar_name_index[i], (STB_LOCAL<<4)|STT_OBJECT, shndx, u64::from(gv.data_off()), u64::from(c.size_of(gv.ty)));
     }
 
     //
@@ -9956,14 +10066,14 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
         if sym.flags.contains(SymFlags::EXTERN) { continue; }
         if sym.flags.contains(SymFlags::STATIC)  { continue; }
 
-        push_sym(&mut symtab, sym_name_index[i], (STB_GLOBAL<<4)|STT_FUNC, SHN_TEXT, sym.code_off as u64, sym.code_len as u64);
+        push_sym(&mut symtab, sym_name_index[i], (STB_GLOBAL<<4)|STT_FUNC, SHN_TEXT, u64::from(sym.code_off), u64::from(sym.code_len));
     }
     for (i, gv) in c.globals.vars.iter().enumerate() {
         if gv.flags.contains(GlobalEntryFlags::EXTERN) { continue; }
         if gv.flags.contains(GlobalEntryFlags::STATIC) { continue; }
 
         let shndx = if gv.flags.contains(GlobalEntryFlags::BSS) { SHN_BSS } else { SHN_DATA };
-        push_sym(&mut symtab, gvar_name_index[i], (STB_GLOBAL<<4)|STT_OBJECT, shndx, gv.data_off() as u64, c.size_of(gv.ty) as u64);
+        push_sym(&mut symtab, gvar_name_index[i], (STB_GLOBAL<<4)|STT_OBJECT, shndx, u64::from(gv.data_off()), u64::from(c.size_of(gv.ty)));
     }
 
     let mut elf_sym_index = vec![0u32; nsyms];
@@ -9996,18 +10106,18 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
     };
 
     for r in &c.call_relocs {
-        push_rela(&mut rela, r.offset as u64, elf_sym_index[r.sym_index as usize] as u64, R_PLT32, r.addend);
+        push_rela(&mut rela, u64::from(r.offset), u64::from(elf_sym_index[r.sym_index as usize]), R_PLT32, r.addend);
     }
     for r in &c.rodata_relocs {
-        push_rela(&mut rela, r.text_off as u64, RODATA_SYM, R_PC32, r.rodata_off as i64 - 4);
+        push_rela(&mut rela, u64::from(r.text_off), RODATA_SYM, R_PC32, i64::from(r.rodata_off) - 4);
     }
     for r in &c.data_relocs {
         let sym = if r.is_bss { BSS_SYM } else { DATA_SYM };
-        push_rela(&mut rela, r.text_off as u64, sym, R_PC32, r.data_off as i64 - 4);
+        push_rela(&mut rela, u64::from(r.text_off), sym, R_PC32, i64::from(r.data_off) - 4);
     }
     for r in &c.got_relocs {
         let sym_idx = elf_gvar_extern_sym_index[r.sym_index as usize];
-        push_rela(&mut rela, r.text_off as u64, sym_idx as u64, R_GOTPCREL, -4);
+        push_rela(&mut rela, u64::from(r.text_off), u64::from(sym_idx), R_GOTPCREL, -4);
     }
 
     //
@@ -10116,7 +10226,7 @@ fn main() {
 
     let out_path = args.iter()
         .position(|s| s == "-o")
-        .and_then(|i| args.get(i+1)).map(|s| s.as_str()).unwrap_or("out.o");
+        .and_then(|i| args.get(i+1)).map_or("out.o", std::string::String::as_str);
 
     let mut pp = match PP::new(Path::new(&args[1]), &args[1..]) {
         Ok(pp) => pp,
@@ -10172,7 +10282,7 @@ fn run_main(mut c: Compiler) {
     c.code.bytes.extend_from_slice(&c.data);
 
     let bss_base = c.code.bytes.len();
-    c.code.bytes.extend(std::iter::repeat(0u8).take(c.bss_size));
+    c.code.bytes.extend(std::iter::repeat_n(0u8, c.bss_size));
 
     //
     // Patch rodata relocs
@@ -10243,10 +10353,10 @@ fn run_main(mut c: Compiler) {
     // Prepare argc/argv/envp
     //
     let args = std::env::args().map(|s| CString::new(s).unwrap()).collect::<Vec<_>>();
-    let argv = args.iter().map(|s| s.as_ptr() as *const u8).chain([std::ptr::null()]).collect::<Vec<_>>();
+    let argv = args.iter().map(|s| s.as_ptr().cast::<u8>()).chain([std::ptr::null()]).collect::<Vec<_>>();
     let argc = args.len() as i32;
     let env_vars = std::env::vars().map(|(k,v)| CString::new(format!("{k}={v}")).unwrap()).collect::<Vec<_>>();
-    let envp = env_vars.iter().map(|s| s.as_ptr() as *const u8).chain([std::ptr::null()]).collect::<Vec<_>>();
+    let envp = env_vars.iter().map(|s| s.as_ptr().cast::<u8>()).chain([std::ptr::null()]).collect::<Vec<_>>();
 
     //
     // Find main
@@ -10273,7 +10383,7 @@ fn run_main(mut c: Compiler) {
         let patch_pos      = r.offset as usize;
         let rel = (base + trampoline_off as i64 - (base + patch_pos as i64 + 4)) as i32;
         unsafe {
-            std::ptr::write_unaligned(mmap.as_mut_ptr().add(patch_pos) as *mut i32, rel);
+            std::ptr::write_unaligned(mmap.as_mut_ptr().add(patch_pos).cast::<i32>(), rel);
         }
     }
 
@@ -10286,7 +10396,7 @@ fn run_main(mut c: Compiler) {
         let rel = (base + slot_off as i64) - (base + patch_pos as i64 + 4);
         unsafe {
             std::ptr::write_unaligned(
-                mmap.as_mut_ptr().add(patch_pos) as *mut i32,
+                mmap.as_mut_ptr().add(patch_pos).cast::<i32>(),
                 rel as i32
             );
         }
@@ -10295,7 +10405,7 @@ fn run_main(mut c: Compiler) {
     // Make entire mapping RWX - code needs exec (.data needs write)
     unsafe {
         libc::mprotect(
-            mmap.as_mut_ptr() as *mut libc::c_void,
+            mmap.as_mut_ptr().cast::<libc::c_void>(),
             mmap.len(),
             libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
         );
