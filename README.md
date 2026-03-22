@@ -2,7 +2,7 @@
 
 The fastest C compiler in the world.
 
-ccrush is a single-pass, ahead-of-time C compiler written in Rust, built completely from scratch with no LLVM, no libclang - just a handful of small utility crates. It compiles C directly to x86-64 ELF object files - or runs your code immediately in a JIT mode that mmaps the generated code and executes it in-process.
+ccrush is a single-pass, ahead-of-time C compiler written in Rust, built completely from scratch with no LLVM, no libclang. It compiles C directly to x86-64 ELF object files - or runs your code immediately in a JIT mode that mmaps the generated code and executes it in-process.
 
 It is fast because it is designed with handmade spirit: data-oriented, cache-friendly, no unnecessary abstraction. Every little hot structure is sized to fit in cache lines. There is no AST, no IR, no optimization pipeline. The compiler is just a loop over tokens that emits machine code as it goes. Like compilers used to be built back in the day.
 
