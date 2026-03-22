@@ -458,15 +458,15 @@ pub enum TK {
     BinAndEq, BinOrEq,
 
     // PP-internal - never escapes cooked stream
-    Hash, Newline,
 
+    Hash, Newline, Paste /* ## */, Stringify /* # */,
     // Inside macro bodies only
     Param(u8),
 }
 
 impl TK {
     #[inline]
-    pub fn compound_to_binop(self) -> TK {
+    pub const fn compound_to_binop(self) -> TK {
         match self {
             TK::PlusEq   => TK::Plus,
             TK::MinusEq  => TK::Minus,
@@ -544,6 +544,24 @@ const HASH_BREAK:    u64 = hash_ident("break");
 const HASH_BOOL:     u64 = hash_ident("bool");
 const HASH__BOOL:    u64 = hash_ident("_Bool");
 const HASH_CONTINUE: u64 = hash_ident("continue");
+
+const HASH___VA_ARGS__: u64 = hash_ident("__VA_ARGS__");
+
+const HASH_BUILTIN_BSWAP16:     u64 = hash_ident("__builtin_bswap16");
+const HASH_BUILTIN_BSWAP32:     u64 = hash_ident("__builtin_bswap32");
+const HASH_BUILTIN_BSWAP64:     u64 = hash_ident("__builtin_bswap64");
+const HASH_BUILTIN_CLZ:         u64 = hash_ident("__builtin_clz");
+const HASH_BUILTIN_CLZL:        u64 = hash_ident("__builtin_clzl");
+const HASH_BUILTIN_CLZLL:       u64 = hash_ident("__builtin_clzll");
+const HASH_BUILTIN_CTZ:         u64 = hash_ident("__builtin_ctz");
+const HASH_BUILTIN_CTZL:        u64 = hash_ident("__builtin_ctzl");
+const HASH_BUILTIN_CTZLL:       u64 = hash_ident("__builtin_ctzll");
+const HASH_BUILTIN_POPCOUNT:    u64 = hash_ident("__builtin_popcount");
+const HASH_BUILTIN_POPCOUNTL:   u64 = hash_ident("__builtin_popcountl");
+const HASH_BUILTIN_POPCOUNTLL:  u64 = hash_ident("__builtin_popcountll");
+const HASH_BUILTIN_EXPECT:      u64 = hash_ident("__builtin_expect");
+const HASH_BUILTIN_UNREACHABLE: u64 = hash_ident("__builtin_unreachable");
+const HASH_BUILTIN_TRAP:        u64 = hash_ident("__builtin_trap");
 
 const HASH_HIDDEN_LOCAL: u64 = 0;
 
@@ -748,7 +766,8 @@ struct MacroDef {
     body_len:     u32,  // 4
 
     param_count:  u8,   // 1
-    _pad:         [u8; 3],
+    is_variadic:  bool, // 1
+    _pad:         [u8; 2],
 }
 
 struct MacroTable {
@@ -795,7 +814,7 @@ impl MacroTable {
     }
 
     #[inline]
-    fn define(&mut self, name_hash: u64, def_span: Span, params: &[u64], body: &[Token]) {
+    fn define(&mut self, name_hash: u64, def_span: Span, is_variadic: bool, params: &[u64], body: &[Token]) {
         let body_start  = self.tok_pool.len() as u32;
 
         self.tok_pool.extend_from_slice(body);
@@ -803,9 +822,10 @@ impl MacroTable {
         let def = MacroDef {
             def_span,
             body_start,
+            is_variadic,
             body_len:    body.len() as u32,
             param_count: params.len() as u8,
-            _pad: [0; 3]
+            _pad: [0; 2]
         };
 
         if let Some(&i) = self.index.get(&name_hash) {
@@ -1139,6 +1159,9 @@ impl PP {
         self.define_func_macro("__glibc_has_builtin",         &["b"],          *b"0");
         self.define_func_macro("__GLIBC_USE",                 &["f"],          *b"0");
         self.define_func_macro("__glibc_clang_has_extension", &["ext"],        *b"0");
+
+        self.define_func_macro("__CONCAT", &["x", "y"],       *b"x ## y");
+        self.define_func_macro("__STRING", &["x"],            *b"#x");
     }
 
     #[inline]
@@ -1158,7 +1181,7 @@ impl PP {
     #[inline]
     pub fn define_simple(&mut self, name: &str, val: &str) {
         let (_, body) = self.lex_str(val.as_bytes());
-        self.macros.define(hash_ident(name), Span::POISONED, &[], &body);
+        self.macros.define(hash_ident(name), Span::POISONED, false, &[], &body);
     }
 
     #[inline]
@@ -1172,7 +1195,8 @@ impl PP {
         let param_hashes: SmallVec<[u64; MAX_PARAMS]> = params.iter()
             .map(|&p| hash_ident(p))
             .collect();
-        self.macros.define(hash_ident(name), Span::POISONED, &param_hashes, &body_toks);
+
+        self.macros.define(hash_ident(name), Span::POISONED, false, &param_hashes, &body_toks);
     }
 
     #[inline]
@@ -1352,12 +1376,15 @@ impl PP {
             && next.span.file  == name_tok.span.file
             && next.span.start == name_tok.span.start + name_tok.span.len as u32;
 
-        let mut param_hashes: SmallVec<[u64; MAX_PARAMS]> = SmallVec::new();
-        let mut body: Vec<Token> = Vec::new();
+        let mut param_hashes = SmallVec::<[u64; MAX_PARAMS]>::new();
+        let mut is_variadic = false;
+        let mut body = Vec::new();
 
+        // Returns TK::Param(i) if t matches a param name, else t unchanged.
+        // For __VA_ARGS__, param index = param_count (last slot).
         #[inline]
-        fn try_param_subst(t: Token, params: &[u64], arena: &SrcArena) -> Token {
-            if t.kind != TK::Ident || params.is_empty() { return t; }
+        fn try_param_subst(t: Token, params: &[u64], is_variadic: bool, arena: &SrcArena) -> Token {
+            if t.kind != TK::Ident { return t; }
 
             let h = hash_ident(t.s(arena));
             for (i, &ph) in params.iter().enumerate() {
@@ -1366,40 +1393,72 @@ impl PP {
                 }
             }
 
+            if is_variadic && h == HASH___VA_ARGS__ {
+                return Token { kind: TK::Param(params.len() as u8), span: t.span, hash: 0 };
+            }
+
             t
         }
 
         if is_func {
-            // Collect params
             loop {
                 let t = self.raw();
                 match t.kind {
-                    TK::RParen             => break,
-                    TK::Comma              => {}
-                    TK::Ident              => { param_hashes.push(hash_ident(t.s(&self.src_arena))); }
-                    TK::Newline | TK::Eof  => { self.skip_line(); return Ok(()); }
+                    TK::RParen            => break,
+                    TK::Comma             => {}
+                    TK::Ident             => { param_hashes.push(hash_ident(t.s(&self.src_arena))); }
+                    TK::TripleDot         => { is_variadic = true; }
+                    TK::Newline | TK::Eof => { self.skip_line(); return Ok(()); }
                     _ => {}
                 }
             }
-
-            // Collect body
-            loop {
-                let t = self.raw();
-                if matches!(t.kind, TK::Newline | TK::Eof) { self.at_bol = true; break; }
-                body.push(try_param_subst(t, &param_hashes, &self.src_arena));
-            }
-        } else if !matches!(next.kind, TK::Newline | TK::Eof) {
-            body.push(try_param_subst(next, &param_hashes, &self.src_arena));
-            loop {
-                let t = self.raw();
-                if matches!(t.kind, TK::Newline | TK::Eof) { self.at_bol = true; break; }
-                body.push(try_param_subst(t, &param_hashes, &self.src_arena));
-            }
-        } else {
-            self.at_bol = true;
         }
 
-        self.macros.define(name_hash, def_span, &param_hashes, &body);
+        // For object macros `next` is the first body token (or newline/eof).
+        // For func macros we start reading fresh.
+        let mut pending = if !is_func { Some(next) } else { None };
+
+        loop {
+            let t = match pending.take() {
+                Some(t) => t,
+                None    => self.raw(),
+            };
+
+            if matches!(t.kind, TK::Newline | TK::Eof) { self.at_bol = true; break; }
+
+            match t.kind {
+                TK::Hash => {
+                    let next2 = self.raw();
+                    if next2.kind == TK::Hash {
+                        // ## paste operator
+                        body.push(Token { kind: TK::Paste, span: t.span, hash: 0 });
+                    } else if matches!(next2.kind, TK::Newline | TK::Eof) {
+                        // # at end of line - ignore
+                        self.at_bol = true;
+                        break;
+                    } else {
+                        // # param - stringification
+                        let subst = try_param_subst(next2, &param_hashes, is_variadic, &self.src_arena);
+                        match subst.kind {
+                            TK::Param(pi) => body.push(Token {
+                                kind: TK::Stringify,
+                                span: t.span,
+                                hash: pi as u64,
+                            }),
+                            _ => {
+                                // # non-param: not standard but be permissive
+                                body.push(t);
+                                body.push(subst);
+                            }
+                        }
+                    }
+                }
+
+                _ => body.push(try_param_subst(t, &param_hashes, is_variadic, &self.src_arena)),
+            }
+        }
+
+        self.macros.define(name_hash, def_span, is_variadic, &param_hashes, &body);
 
         Ok(())
     }
@@ -1533,7 +1592,10 @@ impl PP {
                 TK::Comma if depth == 0 => {
                     arg_ranges.push((arg_start, self.macros.scratch.len() as u32 - arg_start));
                     arg_index += 1;
-                    if arg_index >= def.param_count as usize {
+
+                    let named_params = def.param_count as usize - if def.is_variadic { 1 } else { 0 };
+
+                    if arg_index >= named_params && !def.is_variadic {
                         self.macros.scratch.truncate(scratch_base as usize);
                         return Err(PPError::ArgumentCountMismatch {
                             span: t.span,
@@ -1542,14 +1604,23 @@ impl PP {
                         });
                     }
 
-                    arg_start = self.macros.scratch.len() as u32;
+                    if arg_index < named_params {
+                        // Normal named param separator - start new range
+                        arg_start = self.macros.scratch.len() as u32;
+                    } else {
+                        // Inside __VA_ARGS__ - keep comma as a token
+                        self.macros.scratch.push(t);
+                        // Don't update arg_start, all remaining tokens go into the VA range
+                    }
                 }
 
                 _ => self.macros.scratch.push(t),
             }
         }
 
-        if arg_ranges.len() < def.param_count as usize {
+        let named_params = def.param_count as usize - if def.is_variadic { 1 } else { 0 };
+
+        if arg_ranges.len() < named_params {
             self.macros.scratch.truncate(scratch_base as usize);
             return Err(PPError::ArgumentCountMismatch {
                 span: call_span,
@@ -1558,13 +1629,26 @@ impl PP {
             });
         }
 
-        let all_single_and_not_macros = arg_ranges.iter().all(|&(start, len)| {
-            if len != 1 { return false; }
+        //
+        // If variadic and no extra args: push an empty range for __VA_ARGS__
+        //
+        if def.is_variadic && arg_ranges.len() == named_params {
+            arg_ranges.push((self.macros.scratch.len() as u32, 0));
+        }
 
-            let t = self.macros.scratch[start as usize];
-            // Make sure the single token isn't itself a macro
-            t.kind != TK::Ident || self.macros.find(hash_ident(t.s(&self.src_arena))).is_none()
-        });
+        let d = &self.macros.defs[index];
+        let body_start = d.body_start as usize;
+        let body_len   = d.body_len   as usize;
+
+        let all_single_and_not_macros = !def.is_variadic  // Fast path doesn't handle VA
+            && arg_ranges.iter().all(|&(start, len)| {
+                if len != 1 { return false; }
+
+                let t = self.macros.scratch[start as usize];
+                t.kind != TK::Ident || self.macros.find(hash_ident(t.s(&self.src_arena))).is_none()
+            })
+            && !self.macros.tok_pool[body_start..body_start+body_len].iter()
+            .any(|t| matches!(t.kind, TK::Paste | TK::Stringify));
 
         if all_single_and_not_macros {
             //
@@ -1574,11 +1658,6 @@ impl PP {
 
             let frame_start = self.exp.pool.len() as u32;
             let mut frame_len = 0u32;
-
-            let d = &self.macros.defs[index];
-
-            let body_start = d.body_start as usize;
-            let body_len   = d.body_len   as usize;
 
             // Each body token is either a literal token (1) or a Param substituted by 1 token (1)
             // So total pushed = body_len exactly
@@ -1593,6 +1672,7 @@ impl PP {
                     }
                     _ => { self.exp.pool.push(t); }
                 }
+
                 frame_len += 1;
             }
 
@@ -1641,24 +1721,101 @@ impl PP {
         // release the borrow on self.macros before touching self.exp.
         //
 
-        let d = &self.macros.defs[index];
-        let body_start = d.body_start as usize;
-        let body_len   = d.body_len   as usize;
         let frame_start = self.exp.pool.len() as u32;
         let mut frame_len = 0u32;
-        for i in body_start..body_start + body_len {
+
+        let mut i = body_start;
+        while i < body_start + body_len {
             let t = self.macros.tok_pool[i];
+            i += 1;
+
             match t.kind {
                 TK::Param(pi) => {
                     let pi = pi as usize;
 
                     let arg_start = if pi == 0 { arg_pool_base as usize }
                                     else       { self.macros.arg_ends[pi - 1] as usize };
+
                     let arg_end   = self.macros.arg_ends[pi] as usize;
 
                     self.exp.pool.extend_from_slice(&self.macros.arg_pool[arg_start..arg_end]);
                     frame_len += (arg_end - arg_start) as u32;
                 }
+
+                TK::Stringify => {   // @Speed @Memory
+                    let pi = t.hash as usize;
+
+                    let arg_start = if pi == 0 { arg_pool_base as usize }
+                    else        { self.macros.arg_ends[pi - 1] as usize };
+
+                    let arg_end = self.macros.arg_ends[pi] as usize;
+
+                    let mut s = "\"".to_owned();
+                    for tok in &self.macros.arg_pool[arg_start..arg_end] {
+                        for ch in tok.s(&self.src_arena).chars() {
+                            match ch {
+                                '"'  => s.push_str("\\\""),
+                                '\\' => s.push_str("\\\\"),
+                                _    => s.push(ch),
+                            }
+                        }
+                    }
+                    s.push('"');
+
+                    let fid = self.src_arena.add_bytes("<stringify>".as_ref(), s.as_bytes());
+                    let data = self.src_arena.slice(fid);
+
+                    let tok = lex(data, &mut 0, fid);
+                    self.exp.pool.push(tok);
+                    frame_len += 1;
+                }
+
+                TK::Paste => {
+                    //
+                    // Lhs is already pushed, pop it
+                    //
+                    let lhs_tok = self.exp.pool.pop().unwrap();
+                    frame_len -= 1;
+
+                    //
+                    // Rhs is the next body token (might itself be a Param)
+                    //
+                    if i < body_start + body_len {
+                        let rhs_tok = self.macros.tok_pool[i];
+                        i += 1;
+
+                        let rhs_tok = match rhs_tok.kind {
+                            TK::Param(pi) => {
+                                // Rhs is a param - get its first token from arg_pool
+                                let pi = pi as usize;
+
+                                let arg_start = if pi == 0 { arg_pool_base as usize }
+                                else { self.macros.arg_ends[pi-1] as usize };
+
+                                let arg_end  = self.macros.arg_ends[pi] as usize;
+
+                                if arg_start < arg_end { self.macros.arg_pool[arg_start] }
+                                else { continue } // Empty arg, discard lhs too?..
+                            }
+                            _ => rhs_tok
+                        };
+
+                        let lhs_text = lhs_tok.s(&self.src_arena);
+                        let rhs_text = rhs_tok.s(&self.src_arena);
+                        let pasted   = format!("{lhs_text}{rhs_text}");
+
+                        let fid  = self.src_arena.add_bytes("<paste>".as_ref(), pasted.as_bytes());
+                        let data = self.src_arena.slice(fid);
+
+                        let tok = lex(data, &mut 0, fid);
+                        self.exp.pool.push(tok);
+
+                        frame_len += 1;
+                    }
+
+                    // else: ## at end of body, keep lhs as-is
+                }
+
                 _ => {
                     self.exp.pool.push(t);
                     frame_len += 1;
@@ -2804,6 +2961,19 @@ impl TypeTable {
         self.entries[id].kind
     }
 
+    /// If `ty` is a function pointer or bare function type, returns the Func TypeRef.
+    #[inline]
+    fn resolve_func_ptr_type(&self, ty: TypeRef) -> Option<TypeRef> {
+        match self.get_kind(ty) {
+            TypeKind::Func => Some(ty),
+            TypeKind::Ptr  => {
+                let inner = self.deref(ty);
+                if self.get_kind(inner) == TypeKind::Func { Some(inner) } else { None }
+            }
+            _ => None,
+        }
+    }
+
     #[inline]
     pub fn array_of(&mut self, elem: TypeRef, len: u32) -> TypeRef {
         self.intern(TypeKind::Array, QualFlags::empty(), TypeFlags::empty(), elem, len, 0)
@@ -3571,6 +3741,72 @@ impl CodeBuf {
             1 => self.emit_byte(offset as i8 as u8),
             2 => self.emit_i32(offset), _ => {}
         }
+    }
+
+    // bswap reg (16-bit needs xchg instead since bswap r16 is undefined behavior on x86)
+    #[inline]
+    pub fn bswap(&mut self, r: Reg, size: u8) {
+        match size {
+            2 => {
+                // xchg al, ah - swap the two bytes of the low word
+                // ror r16, 8 is the clean way
+                if r.ext() { self.bytes.push(0x41); }
+                self.bytes.push(0x66); // operand size prefix
+                self.bytes.push(0xC1); // ror r/m16, imm8
+                self.bytes.push(0xC8 | r.enc());
+                self.bytes.push(8);
+            }
+            4 => {
+                if r.ext() { self.bytes.push(0x41); }
+                self.bytes.push(0x0F);
+                self.bytes.push(0xC8 | r.enc());
+            }
+            _ => { // 8
+                self.bytes.push(if r.ext() { 0x49 } else { 0x48 });
+                self.bytes.push(0x0F);
+                self.bytes.push(0xC8 | r.enc());
+            }
+        }
+    }
+
+    // lzcnt r64, r64 (F3 REX.W 0F BD /r)
+    #[inline]
+    pub fn lzcnt(&mut self, dst: Reg, src: Reg) {
+        self.bytes.push(0xF3);
+        let rex = 0x48 | ((dst.ext() as u8) << 2) | (src.ext() as u8);
+        self.bytes.push(rex);
+        self.bytes.push(0x0F);
+        self.bytes.push(0xBD);
+        self.bytes.push(0xC0 | (dst.enc() << 3) | src.enc());
+    }
+
+    // tzcnt r64, r64 (F3 REX.W 0F BC /r)
+    #[inline]
+    pub fn tzcnt(&mut self, dst: Reg, src: Reg) {
+        self.bytes.push(0xF3);
+        let rex = 0x48 | ((dst.ext() as u8) << 2) | (src.ext() as u8);
+        self.bytes.push(rex);
+        self.bytes.push(0x0F);
+        self.bytes.push(0xBC);
+        self.bytes.push(0xC0 | (dst.enc() << 3) | src.enc());
+    }
+
+    // popcnt r64, r64 (F3 REX.W 0F B8 /r)
+    #[inline]
+    pub fn popcnt(&mut self, dst: Reg, src: Reg) {
+        self.bytes.push(0xF3);
+        let rex = 0x48 | ((dst.ext() as u8) << 2) | (src.ext() as u8);
+        self.bytes.push(rex);
+        self.bytes.push(0x0F);
+        self.bytes.push(0xB8);
+        self.bytes.push(0xC0 | (dst.enc() << 3) | src.enc());
+    }
+
+    // ud2 - guaranteed undefined instruction, causes SIGILL
+    #[inline]
+    pub fn ud2(&mut self) {
+        self.bytes.push(0x0F);
+        self.bytes.push(0x0B);
     }
 
     // ModRM + optional SIB + displacement for [base + offset]
@@ -5786,6 +6022,8 @@ impl Compiler {
 
             TK::LCurly => self.compile_block(),
 
+            TK::SemiColon => { self.next(); Ok(()) }
+
             _          => self.compile_expr_stmt(),
         }
     }
@@ -7041,9 +7279,38 @@ impl Compiler {
         let lhs = self.vstack.pop();
         if !lhs.is_lvalue() { return Err(CError::NotLvalue { span }); }
 
+        //
+        // Spill lhs base address if it's a RegInd - rhs evaluation (e.g. function calls)
+        // can clobber the base register before we get to emit the store.
+        //
+        let (lhs, lhs_addr_spill) = if lhs.kind() == VK::RegInd {
+            let addr_off = self.locals.alloc(HASH_HIDDEN_LOCAL, TYPE_LONG, &self.types);
+            let base = lhs.reg().as_gp();
+            self.buf.mov_store(Reg::Rbp, addr_off, base, true);
+            self.regs.free(base);
+            (CValue::regind(lhs.ty, Reg::Rbp, addr_off), Some(addr_off))
+        } else {
+            (lhs, None)
+        };
+
         self.compile_expr_impl(if right { prec } else { prec + 1 })?;
 
+        //
+        // Reload lhs base address if we spilled it
+        //
+        let lhs = if let Some(addr_off) = lhs_addr_spill {
+            let r = self.regs.alloc(span)?;
+            self.buf.mov_load(r, Reg::Rbp, addr_off, true);
+            CValue::regind(lhs.ty, r, 0)
+        } else {
+            lhs
+        };
+
         if op != TK::Eq {
+            //
+            // Compound assignment path: +=, /=, etc
+            //
+
             // Load lhs current value, push it, push rhs, do the op
             let rhs = self.vstack.pop();
             let base = lhs.reg().as_gp();
@@ -7066,6 +7333,7 @@ impl Compiler {
         let base = lhs.reg().as_gp();
         self.emit_store_keep(base, lhs.offset(), lhs.ty)?;
         self.regs.free(base);
+
         Ok(())
     }
 
@@ -8013,6 +8281,30 @@ impl Compiler {
                     i += 1;
                 }
 
+                // @Incomplete: Implement that in other places too
+                //
+                // Adjacent string literal concatenation: "hello" "world" -> "helloworld"
+                //
+                while self.current_token.kind == TK::StrLit {
+                    let t2   = self.next();
+                    let raw2 = t2.s(&self.pp.src_arena);
+                    let s2   = &raw2[1..raw2.len()-1];
+                    let bytes2 = s2.as_bytes();
+                    let mut i2 = 0;
+                    while i2 < bytes2.len() {
+                        if bytes2[i2] == b'\\' && i2+1 < bytes2.len() {
+                            i2 += 1;
+                            self.scratch_buffer_for_unescaping_string_literals_to_further_intern_them_into_rodata.push(match bytes2[i2] {
+                                b'n' => b'\n', b't' => b'\t', b'r' => b'\r',
+                                b'0' => b'\0', other => other,
+                            });
+                        } else {
+                            self.scratch_buffer_for_unescaping_string_literals_to_further_intern_them_into_rodata.push(bytes2[i2]);
+                        }
+                        i2 += 1;
+                    }
+                }
+
                 let bytes = core::mem::take(&mut self.scratch_buffer_for_unescaping_string_literals_to_further_intern_them_into_rodata);
                 let rodata_off = self.rodata_intern(&bytes);
 
@@ -8114,7 +8406,9 @@ impl Compiler {
                         self.vstack.push(CValue::imm(TYPE_INT, size as _));
                     }
                 } else if self.current_token.kind == TK::LParen {
-                    self.compile_call(hash, name_tok)?;
+                    if !self.try_compile_builtin(hash)? {
+                        self.compile_call(hash, name_tok)?;
+                    }
                 } else if let Some(lv) = self.locals.find(hash) {
                     if lv.is_indirect {
                         //
@@ -8315,61 +8609,93 @@ impl Compiler {
         Ok(())
     }
 
-    fn spill_vstack_across_call(&mut self) -> CResult<()> {
-        for i in 0..self.vstack.len() {
-            let v = self.decay_array(self.vstack.vals[i])?;
-            match v.kind() {
-                VK::Imm | VK::Local => continue, // Already safe
-                VK::Reg | VK::RegInd => {}
+    /// Returns true if the builtin was handled, false if it should fall through to normal call.
+    fn try_compile_builtin(&mut self, hash: u64) -> CResult<bool> {
+        match hash {
+            HASH_BUILTIN_BSWAP16 | HASH_BUILTIN_BSWAP32 | HASH_BUILTIN_BSWAP64 => {
+                self.next(); // (
+                self.compile_expr_no_comma()?;
+                self.expect(TK::RParen, "')'")?;
+
+                let (r, _) = self.pop_reg()?;
+                let ty = match hash {
+                    HASH_BUILTIN_BSWAP16 => { self.buf.bswap(r, 2); TYPE_SHORT }
+                    HASH_BUILTIN_BSWAP32 => { self.buf.bswap(r, 4); TYPE_INT   }
+                    _                    => { self.buf.bswap(r, 8); TYPE_LONG  }
+                };
+                self.vstack.push(CValue::gp(ty, r));
+                Ok(true)
             }
 
-            let spill_off = self.locals.alloc(HASH_HIDDEN_LOCAL, v.ty, &self.types);
+            HASH_BUILTIN_CLZ | HASH_BUILTIN_CLZL | HASH_BUILTIN_CLZLL => {
+                self.next(); // (
+                self.compile_expr_no_comma()?;
+                self.expect(TK::RParen, "')'")?;
 
-            if matches!(self.get_kind(v.ty), TypeKind::Struct | TypeKind::Union) {
-                //
-                // Struct in RegInd - base reg will be clobbered
-                // Copy struct data to a stack local
-                //
-
-                let size = self.types.size_of(v.ty) as i32;
-
-                let (src_base, src_off) = (v.reg().as_gp(), v.offset());
-                self.emit_struct_copy(Reg::Rbp, spill_off, src_base, src_off, size)?;
-                self.regs.free(src_base);
-            } else if self.is_float(v.ty) {
-                let xmm = if v.kind() == VK::RegInd {
-                    let tmp = self.xmms.alloc(Span::POISONED)?;
-                    self.emit_float_load(tmp, v.reg().as_gp(), v.offset(), v.ty);
-                    self.regs.free(v.reg().as_gp());
-                    tmp
-                } else {
-                    v.reg().as_xmm()
-                };
-
-                self.emit_float_store(Reg::Rbp, spill_off, xmm, v.ty);
-
-                if v.kind() == VK::RegInd { self.xmms.free(xmm); }
-                // VK::Reg xmm is freed by clobber_caller_save - don't free here
-            } else {
-                let gp = if v.kind() == VK::RegInd {
-                    let tmp = self.regs.alloc(Span::POISONED)?;
-                    self.emit_int_load(tmp, v.reg().as_gp(), v.offset(), v.ty);
-                    self.regs.free(v.reg().as_gp());
-                    tmp
-                } else {
-                    v.reg().as_gp()
-                };
-
-                self.emit_int_store(Reg::Rbp, spill_off, gp, v.ty);
-
-                if v.kind() == VK::RegInd { self.regs.free(gp); }
-                // VK::Reg gp is freed by clobber_caller_save - don't free here
+                let (r, _) = self.pop_reg()?;
+                // lzcnt r, r  (or bsr + xor for fallback)
+                self.buf.lzcnt(r, r);
+                self.vstack.push(CValue::gp(TYPE_INT, r));
+                Ok(true)
             }
 
-            self.vstack.vals[i] = CValue::local(v.ty, spill_off);
+            HASH_BUILTIN_CTZ | HASH_BUILTIN_CTZL | HASH_BUILTIN_CTZLL => {
+                self.next(); // (
+                self.compile_expr_no_comma()?;
+                self.expect(TK::RParen, "')'")?;
+
+                let (r, _) = self.pop_reg()?;
+                self.buf.tzcnt(r, r);
+                self.vstack.push(CValue::gp(TYPE_INT, r));
+                Ok(true)
+            }
+
+            HASH_BUILTIN_POPCOUNT | HASH_BUILTIN_POPCOUNTL | HASH_BUILTIN_POPCOUNTLL => {
+                self.next(); // (
+                self.compile_expr_no_comma()?;
+                self.expect(TK::RParen, "')'")?;
+
+                let (r, _) = self.pop_reg()?;
+                self.buf.popcnt(r, r);
+                self.vstack.push(CValue::gp(TYPE_INT, r));
+                Ok(true)
+            }
+
+            HASH_BUILTIN_EXPECT => {
+                self.next(); // (
+                self.compile_expr_no_comma()?;
+                self.expect(TK::Comma, "','")?;
+
+                // Discard the expected value hint for now... @Incomplete
+                self.compile_expr_no_comma()?;
+                let hint = self.vstack.pop();
+
+                if matches!(hint.kind(), VK::Reg | VK::RegInd) { self.free_reg(hint.reg()); }
+                self.expect(TK::RParen, "')'")?;
+                // expr result is already on vstack
+
+                Ok(true)
+            }
+
+            HASH_BUILTIN_UNREACHABLE => {
+                self.next(); // (
+                self.expect(TK::RParen, "')'")?;
+                self.buf.ud2();  // undefined instruction - trap if reached
+                // Push a dummy value since expression context expects something
+                self.vstack.push(CValue::imm(TYPE_INT, 0));
+                Ok(true)
+            }
+
+            HASH_BUILTIN_TRAP => {
+                self.next(); // (
+                self.expect(TK::RParen, "')'")?;
+                self.buf.ud2();
+                self.vstack.push(CValue::imm(TYPE_INT, 0));
+                Ok(true)
+            }
+
+            _ => Ok(false)
         }
-
-        Ok(())
     }
 
     #[inline]
@@ -8462,22 +8788,154 @@ impl Compiler {
         Ok(())
     }
 
+    fn spill_vstack_across_call(&mut self) -> CResult<()> {
+        for i in 0..self.vstack.len() {
+            let v = self.decay_array(self.vstack.vals[i])?;
+            match v.kind() {
+                VK::Imm | VK::Local => continue, // Already safe
+                VK::Reg | VK::RegInd => {}
+            }
+
+            let spill_off = self.locals.alloc(HASH_HIDDEN_LOCAL, v.ty, &self.types);
+
+            if matches!(self.get_kind(v.ty), TypeKind::Struct | TypeKind::Union) {
+                //
+                // Struct in RegInd - base reg will be clobbered
+                // Copy struct data to a stack local
+                //
+
+                let size = self.types.size_of(v.ty) as i32;
+
+                let (src_base, src_off) = (v.reg().as_gp(), v.offset());
+                self.emit_struct_copy(Reg::Rbp, spill_off, src_base, src_off, size)?;
+                self.regs.free(src_base);
+            } else if self.is_float(v.ty) {
+                let xmm = if v.kind() == VK::RegInd {
+                    let tmp = self.xmms.alloc(Span::POISONED)?;
+                    self.emit_float_load(tmp, v.reg().as_gp(), v.offset(), v.ty);
+                    self.regs.free(v.reg().as_gp());
+                    tmp
+                } else {
+                    v.reg().as_xmm()
+                };
+
+                self.emit_float_store(Reg::Rbp, spill_off, xmm, v.ty);
+
+                if v.kind() == VK::RegInd { self.xmms.free(xmm); }
+                // VK::Reg xmm is freed by clobber_caller_save - don't free here
+            } else {
+                let gp = if v.kind() == VK::RegInd {
+                    let tmp = self.regs.alloc(Span::POISONED)?;
+                    self.emit_int_load(tmp, v.reg().as_gp(), v.offset(), v.ty);
+                    self.regs.free(v.reg().as_gp());
+                    tmp
+                } else {
+                    v.reg().as_gp()
+                };
+
+                self.emit_int_store(Reg::Rbp, spill_off, gp, v.ty);
+
+                if v.kind() == VK::RegInd { self.regs.free(gp); }
+                // VK::Reg gp is freed by clobber_caller_save - don't free here
+            }
+
+            self.vstack.vals[i] = CValue::local(v.ty, spill_off);
+        }
+
+        Ok(())
+    }
+
     fn compile_call(&mut self, callee_hash: u64, name_tok: Token) -> CResult<()> {
+        #[derive(Copy, Clone)]
+        enum CalleeKind {
+            Sym(usize),
+            LocalFp(i32),        // rbp_off
+            GlobalFp(u32, bool), // data_off, is_bss
+        }
+
         self.next(); // '('
 
-        let Some(sym_index) = self.syms.find(callee_hash) else {
+        //
+        // Resolve callee - either a named symbol or a local function pointer
+        //
+
+        let (func_ty, callee_kind) = if let Some(sym_index) = self.syms.find(callee_hash) {
+            //
+            // Call to a declared function
+            //
+
+            let func_ty = self.syms[sym_index].func_ty;
+            (func_ty, CalleeKind::Sym(sym_index))
+        } else if let Some(lv) = self.locals.find(callee_hash) {
+            //
+            // Call to a function pointer inside a local
+            //
+
+            match self.types.resolve_func_ptr_type(lv.ty) {
+                Some(func_ty) => (func_ty, CalleeKind::LocalFp(lv.rbp_off)),
+                None => return Err(CError::Undefined {
+                    span: name_tok.span,
+                    name: self.s(name_tok).to_owned()
+                }),
+            }
+        } else if let Some(gv) = self.globals.find(callee_hash) {
+            //
+            // Call to a function pointer inside a global
+            //
+
+            match self.types.resolve_func_ptr_type(gv.ty) {
+                Some(func_ty) => (func_ty, CalleeKind::GlobalFp(gv.data_off, gv.is_bss)),
+                None => return Err(CError::Undefined {
+                    span: name_tok.span,
+                    name: self.s(name_tok).to_owned()
+                }),
+            }
+        } else {
             return Err(CError::Undefined {
                 span: name_tok.span,
                 name: self.s(name_tok).to_owned()
             });
         };
 
-        let sym = self.syms[sym_index];
-
-        let func_type_entry = self.types.get(sym.func_ty);
+        let func_type_entry = self.types.get(func_ty);
         let param_count = func_type_entry.param_count();
         let ret_ty = func_type_entry.ret_ty();
         let is_variadic = func_type_entry.is_variadic();
+
+        //
+        // If calling through a function pointer, spill it to a hidden local now
+        // so that arg evaluation can't clobber it
+        //
+        let fp_spill_off = match callee_kind {
+            CalleeKind::Sym(_) => None,
+
+            CalleeKind::LocalFp(rbp_off) => {
+                let spill = self.locals.alloc(HASH_HIDDEN_LOCAL, TYPE_LONG, &self.types);
+
+                let r = self.regs.alloc(name_tok.span)?;
+                self.buf.mov_load(r, Reg::Rbp, rbp_off, true);
+                self.buf.mov_store(Reg::Rbp, spill, r, true);
+                self.regs.free(r);
+
+                Some(spill)
+            }
+
+            CalleeKind::GlobalFp(data_off, is_bss) => {
+                let spill = self.locals.alloc(HASH_HIDDEN_LOCAL, TYPE_LONG, &self.types);
+
+                let r = self.regs.alloc(name_tok.span)?;
+                let text_off = self.buf.lea_rip(r);  // lea r, [rip + global] then load the pointer value
+                self.data_relocs.push(DataReloc { text_off: text_off as u32, data_off, is_bss });
+                let r2 = self.regs.alloc(name_tok.span)?;
+                self.buf.mov_load(r2, r, 0, true);
+                self.regs.free(r);
+
+                self.buf.mov_store(Reg::Rbp, spill, r2, true);
+                self.regs.free(r2);
+
+                Some(spill)
+            }
+        };
 
         //
         // Evaluate all args and spill to locals
@@ -8507,7 +8965,7 @@ impl Compiler {
             //
             let arg_idx = arg_spills.len();
             let declared_ty = if arg_idx < param_count as usize {
-                self.types.get_param(sym.func_ty, arg_idx as _)
+                self.types.get_param(func_ty, arg_idx as _)
             } else {
                 v.ty  // variadic, use value type
             };
@@ -8561,7 +9019,8 @@ impl Compiler {
         //
         // Handle struct return
         //
-        //                          off is_memory
+
+        //                         off is_memory
         let struct_ret_off: Option<(i32, bool)> = if matches!(self.get_kind(ret_ty), TypeKind::Struct | TypeKind::Union) {
             let classes = self.classify_struct(ret_ty);
             if classes[0] == SysVClass::Memory {
@@ -8652,15 +9111,33 @@ impl Compiler {
             }
         }
 
-        let call_site = self.buf.call_rel32();
-        if sym.flags.contains(SymFlags::EXTERN) {
-            self.relocs.push(Reloc {
-                offset: call_site as u32,
-                sym_index: sym_index as u32,
-                addend: -4
-            });
+        //
+        // Emit call instruction
+        //
+        if let Some(spill) = fp_spill_off {
+            //
+            // Function pointer call - reload into r11 (not an arg reg, caller-save)
+            //
+            let r = self.regs.alloc(name_tok.span)?;
+            self.buf.mov_load(r, Reg::Rbp, spill, true);
+            self.buf.call_r(r);
+            self.regs.free(r);
         } else {
-            self.buf.patch_call(call_site, sym.code_off as usize);
+            let CalleeKind::Sym(sym_index) = callee_kind else {
+                unreachable!()
+            };
+
+            let sym = self.syms[sym_index];
+            let call_site = self.buf.call_rel32();
+            if sym.flags.contains(SymFlags::EXTERN) {
+                self.relocs.push(Reloc {
+                    offset: call_site as u32,
+                    sym_index: sym_index as u32,
+                    addend: -4
+                });
+            } else {
+                self.buf.patch_call(call_site, sym.code_off as usize);
+            }
         }
 
         self.regs.clobber_caller_save();
