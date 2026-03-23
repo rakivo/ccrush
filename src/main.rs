@@ -4837,8 +4837,13 @@ pub struct CallReloc {
     pub addend: i64
 }
 
-pub struct RodataReloc {
+pub struct TextRodataReloc {
     pub text_off: u32,
+    pub rodata_off: u32
+}
+
+pub struct DataRodataReloc {
+    pub data_off: u32,
     pub rodata_off: u32
 }
 
@@ -4987,17 +4992,18 @@ pub struct Compiler {
     pub tags:          IntMap<u64, TypeRef>,
     pub enum_consts:   IntMap<u64, i64>,
 
-    pub data:          Vec<u8>,
-    pub got_relocs:    Vec<GotReloc>,
-    pub data_relocs:   Vec<DataReloc>,
-    pub bss_size:      usize,
-
     pub loop_stack:    Vec<LoopContext>,
 
-    pub call_relocs:   Vec<CallReloc>,
     pub rodata:        Vec<u8>,
-    pub rodata_relocs: Vec<RodataReloc>,
     pub rodata_interner: IntMap<RodataHash, u32>, // Bytes hash -> offset into rodata
+    pub data:          Vec<u8>,
+    pub bss_size:      usize,
+
+    pub got_relocs:    Vec<GotReloc>,
+    pub data_relocs:   Vec<DataReloc>,
+    pub call_relocs:   Vec<CallReloc>,
+    pub rodata_relocs: Vec<TextRodataReloc>,
+    pub data_rodata_relocs: Vec<DataRodataReloc>,
 
     pub vla_sizes:     IntMap<TypeRef, i32>,  // Fresh TypeRef -> rbp_off of total byte size local
 
@@ -5009,7 +5015,7 @@ pub struct Compiler {
 
     pub pp:            PP,
 
-    pub scratch_buffer_for_unescaping_string_literals_to_further_intern_them_into_rodata: SmallVec<[u8; 2048]>,
+    pub strlit_unescaping_scratch: SmallVec<[u8; 2048]>,
 }
 
 impl Deref for Compiler {
@@ -5140,6 +5146,7 @@ impl Compiler {
             enum_consts: Default::default(),
             typedefs: Default::default(),
             vla_sizes: Default::default(),
+            data_rodata_relocs: Default::default(),
             data: Vec::new(), globals: GlobalTable::new(),
             bss_size: 0, data_relocs: Vec::new(),
             code: CodeBuf::new(), vstack: ValueStack::new(),
@@ -5148,7 +5155,7 @@ impl Compiler {
             rodata: Vec::new(), rodata_relocs: Vec::new(),
             locals: LocalTable::new(), ret_ty: TYPE_VOID,
             dont_decay_types_of_array_globals_to_pointers: false,
-            scratch_buffer_for_unescaping_string_literals_to_further_intern_them_into_rodata: Default::default()
+            strlit_unescaping_scratch: Default::default()
         };
 
         // @Incomplete
@@ -5185,6 +5192,18 @@ impl Compiler {
     fn at_eof(&self) -> bool { self.current_token.kind == TK::Eof }
 
     #[inline]
+    fn rodata_intern(&mut self, bytes: &[u8]) -> u32 {
+        let hash = hash_bytes_for_rodata_interning(bytes);
+        *self.rodata_interner.entry(hash).or_insert_with(|| {
+            let off = self.rodata.len() as u32;
+            self.rodata.extend_from_slice(bytes);
+            if bytes.last() != Some(&0) { self.rodata.push(0); }
+            off
+        })
+    }
+
+
+    #[inline]
     fn unescape_len(s: &str) -> usize {
         let bytes = s.as_bytes();
         let mut len = 0usize;
@@ -5198,14 +5217,49 @@ impl Compiler {
     }
 
     #[inline]
-    fn rodata_intern(&mut self, bytes: &[u8]) -> u32 {
-        let hash = hash_bytes_for_rodata_interning(bytes);
-        *self.rodata_interner.entry(hash).or_insert_with(|| {
-            let off = self.rodata.len() as u32;
-            self.rodata.extend_from_slice(bytes);
-            if bytes.last() != Some(&0) { self.rodata.push(0); }
-            off
-        })
+    fn unescape_string_literal_into_scratch(&mut self, start_token: &Token) -> SmallVec<[u8; 2048]> {
+        let raw = start_token.s(&self.pp.src_arena);
+        let s   = &raw[1..raw.len()-1];
+        let bytes = s.as_bytes();
+
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i+1 < bytes.len() {
+                i += 1;
+                self.strlit_unescaping_scratch.push(match bytes[i] {
+                    b'n' => b'\n', b't' => b'\t', b'r' => b'\r',
+                    b'0' => b'\0', other => other,
+                });
+            } else {
+                self.strlit_unescaping_scratch.push(bytes[i]);
+            }
+            i += 1;
+        }
+
+        //
+        // Adjacent string literal concatenation: "hello" "world" -> "helloworld"
+        //
+        while self.current_token.kind == TK::StrLit {
+            let t2   = self.next();
+            let raw2 = t2.s(&self.pp.src_arena);
+            let s2   = &raw2[1..raw2.len()-1];
+            let bytes2 = s2.as_bytes();
+            let mut i2 = 0;
+            while i2 < bytes2.len() {
+                if bytes2[i2] == b'\\' && i2+1 < bytes2.len() {
+                    i2 += 1;
+                    self.strlit_unescaping_scratch.push(match bytes2[i2] {
+                        b'n' => b'\n', b't' => b'\t', b'r' => b'\r',
+                        b'0' => b'\0', other => other,
+                    });
+                } else {
+                    self.strlit_unescaping_scratch.push(bytes2[i2]);
+                }
+                i2 += 1;
+            }
+        }
+
+        core::mem::take(&mut self.strlit_unescaping_scratch)
     }
 
     #[inline]
@@ -5855,7 +5909,7 @@ impl Compiler {
                     _               => self.rodata.extend_from_slice(&v.get_fimm().to_bits().to_le_bytes()),
                 }
                 let text_off = self.emit_float_load_rip(xmm, v.ty) as _;
-                self.rodata_relocs.push(RodataReloc { text_off, rodata_off });
+                self.rodata_relocs.push(TextRodataReloc { text_off, rodata_off });
 
                 Ok(xmm)
             }
@@ -6879,31 +6933,12 @@ impl Compiler {
                     // Initialized global array of bytes (string)
                     //
 
-                    let t   = self.next();
-                    let raw = t.s(&self.pp.src_arena);
-                    let s   = &raw[1..raw.len()-1];
+                    let t = self.next();
 
-                    // @Cutnpaste
-                    // Unescape into data
-                    let bytes = s.as_bytes();
-                    let mut i = 0;
-                    while i < bytes.len() {
-                        let b = if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                            i += 1;
-                            match bytes[i] {
-                                b'n' => b'\n', b't' => b'\t', b'r' => b'\r',
-                                b'0' => b'\0', b'\\' => b'\\',
-                                b'\'' => b'\'', b'"' => b'"',
-                                other => other,
-                            }
-                        } else { bytes[i] };
-                        self.data.push(b);
-                        i += 1;
-                    }
-
+                    let bytes = self.unescape_string_literal_into_scratch(&t);
+                    self.data.extend_from_slice(&bytes);
                     self.data.push(0);
-
-                    let actual_len = Self::unescape_len(s) + 1;
+                    let actual_len = bytes.len() + 1;
 
                     // Zero pad remaining if sized
                     if !inferred && actual_len < arr_len {
@@ -6924,6 +6959,44 @@ impl Compiler {
                             // Too many, error out..?
                             self.compile_expr()?;
                             self.vstack.pop();
+                        } else if self.current_token.kind == TK::StrLit {
+                            let e = self.types.get(elem_ty);
+                            if e.is_array() && self.types.get_kind(e.elem()) == TypeKind::Char {
+                                //
+                                // Store bytes inline
+                                //
+                                // char s[][] = {"Hello", "World"};
+
+                                // @Cutnpaste from above
+
+                                let t = self.next();
+
+                                let bytes = self.unescape_string_literal_into_scratch(&t);
+                                self.data.extend_from_slice(&bytes);
+                                self.data.push(0);
+                                let actual_len = bytes.len() + 1;
+
+                                // Zero pad remaining if sized
+                                if !inferred && actual_len < arr_len {
+                                    self.data.extend(std::iter::repeat_n(0u8, arr_len - actual_len));
+                                }
+                            } else {
+                                //
+                                // Store bytes in .rodata, emit a relocation to point at them
+                                //
+
+                                let t = self.next();
+                                let bytes = self.unescape_string_literal_into_scratch(&t);
+                                let rodata_off = self.rodata_intern(&bytes);
+
+                                // Reserve space for a pointer into .rodata
+                                let data_off = self.data.len() as _;
+                                self.data.extend_from_slice(&0usize.to_le_bytes());
+
+                                self.data_rodata_relocs.push(DataRodataReloc { data_off, rodata_off });
+                            }
+
+                            count += 1;
                         } else {
                             let v = self.try_parse_and_eval_const_int()?;
                             match self.types.get_kind(elem_ty) {  // @Cutnpaste from above
@@ -6932,6 +7005,7 @@ impl Compiler {
                                 TypeKind::Int   => self.data.extend_from_slice(&(v as i32).to_le_bytes()),
                                 _               => self.data.extend_from_slice(&v.to_le_bytes()),
                             }
+
                             count += 1;
                         }
 
@@ -7160,47 +7234,41 @@ impl Compiler {
             // Initialized global array of bytes (string)
             //
 
-            let t   = self.next();
-            let raw = t.s(&self.pp.src_arena);
-            let s   = &raw[1..raw.len()-1];
-            let bytes = s.as_bytes();
+            let t = self.next();
+            let bytes = self.unescape_string_literal_into_scratch(&t);
+            let actual_len = bytes.len() + 1;
+            let rodata_off = self.rodata_intern(&bytes);
 
-            let mut off = base_off;
-            let mut i   = 0usize;
+            // lea rdi, [rbp + base_off] - destination
+            let dst = self.regs.alloc(Span::POISONED)?;
+            self.code.lea(dst, Reg::Rbp, base_off);
 
-            while i < bytes.len() && (off - base_off) < arr_len * elem_sz {
-                // @Refactor
-                let b = if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 1;
-                    match bytes[i] {
-                        b'n'  => b'\n',
-                        b't'  => b'\t',
-                        b'r'  => b'\r',
-                        b'0'  => b'\0',
-                        b'\\' => b'\\',
-                        b'\'' => b'\'',
-                        b'"'  => b'"',
-                        other => other,
-                    }
-                } else {
-                    bytes[i]
-                };
+            // lea rsi, [rip + rodata_off] - src
+            let src = self.regs.alloc(Span::POISONED)?;
+            let text_off = self.code.lea_rip(src) as _;
+            self.rodata_relocs.push(TextRodataReloc { text_off, rodata_off });
 
-                // store byte: mov byte [rbp + off], imm
-                let tmp = self.regs.alloc(Span::POISONED)?;
-                self.code.mov_ri64(tmp, i64::from(b));
-                self.code.mov_store8(Reg::Rbp, off, tmp);
-                self.regs.free(tmp);
+            // copy min(actual_len, arr_len) bytes
+            let copy_len = if inferred {
+                actual_len as i32
+            } else {
+                actual_len.min(arr_len as usize) as i32
+            };
 
-                off += 1;
-                i   += 1;
-            }
+            self.code.mov_ri64(Reg::Rdx, copy_len as i64);
+            self.code.mov_rr(Reg::Rdi, dst);
+            self.code.mov_rr(Reg::Rsi, src);
+            self.regs.free(src);
+            self.regs.free(dst);
+            self.emit_memcpy_call();
 
-            // Null terminator
-            if (off - base_off) < arr_len * elem_sz {
+            // Zero pad remaining if sized and string is shorter
+            if !inferred && (actual_len as i32) < arr_len {
                 let tmp = self.regs.alloc(Span::POISONED)?;
                 self.code.xor_rr(tmp, tmp);
-                self.code.mov_store8(Reg::Rbp, off, tmp);
+                for i in actual_len as i32..arr_len {
+                    self.code.mov_store8(Reg::Rbp, base_off + i, tmp);
+                }
                 self.regs.free(tmp);
             }
 
@@ -8094,7 +8162,7 @@ impl Compiler {
 
                 let text_off = self.emit_float_xor_rip(r, ty) as _;
 
-                self.rodata_relocs.push(RodataReloc { text_off, rodata_off });
+                self.rodata_relocs.push(TextRodataReloc { text_off, rodata_off });
                 self.vstack.push(CValue::xmm(ty, r));
             }
 
@@ -8486,63 +8554,20 @@ TypeKind::Ptr) |
                     self.code.movsd_load_rip(xmm)
                 } as _;
 
-                self.rodata_relocs.push(RodataReloc { text_off, rodata_off });
+                self.rodata_relocs.push(TextRodataReloc { text_off, rodata_off });
                 self.vstack.push(CValue::xmm(ty, xmm));
             }
 
             TK::StrLit => {
-                let t   = self.next();
-                let raw = t.s(&self.pp.src_arena);
-                let s   = &raw[1..raw.len()-1];
-                let bytes = s.as_bytes();
+                let t = self.next();
 
-                // @Refactor: Put this into a separate function
-
-                let mut i = 0;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' && i+1 < bytes.len() {
-                        i += 1;
-                        self.scratch_buffer_for_unescaping_string_literals_to_further_intern_them_into_rodata.push(match bytes[i] {
-                            b'n' => b'\n', b't' => b'\t', b'r' => b'\r',
-                            b'0' => b'\0', other => other,
-                        });
-                    } else {
-                        self.scratch_buffer_for_unescaping_string_literals_to_further_intern_them_into_rodata.push(bytes[i]);
-                    }
-                    i += 1;
-                }
-
-                // @Incomplete: Implement that in other places too
-                //
-                // Adjacent string literal concatenation: "hello" "world" -> "helloworld"
-                //
-                while self.current_token.kind == TK::StrLit {
-                    let t2   = self.next();
-                    let raw2 = t2.s(&self.pp.src_arena);
-                    let s2   = &raw2[1..raw2.len()-1];
-                    let bytes2 = s2.as_bytes();
-                    let mut i2 = 0;
-                    while i2 < bytes2.len() {
-                        if bytes2[i2] == b'\\' && i2+1 < bytes2.len() {
-                            i2 += 1;
-                            self.scratch_buffer_for_unescaping_string_literals_to_further_intern_them_into_rodata.push(match bytes2[i2] {
-                                b'n' => b'\n', b't' => b'\t', b'r' => b'\r',
-                                b'0' => b'\0', other => other,
-                            });
-                        } else {
-                            self.scratch_buffer_for_unescaping_string_literals_to_further_intern_them_into_rodata.push(bytes2[i2]);
-                        }
-                        i2 += 1;
-                    }
-                }
-
-                let bytes = core::mem::take(&mut self.scratch_buffer_for_unescaping_string_literals_to_further_intern_them_into_rodata);
+                let bytes = self.unescape_string_literal_into_scratch(&t);
                 let rodata_off = self.rodata_intern(&bytes);
 
                 // lea dst, [rip + disp32] - displacement patched by write_elf via R_X86_64_PC32
                 let dst = self.regs.alloc(Span::POISONED)?;
                 let text_off = self.code.lea_rip(dst) as _;
-                self.rodata_relocs.push(RodataReloc { text_off, rodata_off });
+                self.rodata_relocs.push(TextRodataReloc { text_off, rodata_off });
 
                 let new_type = self.types.ptr_to(TYPE_CHAR);
                 self.vstack.push(CValue::gp(new_type, dst));
@@ -8662,7 +8687,7 @@ TypeKind::Ptr) |
                     if gv.flags.contains(GlobalEntryFlags::EXTERN) {
                         //
                         // Extern global - GOT-indirect access
-                        // mov dst, [rip + got_slot] ->  dst = &global
+                        // mov dst, [rip + got_slot] -> dst = &global
                         //
                         let text_off = self.code.mov_load_rip(dst);
                         self.got_relocs.push(GotReloc {
@@ -9991,6 +10016,7 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
     let sh_symtab   = sname(".symtab");
     let sh_strtab   = sname(".strtab");
     let sh_shstrtab = sname(".shstrtab");
+    let sh_rela_data = sname(".rela.data");
 
     //
     // symtab
@@ -10085,51 +10111,81 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
         push_sym(&mut symtab, gvar_name_index[i], (STB_GLOBAL<<4)|STT_OBJECT, SHN_UNDEF, 0, 0);
     }
 
-    //
-    // rela.text
-    //
-    const R_PLT32: u64 = 4;
-    const R_PC32:  u64 = 2;
-    const R_GOTPCREL: u64 = 9;
-
-    let mut rela = Vec::new();
     let push_rela = |rela: &mut Vec<u8>, offset: u64, sym: u64, rtype: u64, addend: i64| {
         rela.extend_from_slice(&offset.to_le_bytes());
         rela.extend_from_slice(&((sym<<32)|rtype).to_le_bytes());
         rela.extend_from_slice(&addend.to_le_bytes());
     };
 
+    const R_64: u32 = 1;
+    const R_PC32:  u64 = 2;
+    const R_PLT32: u64 = 4;
+    const R_GOTPCREL: u64 = 9;
+
+    //
+    // rela.text
+    //
+
+    let mut rela_text = Vec::new();
+
     for r in &c.call_relocs {
-        push_rela(&mut rela, u64::from(r.offset), u64::from(elf_sym_index[r.sym_index as usize]), R_PLT32, r.addend);
+        push_rela(&mut rela_text, u64::from(r.offset), u64::from(elf_sym_index[r.sym_index as usize]), R_PLT32, r.addend);
     }
     for r in &c.rodata_relocs {
-        push_rela(&mut rela, u64::from(r.text_off), RODATA_SYM, R_PC32, i64::from(r.rodata_off) - 4);
+        push_rela(&mut rela_text, u64::from(r.text_off), RODATA_SYM, R_PC32, i64::from(r.rodata_off) - 4);
     }
     for r in &c.data_relocs {
         let sym = if r.is_bss { BSS_SYM } else { DATA_SYM };
-        push_rela(&mut rela, u64::from(r.text_off), sym, R_PC32, i64::from(r.data_off) - 4);
+        push_rela(&mut rela_text, u64::from(r.text_off), sym, R_PC32, i64::from(r.data_off) - 4);
     }
     for r in &c.got_relocs {
         let sym_idx = elf_gvar_extern_sym_index[r.sym_index as usize];
-        push_rela(&mut rela, u64::from(r.text_off), u64::from(sym_idx), R_GOTPCREL, -4);
+        push_rela(&mut rela_text, u64::from(r.text_off), u64::from(sym_idx), R_GOTPCREL, -4);
+    }
+
+    //
+    // rela.data
+    //
+
+    let mut rela_data = Vec::new();
+
+    for r in &c.data_rodata_relocs {
+        push_rela(&mut rela_data, r.data_off as u64, RODATA_SYM, R_64 as u64, r.rodata_off as i64);
     }
 
     //
     // Layout
     //
+
     const EHSZ: usize = 64;
     const SHSZ: usize = 64;
-    const NSEC: usize = 9;
+    const NSEC: usize = 10;
 
     let text_off    = EHSZ;
     let text_sz     = c.code.bytes.len();
-    let rodata_off  = align(text_off   + text_sz,        16); let rodata_sz  = c.rodata.len();
-    let data_off    = align(rodata_off + rodata_sz,       16); let data_sz    = c.data.len();
-    let rela_off    = align(data_off   + data_sz,          8); let rela_sz    = rela.len();
-    let sym_off     = align(rela_off   + rela_sz,          8); let sym_sz     = symtab.len();
-    let str_off     = align(sym_off    + sym_sz,           8); let str_sz     = strtab.len();
-    let shstr_off   = align(str_off    + str_sz,           8); let shstr_sz   = shstrtab.len();
-    let shdrs_off   = align(shstr_off  + shstr_sz,         8);
+
+    let rodata_off  = align(text_off   + text_sz,        16);
+    let rodata_sz   = c.rodata.len();
+
+    let data_off    = align(rodata_off + rodata_sz,       16);
+    let data_sz     = c.data.len();
+
+    let rela_text_off = align(data_off + data_sz, 8);
+    let rela_text_sz  = rela_text.len();
+
+    let rela_data_off = align(rela_text_off + rela_text_sz, 8);
+    let rela_data_sz  = rela_data.len();
+
+    let sym_off       = align(rela_data_off + rela_data_sz, 8);
+    let sym_sz        = symtab.len();
+
+    let str_off       = align(sym_off + sym_sz, 8);
+    let str_sz        = strtab.len();
+
+    let shstr_off     = align(str_off + str_sz, 8);
+    let shstr_sz      = shstrtab.len();
+
+    let shdrs_off     = align(shstr_off + shstr_sz, 8);
 
     let mut out = vec![0u8; shdrs_off + NSEC * SHSZ];
 
@@ -10154,7 +10210,8 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
     out[rodata_off..rodata_off+rodata_sz].copy_from_slice(&c.rodata);
     out[data_off  ..data_off  +data_sz  ].copy_from_slice(&c.data);
     // .bss has no file content - zero sized in file
-    out[rela_off  ..rela_off  +rela_sz  ].copy_from_slice(&rela);
+    out[rela_text_off  ..rela_text_off  + rela_text_sz].copy_from_slice(&rela_text);
+    out[rela_data_off  ..rela_data_off  + rela_data_sz].copy_from_slice(&rela_data);
     out[sym_off   ..sym_off   +sym_sz   ].copy_from_slice(&symtab);
     out[str_off   ..str_off   +str_sz   ].copy_from_slice(&strtab);
     out[shstr_off ..shstr_off +shstr_sz ].copy_from_slice(&shstrtab);
@@ -10191,19 +10248,19 @@ pub fn write_elf(c: &Compiler) -> Vec<u8> {
 
     //
     // Section indices:
-    // 0=null 1=.text 2=.rodata 3=.data 4=.bss 5=.rela.text 6=.symtab 7=.strtab 8=.shstrtab
+    // 0=null 1=.text 2=.rodata 3=.data 4=.bss 5=.rela.text 6=.symtab 7=.strtab 8=.shstrtab, 9=.rela.data
     //
 
-    section_header(&mut out, 0, 0,           NULL,     0,           0,                 0,                0, 0,                       0,  0);
-    section_header(&mut out, 1, sh_text,     PROGBITS, ALLOC|EXEC,  text_off   as u64, text_sz   as u64, 0, 0,                       16, 0);
-    section_header(&mut out, 2, sh_rodata,   PROGBITS, ALLOC,       rodata_off as u64, rodata_sz as u64, 0, 0,                       16, 0);
-    section_header(&mut out, 3, sh_data,     PROGBITS, ALLOC|WRITE, data_off   as u64, data_sz   as u64, 0, 0,                       16, 0);
-    section_header(&mut out, 4, sh_bss,      NOBITS,   ALLOC|WRITE, data_off   as u64, c.bss_size as u64,0, 0,                       16, 0);
-    section_header(&mut out, 5, sh_rela,     RELA,     0,           rela_off   as u64, rela_sz   as u64, 6, 1,                       8,  24); // link=symtab(6), info=.text(1)
-    section_header(&mut out, 6, sh_symtab,   SYMTAB,   0,           sym_off    as u64, sym_sz    as u64, 7, first_global_sym as u32, 8,  24); // link=strtab(7)
-    section_header(&mut out, 7, sh_strtab,   STRTAB,   0,           str_off    as u64, str_sz    as u64, 0, 0,                       1,  0);
-    section_header(&mut out, 8, sh_shstrtab, STRTAB,   0,           shstr_off  as u64, shstr_sz  as u64, 0, 0,                       1,  0);
-
+    section_header(&mut out, 0, 0,            NULL,     0,           0,                    0,                      0, 0,                       0,  0);
+    section_header(&mut out, 1, sh_text,      PROGBITS, ALLOC|EXEC,  text_off      as u64, text_sz         as u64, 0, 0,                       16, 0);
+    section_header(&mut out, 2, sh_rodata,    PROGBITS, ALLOC,       rodata_off    as u64, rodata_sz       as u64, 0, 0,                       16, 0);
+    section_header(&mut out, 3, sh_data,      PROGBITS, ALLOC|WRITE, data_off      as u64, data_sz         as u64, 0, 0,                       16, 0);
+    section_header(&mut out, 4, sh_bss,       NOBITS,   ALLOC|WRITE, data_off      as u64, c.bss_size      as u64, 0, 0,                       16, 0);
+    section_header(&mut out, 5, sh_rela,      RELA,     0,           rela_text_off as u64, rela_text_sz    as u64, 6, 1,                       8,  24); // link=symtab(6), info=.text(1)
+    section_header(&mut out, 9, sh_rela_data, RELA,     0,           rela_data_off as u64, rela_data.len() as u64, 6, 3,                       8,  24); // link to symtab(6), info = .data(3)
+    section_header(&mut out, 6, sh_symtab,    SYMTAB,   0,           sym_off       as u64, sym_sz          as u64, 7, first_global_sym as u32, 8,  24); // link=strtab(7)
+    section_header(&mut out, 7, sh_strtab,    STRTAB,   0,           str_off       as u64, str_sz          as u64, 0, 0,                       1,  0);
+    section_header(&mut out, 8, sh_shstrtab,  STRTAB,   0,           shstr_off     as u64, shstr_sz        as u64, 0, 0,                       1,  0);
     out
 }
 
@@ -10244,21 +10301,16 @@ fn main() {
     let mut c = Compiler::new(pp);
     c.compile();
 
-    // #[cfg(debug_assertions)]
-    // for (i, e) in c.types.entries.iter() {
-    //     eprintln!("  [{i:?}] {:?} quals={:?} ref_={:?} extra={}", e.kind, e.quals, e.ref_, e.extra);
-    // }
-
-    if args.contains(&"-run".into()) {
-        run_main(c);
-        return;
-    }
-
     let elf = write_elf(&c);
     std::fs::write(out_path, &elf).unwrap_or_else(|e| {
         eprintln!("write {out_path}: {e}");
         std::process::exit(1);
     });
+
+    if args.contains(&"-run".into()) {
+        run_main(c);
+        return;
+    }
 
     eprintln!("wrote {out_path} ({} bytes text, {} total)", c.code.bytes.len(), elf.len());
 }
@@ -10372,12 +10424,31 @@ fn run_main(mut c: Compiler) {
     mmap.copy_from_slice(&c.code.bytes);
 
     let base = mmap.as_ptr() as i64;
+
+    //
+    // Path call relocs
+    //
+
     for r in &c.call_relocs {
         let trampoline_off = sym_to_trampoline[&r.sym_index];
         let patch_pos      = r.offset as usize;
         let rel = (base + trampoline_off as i64 - (base + patch_pos as i64 + 4)) as i32;
         unsafe {
             std::ptr::write_unaligned(mmap.as_mut_ptr().add(patch_pos).cast::<i32>(), rel);
+        }
+    }
+
+    //
+    // Patch data -> rodata relocs
+    //
+    for r in &c.data_rodata_relocs {
+        let patch_pos = data_base + r.data_off as usize;
+        let target    = base + rodata_base as i64 + r.rodata_off as i64;
+        unsafe {
+            std::ptr::write_unaligned(
+                mmap.as_mut_ptr().add(patch_pos).cast::<i64>(),
+                target,
+            );
         }
     }
 
