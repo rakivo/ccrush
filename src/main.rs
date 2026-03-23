@@ -9658,294 +9658,294 @@ TypeKind::Ptr) |
     }
 
     //
-	// Type Coercion Infrastructure
+    // Type Coercion Infrastructure
     //
 
-	/// Pure-type UAC: returns the common `TypeRef` without emitting any code.
-	/// Used for constant-folding fast paths where we just need the result type.
-	#[inline]
-	fn get_usual_arithmetic_conversion_type(&self, lty: TypeRef, rty: TypeRef) -> TypeRef {
-	    let lk = self.get_kind(lty);
-	    let rk = self.get_kind(rty);
+    /// Pure-type UAC: returns the common `TypeRef` without emitting any code.
+    /// Used for constant-folding fast paths where we just need the result type.
+    #[inline]
+    fn get_usual_arithmetic_conversion_type(&self, lty: TypeRef, rty: TypeRef) -> TypeRef {
+        let lk = self.get_kind(lty);
+        let rk = self.get_kind(rty);
 
         //
-	    // Float dominance
+        // Float dominance
         //
-	    if lk == TypeKind::Double || rk == TypeKind::Double { return TYPE_DOUBLE }
-	    if lk == TypeKind::Float  || rk == TypeKind::Float  { return TYPE_FLOAT  }
-
-        //
-	    // Integer promotion brings both to at least int
-        //
-	    let lty = if matches!(lk, TypeKind::Bool | TypeKind::Char | TypeKind::Short) { TYPE_INT } else { lty };
-	    let rty = if matches!(rk, TypeKind::Bool | TypeKind::Char | TypeKind::Short) { TYPE_INT } else { rty };
-	    if lty == rty { return lty }
-
-	    let l_unsigned = self.types.is_unsigned(lty);
-	    let r_unsigned = self.types.is_unsigned(rty);
-
-	    let lk = self.get_kind(lty);
-	    let rk = self.get_kind(rty);
-
-	    let l_rank = Self::int_rank(lk);
-	    let r_rank = Self::int_rank(rk);
-
-	    if l_unsigned == r_unsigned {
-	        if l_rank >= r_rank { lty } else { rty }
-	    } else {
-	        let (u_rank, s_rank, u_ty, s_ty) = if l_unsigned {
-	            (l_rank, r_rank, lty, rty)
-	        } else {
-	            (r_rank, l_rank, rty, lty)
-	        };
-
-	        if u_rank >= s_rank { u_ty } else { s_ty }
-	    }
-	}
-
-	/// Returns the integer-promoted type for a single type (char/short/bool -> int).
-	#[inline]
-	fn promoted_type(&self, ty: TypeRef) -> TypeRef {
-	    match self.get_kind(ty) {
-	        TypeKind::Bool | TypeKind::Char | TypeKind::Short => TYPE_INT,
-	        _ => ty,
-	    }
-	}
-
-	/// Integer conversion rank per C11 $6.3.1.1.
-	/// Returns None for non-integer types (float, ptr, struct, …).
-	#[inline]
-	const fn int_rank(kind: TypeKind) -> u8 {
-	    match kind {
-	        TypeKind::Bool  => 0,
-	        TypeKind::Char  => 1,
-	        TypeKind::Short => 2,
-	        TypeKind::Int   => 3,
-	        TypeKind::Long  => 4,
-	        TypeKind::LLong => 5,
-	        _               => 3, // fallback, shouldn't be called on non-int
-	    }
-	}
-
-	/// Integer promotion: char/short/bool -> int (C11 $6.3.1.1 p2)
-	/// No-op for types already at int rank or above.
-	#[inline]
-	fn integer_promote(&mut self, v: CValue) -> CResult<CValue> {
-	    match self.get_kind(v.ty) {
-	        TypeKind::Bool | TypeKind::Char | TypeKind::Short => {
-	            // Imm path: just retag, full i64 bits are already correct
-	            if v.kind() == VK::Imm {
-	                return Ok(CValue::imm(TYPE_INT, v.imm));
-	            }
-
-	            let r = self.force_gp(v)?;
-	            let from_size = self.types.size_of(v.ty);
-	            let is_signed = self.types.is_signed(v.ty);
-	            self.emit_extend(r, from_size, 4, is_signed);
-	            Ok(CValue::gp(TYPE_INT, r))
-	        }
-
-	        _ => Ok(v),
-	    }
-	}
-
-	/// Usual arithmetic conversions (C11 $6.3.1.8).
-	/// Returns (`coerced_lhs`, `coerced_rhs`, `common_type`).
-	///
-	/// Float dominance:
-	///   double > float (long double omitted - no hw regs yet)
-	///
-	/// Integer:
-	///   - Apply integer promotions to both sides
-	///   - Same type -> done
-	///   - Same signedness -> higher rank wins
-	///   - Unsigned rank >= signed rank -> unsigned wins
-	///   - Otherwise signed wins (it can represent all unsigned values)
-	#[inline]
-	fn do_usual_arithmetic_conversion(&mut self, lv: CValue, rv: CValue) -> CResult<(CValue, CValue, TypeRef)> {
-	    let lk = self.get_kind(lv.ty);
-	    let rk = self.get_kind(rv.ty);
+        if lk == TypeKind::Double || rk == TypeKind::Double { return TYPE_DOUBLE }
+        if lk == TypeKind::Float  || rk == TypeKind::Float  { return TYPE_FLOAT  }
 
         //
-	    // Float dominance
+        // Integer promotion brings both to at least int
         //
-	    let l_float = matches!(lk, TypeKind::Float | TypeKind::Double);
-	    let r_float = matches!(rk, TypeKind::Float | TypeKind::Double);
-	    if l_float || r_float {
-	        let common = if lk == TypeKind::Double || rk == TypeKind::Double {
-	            TYPE_DOUBLE
-	        } else {
-	            TYPE_FLOAT
-	        };
-	        let l = self.coerce_to_xmm(lv, common)?;
-	        let r = self.coerce_to_xmm(rv, common)?;
-	        return Ok((CValue::xmm(common, l), CValue::xmm(common, r), common));
-	    }
+        let lty = if matches!(lk, TypeKind::Bool | TypeKind::Char | TypeKind::Short) { TYPE_INT } else { lty };
+        let rty = if matches!(rk, TypeKind::Bool | TypeKind::Char | TypeKind::Short) { TYPE_INT } else { rty };
+        if lty == rty { return lty }
+
+        let l_unsigned = self.types.is_unsigned(lty);
+        let r_unsigned = self.types.is_unsigned(rty);
+
+        let lk = self.get_kind(lty);
+        let rk = self.get_kind(rty);
+
+        let l_rank = Self::int_rank(lk);
+        let r_rank = Self::int_rank(rk);
+
+        if l_unsigned == r_unsigned {
+            if l_rank >= r_rank { lty } else { rty }
+        } else {
+            let (u_rank, s_rank, u_ty, s_ty) = if l_unsigned {
+                (l_rank, r_rank, lty, rty)
+            } else {
+                (r_rank, l_rank, rty, lty)
+            };
+
+            if u_rank >= s_rank { u_ty } else { s_ty }
+        }
+    }
+
+    /// Returns the integer-promoted type for a single type (char/short/bool -> int).
+    #[inline]
+    fn promoted_type(&self, ty: TypeRef) -> TypeRef {
+        match self.get_kind(ty) {
+            TypeKind::Bool | TypeKind::Char | TypeKind::Short => TYPE_INT,
+            _ => ty,
+        }
+    }
+
+    /// Integer conversion rank per C11 $6.3.1.1.
+    /// Returns None for non-integer types (float, ptr, struct, …).
+    #[inline]
+    const fn int_rank(kind: TypeKind) -> u8 {
+        match kind {
+            TypeKind::Bool  => 0,
+            TypeKind::Char  => 1,
+            TypeKind::Short => 2,
+            TypeKind::Int   => 3,
+            TypeKind::Long  => 4,
+            TypeKind::LLong => 5,
+            _               => 3, // fallback, shouldn't be called on non-int
+        }
+    }
+
+    /// Integer promotion: char/short/bool -> int (C11 $6.3.1.1 p2)
+    /// No-op for types already at int rank or above.
+    #[inline]
+    fn integer_promote(&mut self, v: CValue) -> CResult<CValue> {
+        match self.get_kind(v.ty) {
+            TypeKind::Bool | TypeKind::Char | TypeKind::Short => {
+                // Imm path: just retag, full i64 bits are already correct
+                if v.kind() == VK::Imm {
+                    return Ok(CValue::imm(TYPE_INT, v.imm));
+                }
+
+                let r = self.force_gp(v)?;
+                let from_size = self.types.size_of(v.ty);
+                let is_signed = self.types.is_signed(v.ty);
+                self.emit_extend(r, from_size, 4, is_signed);
+                Ok(CValue::gp(TYPE_INT, r))
+            }
+
+            _ => Ok(v),
+        }
+    }
+
+    /// Usual arithmetic conversions (C11 $6.3.1.8).
+    /// Returns (`coerced_lhs`, `coerced_rhs`, `common_type`).
+    ///
+    /// Float dominance:
+    ///   double > float (long double omitted - no hw regs yet)
+    ///
+    /// Integer:
+    ///   - Apply integer promotions to both sides
+    ///   - Same type -> done
+    ///   - Same signedness -> higher rank wins
+    ///   - Unsigned rank >= signed rank -> unsigned wins
+    ///   - Otherwise signed wins (it can represent all unsigned values)
+    #[inline]
+    fn do_usual_arithmetic_conversion(&mut self, lv: CValue, rv: CValue) -> CResult<(CValue, CValue, TypeRef)> {
+        let lk = self.get_kind(lv.ty);
+        let rk = self.get_kind(rv.ty);
 
         //
-	    // Integer promotions
+        // Float dominance
         //
-	    let lv = self.integer_promote(lv)?;
-	    let rv = self.integer_promote(rv)?;
+        let l_float = matches!(lk, TypeKind::Float | TypeKind::Double);
+        let r_float = matches!(rk, TypeKind::Float | TypeKind::Double);
+        if l_float || r_float {
+            let common = if lk == TypeKind::Double || rk == TypeKind::Double {
+                TYPE_DOUBLE
+            } else {
+                TYPE_FLOAT
+            };
+            let l = self.coerce_to_xmm(lv, common)?;
+            let r = self.coerce_to_xmm(rv, common)?;
+            return Ok((CValue::xmm(common, l), CValue::xmm(common, r), common));
+        }
 
-	    if lv.ty == rv.ty {
-	        return Ok((lv, rv, lv.ty));
-	    }
+        //
+        // Integer promotions
+        //
+        let lv = self.integer_promote(lv)?;
+        let rv = self.integer_promote(rv)?;
 
-	    let l_unsigned = self.types.is_unsigned(lv.ty);
-	    let r_unsigned = self.types.is_unsigned(rv.ty);
+        if lv.ty == rv.ty {
+            return Ok((lv, rv, lv.ty));
+        }
 
-	    let lk = self.get_kind(lv.ty);
-	    let rk = self.get_kind(rv.ty);
+        let l_unsigned = self.types.is_unsigned(lv.ty);
+        let r_unsigned = self.types.is_unsigned(rv.ty);
 
-	    let l_rank = Self::int_rank(lk);
-	    let r_rank = Self::int_rank(rk);
+        let lk = self.get_kind(lv.ty);
+        let rk = self.get_kind(rv.ty);
 
-	    let common_ty = if l_unsigned == r_unsigned {
-	        if l_rank >= r_rank { lv.ty } else { rv.ty }
-	    } else {
-	        let (u_rank, s_rank, u_ty, s_ty) = if l_unsigned {
-	            (l_rank, r_rank, lv.ty, rv.ty)
-	        } else {
-	            (r_rank, l_rank, rv.ty, lv.ty)
-	        };
-	        if u_rank >= s_rank { u_ty } else { s_ty }
-	    };
+        let l_rank = Self::int_rank(lk);
+        let r_rank = Self::int_rank(rk);
 
-	    let lv = self.coerce_int(lv, common_ty)?;
-	    let rv = self.coerce_int(rv, common_ty)?;
-	    Ok((lv, rv, common_ty))
-	}
+        let common_ty = if l_unsigned == r_unsigned {
+            if l_rank >= r_rank { lv.ty } else { rv.ty }
+        } else {
+            let (u_rank, s_rank, u_ty, s_ty) = if l_unsigned {
+                (l_rank, r_rank, lv.ty, rv.ty)
+            } else {
+                (r_rank, l_rank, rv.ty, lv.ty)
+            };
+            if u_rank >= s_rank { u_ty } else { s_ty }
+        };
 
-	/// Coerce an integer `CValue` to `target` integer type.
-	/// Extends (sign/zero) upward, truncation is implicit on x86-64.
-	#[inline]
-	fn coerce_int(&mut self, v: CValue, target: TypeRef) -> CResult<CValue> {
-	    if v.ty == target { return Ok(v) }
-	    if v.kind() == VK::Imm { return Ok(CValue::imm(target, v.imm)) }
+        let lv = self.coerce_int(lv, common_ty)?;
+        let rv = self.coerce_int(rv, common_ty)?;
+        Ok((lv, rv, common_ty))
+    }
 
-	    let r = self.force_gp(v)?;
-	    let from_size = self.types.size_of(v.ty);
-	    let to_size   = self.types.size_of(target);
-	    if to_size > from_size {
-	        let is_signed = self.types.is_signed(v.ty);
-	        self.emit_extend(r, from_size, to_size, is_signed);
-	    }
+    /// Coerce an integer `CValue` to `target` integer type.
+    /// Extends (sign/zero) upward, truncation is implicit on x86-64.
+    #[inline]
+    fn coerce_int(&mut self, v: CValue, target: TypeRef) -> CResult<CValue> {
+        if v.ty == target { return Ok(v) }
+        if v.kind() == VK::Imm { return Ok(CValue::imm(target, v.imm)) }
 
-	    Ok(CValue::gp(target, r))
-	}
+        let r = self.force_gp(v)?;
+        let from_size = self.types.size_of(v.ty);
+        let to_size   = self.types.size_of(target);
+        if to_size > from_size {
+            let is_signed = self.types.is_signed(v.ty);
+            self.emit_extend(r, from_size, to_size, is_signed);
+        }
 
-	/// Implicit coercion for assignment / argument passing (C11 $6.5.16.1).
-	/// Clang-default: all four categories silently allowed.
-	/// TODO: hook warning flags here when they exist.
-	#[inline]
-	fn coerce_for_assign(&mut self, v: CValue, target: TypeRef) -> CResult<CValue> {
-	    if v.ty == target { return Ok(v); }
+        Ok(CValue::gp(target, r))
+    }
 
-	    let from_kind   = self.get_kind(v.ty);
-	    let target_kind = self.get_kind(target);
+    /// Implicit coercion for assignment / argument passing (C11 $6.5.16.1).
+    /// Clang-default: all four categories silently allowed.
+    /// TODO: hook warning flags here when they exist.
+    #[inline]
+    fn coerce_for_assign(&mut self, v: CValue, target: TypeRef) -> CResult<CValue> {
+        if v.ty == target { return Ok(v); }
 
-	    match (from_kind, target_kind) {
-	        // int <-> int
-	        (TypeKind::Bool  | TypeKind::Char  | TypeKind::Short |
-	         TypeKind::Int   | TypeKind::Long  | TypeKind::LLong,
-	         TypeKind::Bool  | TypeKind::Char  | TypeKind::Short |
-	         TypeKind::Int   | TypeKind::Long  | TypeKind::LLong) => {
-	            // TODO(flags): warn on narrowing if -Wconversion
-	            self.coerce_int(v, target)
-	        }
+        let from_kind   = self.get_kind(v.ty);
+        let target_kind = self.get_kind(target);
 
-	        // int -> float
-	        (TypeKind::Bool  | TypeKind::Char  | TypeKind::Short |
-	         TypeKind::Int   | TypeKind::Long  | TypeKind::LLong,
-	         TypeKind::Float | TypeKind::Double) => {
-	            // TODO(flags): warn on precision loss if -Wfloat-conversion
-	            if v.kind() == VK::Imm {
+        match (from_kind, target_kind) {
+            // int <-> int
+            (TypeKind::Bool  | TypeKind::Char  | TypeKind::Short |
+             TypeKind::Int   | TypeKind::Long  | TypeKind::LLong,
+             TypeKind::Bool  | TypeKind::Char  | TypeKind::Short |
+             TypeKind::Int   | TypeKind::Long  | TypeKind::LLong) => {
+                // TODO(flags): warn on narrowing if -Wconversion
+                self.coerce_int(v, target)
+            }
+
+            // int -> float
+            (TypeKind::Bool  | TypeKind::Char  | TypeKind::Short |
+             TypeKind::Int   | TypeKind::Long  | TypeKind::LLong,
+             TypeKind::Float | TypeKind::Double) => {
+                // TODO(flags): warn on precision loss if -Wfloat-conversion
+                if v.kind() == VK::Imm {
                     //
-	                // Constant fold: store bits in a fresh Imm with fimm set
+                    // Constant fold: store bits in a fresh Imm with fimm set
                     //
-	                let fval = v.get_fimm();
-	                return Ok(CValue::fimm(target, fval));
-	            }
+                    let fval = v.get_fimm();
+                    return Ok(CValue::fimm(target, fval));
+                }
 
-	            let r = self.force_gp(v)?;
-	            let xmm = self.xmms.alloc(Span::POISONED)?;
-	            if target_kind == TypeKind::Float {
-	                self.code.cvtsi2ss(xmm, r);
-	            } else {
-	                self.code.cvtsi2sd(xmm, r);
-	            }
-	            self.regs.free(r);
-	            Ok(CValue::xmm(target, xmm))
-	        }
+                let r = self.force_gp(v)?;
+                let xmm = self.xmms.alloc(Span::POISONED)?;
+                if target_kind == TypeKind::Float {
+                    self.code.cvtsi2ss(xmm, r);
+                } else {
+                    self.code.cvtsi2sd(xmm, r);
+                }
+                self.regs.free(r);
+                Ok(CValue::xmm(target, xmm))
+            }
 
-	        // float -> int
-	        (TypeKind::Float | TypeKind::Double,
-	         TypeKind::Bool  | TypeKind::Char  | TypeKind::Short |
-	         TypeKind::Int   | TypeKind::Long  | TypeKind::LLong) => {
-	            // TODO(flags): warn always (-Wfloat-conversion)
-	            let xmm = self.force_xmm(v)?;
-	            let r = self.regs.alloc(Span::POISONED)?;
-	            if from_kind == TypeKind::Float {
-	                self.code.cvttss2si(r, xmm);
-	            } else {
-	                self.code.cvttsd2si(r, xmm);
-	            }
-	            self.xmms.free(xmm);
-	            // If target is narrower than 64-bit, truncate
-	            let r = {
-	                let tmp = CValue::gp(TYPE_LONG, r);
-	                self.coerce_int(tmp, target)?
-	            };
-	            Ok(r)
-	        }
+            // float -> int
+            (TypeKind::Float | TypeKind::Double,
+             TypeKind::Bool  | TypeKind::Char  | TypeKind::Short |
+             TypeKind::Int   | TypeKind::Long  | TypeKind::LLong) => {
+                // TODO(flags): warn always (-Wfloat-conversion)
+                let xmm = self.force_xmm(v)?;
+                let r = self.regs.alloc(Span::POISONED)?;
+                if from_kind == TypeKind::Float {
+                    self.code.cvttss2si(r, xmm);
+                } else {
+                    self.code.cvttsd2si(r, xmm);
+                }
+                self.xmms.free(xmm);
+                // If target is narrower than 64-bit, truncate
+                let r = {
+                    let tmp = CValue::gp(TYPE_LONG, r);
+                    self.coerce_int(tmp, target)?
+                };
+                Ok(r)
+            }
 
-	        // float <-> float
-	        (TypeKind::Float, TypeKind::Double) => {
-	            if v.kind() == VK::Imm {
-	                return Ok(CValue::fimm(target, v.get_fimm()));
-	            }
-	            let xmm = self.force_xmm(v)?;
-	            self.code.cvtss2sd(xmm, xmm);
-	            Ok(CValue::xmm(target, xmm))
-	        }
-	        (TypeKind::Double, TypeKind::Float) => {
-	            // TODO(flags): warn on precision loss if -Wfloat-conversion
-	            if v.kind() == VK::Imm {
-	                return Ok(CValue::fimm(target, f64::from(v.get_fimm() as f32)));
-	            }
-	            let xmm = self.force_xmm(v)?;
-	            self.code.cvtsd2ss(xmm, xmm);
-	            Ok(CValue::xmm(target, xmm))
-	        }
+            // float <-> float
+            (TypeKind::Float, TypeKind::Double) => {
+                if v.kind() == VK::Imm {
+                    return Ok(CValue::fimm(target, v.get_fimm()));
+                }
+                let xmm = self.force_xmm(v)?;
+                self.code.cvtss2sd(xmm, xmm);
+                Ok(CValue::xmm(target, xmm))
+            }
+            (TypeKind::Double, TypeKind::Float) => {
+                // TODO(flags): warn on precision loss if -Wfloat-conversion
+                if v.kind() == VK::Imm {
+                    return Ok(CValue::fimm(target, f64::from(v.get_fimm() as f32)));
+                }
+                let xmm = self.force_xmm(v)?;
+                self.code.cvtsd2ss(xmm, xmm);
+                Ok(CValue::xmm(target, xmm))
+            }
 
-	        // ptr <-> ptr (void* and others)
-	        (TypeKind::Ptr, TypeKind::Ptr) => {
-	            // TODO(flags): warn on non-void* incompatible pointer if -Wincompatible-pointer-types
-	            if v.kind() == VK::Imm { return Ok(CValue::imm(target, v.imm)); }
-	            let r = self.force_gp(v)?;
-	            Ok(CValue::gp(target, r))
-	        }
+            // ptr <-> ptr (void* and others)
+            (TypeKind::Ptr, TypeKind::Ptr) => {
+                // TODO(flags): warn on non-void* incompatible pointer if -Wincompatible-pointer-types
+                if v.kind() == VK::Imm { return Ok(CValue::imm(target, v.imm)); }
+                let r = self.force_gp(v)?;
+                Ok(CValue::gp(target, r))
+            }
 
-	        // int <-> ptr
-	        (TypeKind::Int | TypeKind::Long | TypeKind::LLong, TypeKind::Ptr) |
-	        (TypeKind::Ptr, TypeKind::Int | TypeKind::Long | TypeKind::LLong) => {
-	            // TODO(flags): warn if -Wint-conversion
-	            if v.kind() == VK::Imm { return Ok(CValue::imm(target, v.imm)); }
-	            let r = self.force_gp(v)?;
-	            Ok(CValue::gp(target, r))
-	        }
+            // int <-> ptr
+            (TypeKind::Int | TypeKind::Long | TypeKind::LLong, TypeKind::Ptr) |
+            (TypeKind::Ptr, TypeKind::Int | TypeKind::Long | TypeKind::LLong) => {
+                // TODO(flags): warn if -Wint-conversion
+                if v.kind() == VK::Imm { return Ok(CValue::imm(target, v.imm)); }
+                let r = self.force_gp(v)?;
+                Ok(CValue::gp(target, r))
+            }
 
             //
-	        // signed <-> unsigned (same width)
-	        // Already handled by coerce_int above (same size = no extend needed).
-	        // Explicit arm for clarity; no-op on x86-64.
+            // signed <-> unsigned (same width)
+            // Already handled by coerce_int above (same size = no extend needed).
+            // Explicit arm for clarity; no-op on x86-64.
             //
 
-	        //  everything else: structs, arrays, void - no-op
-	        _ => Ok(v),
-	    }
-	}
+            //  everything else: structs, arrays, void - no-op
+            _ => Ok(v),
+        }
+    }
 }
 
 #[must_use]
