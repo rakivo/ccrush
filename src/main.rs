@@ -7054,7 +7054,7 @@ impl Compiler {
             && self.can_hash_start_a_type(self.next_token.hash)
         {
             self.next(); // (
-            let _ = self.compile_type()?;
+            _ = self.compile_type()?;
             if self.current_token.kind == TK::RParen {
                 self.next(); // )
             }
@@ -7233,6 +7233,16 @@ impl Compiler {
                 self.data.extend_from_slice(&0usize.to_le_bytes());
 
                 self.data_rodata_relocs.push(DataRodataReloc { data_off, rodata_off });
+
+                (false, data_off)
+            }
+
+            TypeKind::Ptr => {
+                let ptr = self.try_parse_and_eval_const_int()?;
+
+                // Reserve space for a pointer into .rodata
+                let data_off = self.data.len() as _;
+                self.data.extend_from_slice(&ptr.to_le_bytes());
 
                 (false, data_off)
             }
