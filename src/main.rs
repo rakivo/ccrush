@@ -833,7 +833,7 @@ struct MacroDef {
     body_len:     u32,  // 4
 
     param_count:  u8,   // 1
-    is_variadic:  bool, // 1
+    is_variadic:  b8,   // 1
     _pad:         [u8; 2],
 }
 
@@ -3014,8 +3014,7 @@ impl TypeTable {
                     }
                 }
 
-                let id = TypeRef(self.entries.len() as u32);
-                self.entries.push(e);
+                let id = self.entries.push(e);
                 self.map_keys[slot] = key;
                 self.map_vals[slot] = id;
                 self.map_used += 1;
