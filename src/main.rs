@@ -764,22 +764,63 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileRef) -> Token {
 }
 
 #[inline]
-fn parse_number_int(s: &str) -> i64 {
-    let s = s.trim_end_matches(['u', 'U', 'l', 'L']);
+pub fn parse_number_int(s: &str) -> (i64, TypeRef) {
+    let s = s.trim();
 
-    if s.starts_with("0x") || s.starts_with("0X") {
-        u64::from_str_radix(&s[2..], 16).unwrap_or(0) as i64
-    } else {
-        s.parse::<u64>().map(|v| v as i64)
-            .or_else(|_| s.parse::<i64>())
-            .unwrap_or(0)
+    // Extract suffix (case insensitive)
+    let suffix = s.chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let mut base = s;
+
+    // Remove suffix from base
+    if !suffix.is_empty() {
+        base = &s[..s.len() - suffix.len()];
     }
+
+    // Determine type
+    let ty = match suffix.as_str() {
+        "u" => TYPE_UINT,
+        "l" => TYPE_LONG,
+        "ul" | "lu" => TYPE_ULONG,
+        "ll" => TYPE_LLONG,
+        "ull" | "llu" => TYPE_ULLONG,
+        "" => TYPE_INT,
+        _ => TYPE_INT, // fallback
+    };
+
+    // Parse numeric base
+    let value = if let Some(hex) = base.strip_prefix("0x").or_else(|| base.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).unwrap_or(0)
+    } else if let Some(oct) = base.strip_prefix("0") {
+        if oct.is_empty() {
+            0
+        } else {
+            i64::from_str_radix(oct, 8).unwrap_or(0)
+        }
+    } else {
+        base.parse::<i64>().unwrap_or(0)
+    };
+
+    (value, ty)
 }
 
 #[inline]
-fn parse_number_float(s: &str) -> f64 {
-    let s = s.strip_suffix('f').unwrap_or(s); // @Incomplete
-    s.parse().unwrap_or(0.0)
+pub fn parse_number_float(s: &str) -> (f64, TypeRef) {
+    let s = s.trim();
+    let last = s.chars().last();
+
+    if let Some('f') | Some('F') = last {
+        let base = &s[..s.len() - 1];
+        (base.parse::<f64>().unwrap_or(0.0), TYPE_FLOAT)
+    } else if let Some('l') | Some('L') = last {
+        let base = &s[..s.len() - 1];
+        (base.parse::<f64>().unwrap_or(0.0), TYPE_LDOUBLE)
+    } else {
+        (s.parse::<f64>().unwrap_or(0.0), TYPE_DOUBLE)
+    }
 }
 
 const MAX_PARAMS: usize = 8;
@@ -2457,7 +2498,7 @@ impl PP {
                 }
 
                 let s = t.s(&self.src_arena);
-                parse_number_int(s)
+                parse_number_int(s).0
             }
 
             TK::Ident => {
@@ -8571,8 +8612,8 @@ TypeKind::Ptr) |
                 let is_float_literal = s.contains('.');
 
                 if !is_float_literal {
-                    let v = parse_number_int(s);
-                    self.vstack.push(CValue::imm(TYPE_INT, v));
+                    let (v, ty) = parse_number_int(s);
+                    self.vstack.push(CValue::imm(ty, v));
                     return Ok(())
                 }
 
@@ -8581,8 +8622,7 @@ TypeKind::Ptr) |
                 //
 
                 let is_float = s.ends_with('f');
-                let v = parse_number_float(s);
-                let ty = if is_float { TYPE_FLOAT } else { TYPE_DOUBLE };
+                let (v, ty) = parse_number_float(s);
 
                 let rodata_off = self.rodata.len() as u32;
                 if is_float {
