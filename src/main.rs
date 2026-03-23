@@ -967,7 +967,7 @@ pub struct PP {
     at_bol:            bx,  // At beginning of line - gate for # directives
     stop_at_newline:   bx,  // For # directives as well
 
-    // TODO(#19): Make pragma_once_paths and include_dirs in PP hashsets
+
     pragma_once_paths: HashSet<Box<Path>, wyhash::WyHasherBuilder>,
     include_dirs:      Vec<Box<Path>>,
 
