@@ -529,6 +529,7 @@ impl Token {
 const HASH_RETURN:   u64 = hash_ident("return");
 const HASH_INT:      u64 = hash_ident("int");
 const HASH_LONG:     u64 = hash_ident("long");
+const HASH_SWITCH:   u64 = hash_ident("switch");
 const HASH_CHAR:     u64 = hash_ident("char");
 const HASH_VOID:     u64 = hash_ident("void");
 const HASH_FLOAT:    u64 = hash_ident("float");
@@ -566,6 +567,8 @@ const HASH_TYPEOF:   u64 = hash_ident("typeof");
 const HASH_ELSE:     u64 = hash_ident("else");
 const HASH_ELIF:     u64 = hash_ident("elif");
 const HASH_ENDIF:    u64 = hash_ident("endif");
+const HASH_CASE:     u64 = hash_ident("case");
+const HASH_DEFAULT:  u64 = hash_ident("default");
 const HASH_BREAK:    u64 = hash_ident("break");
 const HASH_BOOL:     u64 = hash_ident("bool");
 const HASH__BOOL:    u64 = hash_ident("_Bool");
@@ -4025,6 +4028,23 @@ impl CodeBuf {
         self.emit_byte(0x39);
         self.modrm_rr(rhs, lhs);
     }
+    #[inline]
+    pub fn cmp_ri32(&mut self, reg: Reg, imm: i32) {
+        // CMP r32, imm32 uses opcode 0x81 /7
+        // /7 goes in reg/opcode bits of ModR/M, r/m = target register
+
+        // Emit REX prefix if needed (W = 0 for 32-bit, r = high bit of /7 = 0, b = reg.ext())
+        self.rex(false, Reg::Rax /* r = 0 for /7 */, reg);
+
+        self.emit_byte(0x81); // opcode for CMP r/m32, imm32
+
+        // ModR/M byte: mod = 11 (register direct), reg/opcode = 7 (CMP), r/m = reg
+        let modrm = 0xC0 | (7 << 3) | reg.enc();
+        self.emit_byte(modrm);
+
+        // Emit 32-bit immediate
+        self.emit_i32(imm);
+    }
 
     #[inline]
     pub fn setcc(&mut self, dst: Reg, code: u8) {
@@ -4910,6 +4930,13 @@ pub struct LoopContext {
     continue_patches: Vec<u32>,
 }
 
+#[derive(Default)]
+pub struct SwitchContext {
+    cases:         Vec<(i64, u32)>,  // (value, code_off)
+    default_off:   Option<u32>,
+    break_patches: Vec<u32>,
+}
+
 bitflags::bitflags! {
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
     pub struct GlobalEntryFlags: u8 {
@@ -5039,6 +5066,7 @@ pub struct Compiler {
     pub enum_consts:   IntMap<u64, i64>,
 
     pub loop_stack:    Vec<LoopContext>,
+    pub switch_stack:  Vec<SwitchContext>,
 
     pub rodata:        Vec<u8>,
     pub rodata_interner: IntMap<RodataHash, u32>, // Bytes hash -> offset into rodata
@@ -5185,6 +5213,7 @@ impl Compiler {
             ret_ptr_off: None,
             got_relocs: Vec::new(),
             in_global_context: true,
+            switch_stack: Default::default(),
             tags: Default::default(),
             loop_stack: Vec::new(),
             types: TypeTable::new(),
@@ -6371,6 +6400,7 @@ impl Compiler {
                 HASH_IF       => self.compile_if(),
                 HASH_FOR      => self.compile_for(),
                 HASH_WHILE    => self.compile_while(),
+                HASH_SWITCH   => self.compile_switch(),
                 HASH_BREAK    => self.compile_break(self.current_token.span),
                 HASH_CONTINUE => self.compile_continue(self.current_token.span),
 
@@ -6507,9 +6537,23 @@ impl Compiler {
         self.next(); // break
         self.expect(TK::SemiColon, "';'")?;
 
-        let ctx = self.loop_stack.last_mut().ok_or(CError::BreakOutsideLoop { span })?;
-        let patch = self.code.jmp_rel32();
-        ctx.break_patches.push(patch as _);
+        let patch = self.code.jmp_rel32() as _;
+
+        //
+        // Find innermost break target - switch takes priority over loop
+        // if switch is more recent than the innermost loop
+        //
+
+        let loop_depth  = self.loop_stack.len();
+        let switch_depth = self.switch_stack.len();
+
+        if switch_depth > 0 && (loop_depth == 0 || switch_depth > loop_depth) {
+            self.switch_stack.last_mut().unwrap().break_patches.push(patch);
+        } else if loop_depth > 0 {
+            self.loop_stack.last_mut().unwrap().break_patches.push(patch);
+        } else {
+            return Err(CError::BreakOutsideLoop { span });
+        }
 
         Ok(())
     }
@@ -6698,6 +6742,103 @@ impl Compiler {
         // Exit init's scope
         self.locals.pop_scope();
 
+        Ok(())
+    }
+
+    fn compile_switch(&mut self) -> CResult<()> {
+        self.next(); // switch
+
+        self.expect(TK::LParen, "'('")?;
+        self.compile_expr_no_comma()?;
+        self.expect(TK::RParen, "')'")?;
+
+        let (r, _) = self.pop_reg()?;
+
+        //
+        // @CodeOptimization
+        //
+        // This doesn't emit a jump table yet, the current strategy is:
+        //
+        // Compile body, collecting case patches, then patch them
+        //
+
+        self.switch_stack.push(SwitchContext::default());
+
+        // Jump to the dispatch table (patched after body)
+        let jmp_dispatch = self.code.jmp_rel32();
+
+        self.expect(TK::LCurly, "'{'")?;
+        self.locals.push_scope();
+
+        while self.current_token.kind != TK::RCurly && !self.at_eof() {
+            if self.current_token.hash == HASH_CASE {
+                self.next(); // case
+                let val = self.try_parse_and_eval_const_int()?;
+                self.expect(TK::Colon, "':'")?;
+
+                let ctx = self.switch_stack.last_mut().unwrap();
+                ctx.cases.push((val, self.code.pos() as _));
+
+                continue;
+            }
+
+            if self.current_token.hash == HASH_DEFAULT {
+                self.next(); // default
+                self.expect(TK::Colon, "':'")?;
+
+                let ctx = self.switch_stack.last_mut().unwrap();
+                ctx.default_off = Some(self.code.pos() as _);
+
+                continue;
+            }
+
+            self.compile_stmt()?;
+        }
+
+        self.locals.pop_scope();
+        self.expect(TK::RCurly, "'}'")?;
+
+        //
+        // Patch jmp_dispatch to here
+        //
+        self.code.patch_rel32(jmp_dispatch, self.code.pos());
+
+        let ctx = self.switch_stack.pop().unwrap();
+
+        //
+        // Emit dispatch: cmp r, val; je case_off for each case
+        //
+        for (val, case_off) in &ctx.cases {
+            if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 {
+                self.code.cmp_ri32(r, *val as i32);
+            } else {
+                // Doesn't fit into a 32-bit imm: load into tmp reg and compare..
+                let tmp = self.regs.alloc(Span::POISONED)?;
+                self.code.mov_ri64(tmp, *val);
+                self.code.cmp_rr(r, tmp);
+                self.regs.free(tmp);
+            }
+
+            let je = self.code.je_rel32();
+            self.code.patch_rel32(je, *case_off as _);
+        }
+
+        if let Some(default_off) = ctx.default_off {
+            let jmp = self.code.jmp_rel32();
+            self.code.patch_rel32(jmp, default_off as _);
+        } else {
+            // ... Fall through to after body
+        }
+
+        //
+        // Patch all break jumps to here
+        //
+        let after_switch = self.code.pos();
+        for patch in ctx.break_patches {
+            self.code.patch_rel32(patch as _, after_switch);
+        }
+
+        self.regs.free(r);
         Ok(())
     }
 
