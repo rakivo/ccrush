@@ -10351,16 +10351,19 @@ fn main() {
     let mut c = Compiler::new(pp);
     c.compile();
 
+    if args.contains(&"-run".into()) {
+        // @Incomplete
+        // @Note: This logically should write elf first and then run and exit, but it is what it is..
+
+        run_main(c);
+        return;
+    }
+
     let elf = write_elf(&c);
     std::fs::write(out_path, &elf).unwrap_or_else(|e| {
         eprintln!("write {out_path}: {e}");
         std::process::exit(1);
     });
-
-    if args.contains(&"-run".into()) {
-        run_main(c);
-        return;
-    }
 
     eprintln!("wrote {out_path} ({} bytes text, {} total)", c.code.bytes.len(), elf.len());
 }
