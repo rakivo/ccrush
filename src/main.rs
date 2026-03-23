@@ -1235,6 +1235,20 @@ impl PP {
     }
 
     #[inline]
+    fn replay_tokens(&mut self, tokens: Vec<Token>) {
+        let saved_cur  = self.current_token;
+        let saved_peek = self.next_token;
+
+        let mut replay = tokens;
+        replay.push(saved_cur);
+        replay.push(saved_peek);
+
+        self.exp.push(replay.as_slice());
+        self.current_token = self.cook();
+        self.next_token    = self.cook();
+    }
+
+    #[inline]
     fn lex_str(&mut self, s: impl AsRef<[u8]>) -> (FileRef, Vec<Token>) {
         let fid  = self.src_arena.add_bytes(&PathBuf::from("<builtin>"), s.as_ref());
         let data = self.src_arena.slice(fid);
@@ -6553,16 +6567,7 @@ impl Compiler {
         //
         self.code.patch_rel32(jmp_cond, self.code.pos());
         if !cond_toks.is_empty() {
-            let saved_cur  = self.pp.current_token;
-            let saved_peek = self.pp.next_token;
-
-            let mut replay = cond_toks;
-            replay.push(saved_cur);
-            replay.push(saved_peek);
-
-            self.pp.exp.push(replay.as_slice());
-            self.pp.current_token = self.pp.cook();
-            self.pp.next_token    = self.pp.cook();
+            self.replay_tokens(cond_toks);
 
             self.compile_expr_no_comma()?;
             let (r, _) = self.pop_reg()?;
@@ -6658,16 +6663,7 @@ impl Compiler {
         }
 
         if !post_toks.is_empty() {
-            let saved_cur  = self.pp.current_token;
-            let saved_peek = self.pp.next_token;
-
-            let mut replay = post_toks;
-            replay.push(saved_cur);
-            replay.push(saved_peek);
-
-            self.pp.exp.push(replay.as_slice());
-            self.pp.current_token = self.pp.cook();
-            self.pp.next_token    = self.pp.cook();
+            self.replay_tokens(post_toks);
 
             self.compile_expr()?;
             let v = self.vstack.pop();
@@ -6689,16 +6685,7 @@ impl Compiler {
             let jmp = self.code.jmp_rel32();
             self.code.patch_rel32(jmp, loop_top);
         } else {
-            let saved_cur  = self.pp.current_token;
-            let saved_peek = self.pp.next_token;
-
-            let mut replay = cond_toks;
-            replay.push(saved_cur);
-            replay.push(saved_peek);
-
-            self.pp.exp.push(replay.as_slice());
-            self.pp.current_token = self.pp.cook();
-            self.pp.next_token    = self.pp.cook();
+            self.replay_tokens(cond_toks);
 
             self.compile_expr_no_comma()?;
             let (r, _) = self.pop_reg()?;
@@ -7425,16 +7412,7 @@ impl Compiler {
         // Replay tokens and compile initializer
         //
 
-        let saved_cur  = self.pp.current_token;
-        let saved_peek = self.pp.next_token;
-
-        let mut replay = toks;
-        replay.push(saved_cur);
-        replay.push(saved_peek);
-
-        self.pp.exp.push(replay.as_slice());
-        self.pp.current_token = self.pp.cook();
-        self.pp.next_token    = self.pp.cook();
+        self.replay_tokens(toks);
 
         self.compile_array_initializer(off, real_ty)?;
 
