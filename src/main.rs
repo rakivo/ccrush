@@ -64,6 +64,8 @@
 // TODO(#15): Stack unwind info
 // TODO(#14): GCC statement expressions
 // TODO(#27): Switch statements
+// TODO(#30): Ternary operator
+// TODO: static assert
 
 // TODO(#18): Resolve the situation with sret and VLA hidden slot using the same slot...?
 
@@ -10717,3 +10719,4 @@ fn run_main(mut c: Compiler) {
     let result = f(argc, argv_ptr, envp_ptr);
     std::process::exit(result);
 }
+     
