@@ -71,7 +71,6 @@
 // TODO(#15): Stack unwind info
 // TODO(#14): GCC statement expressions
 // TODO(#16): More declarators support: `void (*(*fp)(int))(float)`
-// TODO(#17): __builtin_bswap16, __builtin_*...
 // TODO(#25): Strings in initializers, i.e. char *s[] = {"abc", "xyz"};
 // TODO(#26): 50.f float literals
 // TODO(#27): Switch statements
