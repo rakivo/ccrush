@@ -2650,6 +2650,13 @@ impl TypeEntry {
 
     #[inline]
     #[must_use]
+    pub fn repr(&self) -> TypeRef {
+        debug_assert!(self.kind == TypeKind::Enum);
+        self.ref_
+    }
+
+    #[inline]
+    #[must_use]
     pub fn array_len(&self) -> u32 {
         debug_assert!(self.kind == TypeKind::Array);
         self.extra
@@ -3152,7 +3159,7 @@ impl TypeTable {
             TypeKind::Double                              => 8,
             TypeKind::LDouble                             => 16,
             TypeKind::Ptr                                 => 8,
-            TypeKind::Enum                                => 4,
+            TypeKind::Enum   => self.size_of(e.repr()),
             TypeKind::Array  => self.size_of(e.elem()) * e.array_len(),
             TypeKind::Struct => self.struct_size(e.field_start(), e.field_count()),
             TypeKind::Union  => self.union_size(e.field_start(), e.field_count()),
@@ -3174,7 +3181,7 @@ impl TypeTable {
             TypeKind::Double                              => 8,
             TypeKind::LDouble                             => 16,
             TypeKind::Ptr                                 => 8,
-            TypeKind::Enum                                => 4,
+            TypeKind::Enum   => self.align_of(e.repr()),
             TypeKind::Array  => self.align_of(e.elem()),
             TypeKind::Struct => self.struct_align(e.field_start(), e.field_count()),
             TypeKind::Union  => self.union_align(e.field_start(), e.field_count()),
@@ -5474,14 +5481,14 @@ impl Compiler {
             let is_incomplete =
                 self.types.get(existing_ty).flags == TypeFlags::FORWARD_DECLARATION;
 
-            if !is_incomplete || self.current_token.kind != TK::LCurly {
+            if !is_incomplete || !matches!(self.current_token.kind, TK::LCurly | TK::Colon) {
                 return Ok(existing_ty);
             }
 
             // ... Fall through to parse the full definition
         }
 
-        if self.current_token.kind != TK::LCurly {
+        if !matches!(self.current_token.kind, TK::LCurly | TK::Colon) {
             if let Some(tag) = tag {
                 //
                 // Forward declaration - register incomplete type if not already known
@@ -5509,6 +5516,23 @@ impl Compiler {
                 name: t.s(&self.src_arena).to_owned(),
                 span: t.span,
             });
+        }
+
+        let mut repr_ty = None;
+        if self.current_token.kind == TK::Colon {
+            let colon = self.next(); // :
+
+            let ty = self.compile_type()?;
+
+            if !self.get(ty).is_integer() {
+                return Err(CError::Expected {
+                    span: colon.span,
+                    expected: "integer type",
+                    got: self.types.to_string(ty)
+                });
+            }
+
+            repr_ty = Some(ty);
         }
 
         self.next(); // {
@@ -5546,8 +5570,10 @@ impl Compiler {
             existing_ty  // reuse the same TypeRef
         } else {
             self.types.intern(
-                TypeKind::Enum, QualFlags::empty(), TypeFlags::empty(),
-                TypeRef(0), 0, 0
+                TypeKind::Enum,
+                QualFlags::empty(), TypeFlags::empty(),
+                repr_ty.unwrap_or(TYPE_INT),
+                0, 0
             )
         };
 
