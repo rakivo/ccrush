@@ -48,3 +48,19 @@ lto = false
 codegen-units = 16
 overflow-checks = false
 panic = "abort"                   # optional: less noise, smaller code
+
+# RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort -Zlocation-detail=none -Zfmt-debug=none" \
+#     cargo +nightly b \
+#        -Z build-std=std,panic_abort \
+#        -Z build-std-features= \
+#         --profile=release-small --target=x86_64-unknown-linux-gnu
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+panic = "abort"
+codegen-units = 1
+lto = "fat"
+strip = true
+debug = 0
+overflow-checks = false
+debug-assertions = false
