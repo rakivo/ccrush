@@ -58,7 +58,6 @@
 //
 
 // TODO(#21): Struct literals
-// TODO(#23): String literal merging: "foo""bar"
 // TODO(#20): Enum repr type C23 extension.
 // TODO(#3): Function pointers
 // TODO(#7): __attribute__
