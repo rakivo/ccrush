@@ -57,7 +57,6 @@
 //
 //
 
-// TODO(#2): Structs
 // TODO(#21): Struct literals
 // TODO(#23): String literal merging: "foo""bar"
 // TODO(#20): Enum repr type C23 extension.
