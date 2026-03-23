@@ -765,34 +765,29 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileRef) -> Token {
 pub fn parse_number_int(s: &str) -> (i64, TypeRef) {
     let s = s.trim();
 
-    // Extract suffix (case insensitive)
-    let suffix = s.chars()
-        .rev()
-        .take_while(|c| c.is_ascii_alphabetic())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    let mut base = s;
+    // Find where the suffix starts (from the end, skip ascii alpha chars)
+    let suffix_start = s
+        .as_bytes()
+        .iter()
+        .rposition(|b| !b.is_ascii_alphabetic())
+        .map(|i| i + 1)
+        .unwrap_or(0);
 
-    // Remove suffix from base
-    if !suffix.is_empty() {
-        base = &s[..s.len() - suffix.len()];
-    }
+    let base = &s[..suffix_start];
+    let suffix = &s[suffix_start..];
 
-    // Determine type
-    let ty = match suffix.as_str() {
-        "u" => TYPE_UINT,
-        "l" => TYPE_LONG,
-        "ul" | "lu" => TYPE_ULONG,
-        "ll" => TYPE_LLONG,
-        "ull" | "llu" => TYPE_ULLONG,
-        "" => TYPE_INT,
-        _ => TYPE_INT, // fallback
+    let ty = match suffix {
+        "u" | "U" => TYPE_UINT,
+        "l" | "L" => TYPE_LONG,
+        "ul" | "uL" | "Ul" | "UL" | "lu" | "lU" | "Lu" | "LU" => TYPE_ULONG,
+        "ll" | "lL" | "Ll" | "LL" => TYPE_LLONG,
+        "ull" | "uLL" | "Ull" | "ULL" | "llu" | "llU" | "LLu" | "LLU" => TYPE_ULLONG,
+        _ => TYPE_INT,
     };
 
-    // Parse numeric base
     let value = if let Some(hex) = base.strip_prefix("0x").or_else(|| base.strip_prefix("0X")) {
         i64::from_str_radix(hex, 16).unwrap_or(0)
-    } else if let Some(oct) = base.strip_prefix("0") {
+    } else if let Some(oct) = base.strip_prefix('0') {
         if oct.is_empty() {
             0
         } else {
@@ -808,16 +803,10 @@ pub fn parse_number_int(s: &str) -> (i64, TypeRef) {
 #[inline]
 pub fn parse_number_float(s: &str) -> (f64, TypeRef) {
     let s = s.trim();
-    let last = s.chars().last();
-
-    if let Some('f') | Some('F') = last {
-        let base = &s[..s.len() - 1];
-        (base.parse::<f64>().unwrap_or(0.0), TYPE_FLOAT)
-    } else if let Some('l') | Some('L') = last {
-        let base = &s[..s.len() - 1];
-        (base.parse::<f64>().unwrap_or(0.0), TYPE_LDOUBLE)
-    } else {
-        (s.parse::<f64>().unwrap_or(0.0), TYPE_DOUBLE)
+    match s.as_bytes().last() {
+        Some(b'f' | b'F') => ((&s[..s.len() - 1]).parse::<f64>().unwrap_or(0.0), TYPE_FLOAT),
+        Some(b'l' | b'L') => ((&s[..s.len() - 1]).parse::<f64>().unwrap_or(0.0), TYPE_LDOUBLE),
+        _ => (s.parse::<f64>().unwrap_or(0.0), TYPE_DOUBLE),
     }
 }
 
@@ -5249,18 +5238,6 @@ impl Compiler {
     fn at_eof(&self) -> bool { self.current_token.kind == TK::Eof }
 
     #[inline]
-    fn rodata_intern(&mut self, bytes: &[u8]) -> u32 {
-        let hash = hash_bytes_for_rodata_interning(bytes);
-        *self.rodata_interner.entry(hash).or_insert_with(|| {
-            let off = self.rodata.len() as u32;
-            self.rodata.extend_from_slice(bytes);
-            if bytes.last() != Some(&0) { self.rodata.push(0); }
-            off
-        })
-    }
-
-
-    #[inline]
     fn unescape_len(s: &str) -> usize {
         let bytes = s.as_bytes();
         let mut len = 0usize;
@@ -5274,7 +5251,23 @@ impl Compiler {
     }
 
     #[inline]
-    fn unescape_string_literal_into_scratch(&mut self, start_token: &Token) -> SmallVec<[u8; 2048]> {
+    fn unescape_string_literal_into_scratch_and_intern_them_into_rodata(&mut self, start_token: &Token) -> u32 {
+        self.unescape_string_literal_into_scratch(start_token);
+
+        let bytes = &self.strlit_unescaping_scratch;
+        let hash = hash_bytes_for_rodata_interning(bytes);
+        *self.rodata_interner.entry(hash).or_insert_with(|| {
+            let off = self.rodata.len() as u32;
+            self.rodata.extend_from_slice(bytes);
+            if bytes.last() != Some(&0) { self.rodata.push(0); }
+            off
+        })
+    }
+
+    #[inline]
+    fn unescape_string_literal_into_scratch(&mut self, start_token: &Token) {
+        self.strlit_unescaping_scratch.clear();
+
         let raw = start_token.s(&self.pp.src_arena);
         let s   = &raw[1..raw.len()-1];
         let bytes = s.as_bytes();
@@ -5290,6 +5283,7 @@ impl Compiler {
             } else {
                 self.strlit_unescaping_scratch.push(bytes[i]);
             }
+
             i += 1;
         }
 
@@ -5315,8 +5309,6 @@ impl Compiler {
                 i2 += 1;
             }
         }
-
-        core::mem::take(&mut self.strlit_unescaping_scratch)
     }
 
     #[inline]
@@ -6374,16 +6366,19 @@ impl Compiler {
     #[inline]
     fn compile_stmt(&mut self) -> CResult<()> {
         match self.current_token.kind {
-            TK::Ident => {
-                let h = self.current_token.hash;
-                     if h == HASH_RETURN        { self.compile_return()     }
-                else if h == HASH_IF            { self.compile_if()         }
-                else if h == HASH_FOR           { self.compile_for()        }
-                else if h == HASH_WHILE         { self.compile_while()      }
-                else if h == HASH_BREAK         { self.compile_break(self.current_token.span)    }
-                else if h == HASH_CONTINUE      { self.compile_continue(self.current_token.span) }
-                else if self.can_hash_start_a_type(h) { self.compile_local_decl() }
-                else { self.compile_expr_stmt()  }
+            TK::Ident => match self.current_token.hash {
+                HASH_RETURN   => self.compile_return(),
+                HASH_IF       => self.compile_if(),
+                HASH_FOR      => self.compile_for(),
+                HASH_WHILE    => self.compile_while(),
+                HASH_BREAK    => self.compile_break(self.current_token.span),
+                HASH_CONTINUE => self.compile_continue(self.current_token.span),
+
+                _ => if self.can_hash_start_a_type(self.current_token.hash) {
+                    self.compile_local_decl()
+                } else {
+                    self.compile_expr_stmt()
+                }
             }
 
             TK::LCurly => self.compile_block(),
@@ -6984,10 +6979,10 @@ impl Compiler {
 
                     let t = self.next();
 
-                    let bytes = self.unescape_string_literal_into_scratch(&t);
-                    self.data.extend_from_slice(&bytes);
+                    self.unescape_string_literal_into_scratch(&t);
+                    self.data.extend_from_slice(&self.strlit_unescaping_scratch);
                     self.data.push(0);
-                    let actual_len = bytes.len() + 1;
+                    let actual_len = self.strlit_unescaping_scratch.len() + 1;
 
                     // Zero pad remaining if sized
                     if !inferred && actual_len < arr_len {
@@ -7020,10 +7015,10 @@ impl Compiler {
 
                                 let t = self.next();
 
-                                let bytes = self.unescape_string_literal_into_scratch(&t);
-                                self.data.extend_from_slice(&bytes);
+                                self.unescape_string_literal_into_scratch(&t);
+                                self.data.extend_from_slice(&self.strlit_unescaping_scratch);
                                 self.data.push(0);
-                                let actual_len = bytes.len() + 1;
+                                let actual_len = self.strlit_unescaping_scratch.len() + 1;
 
                                 // Zero pad remaining if sized
                                 if !inferred && actual_len < arr_len {
@@ -7035,8 +7030,7 @@ impl Compiler {
                                 //
 
                                 let t = self.next();
-                                let bytes = self.unescape_string_literal_into_scratch(&t);
-                                let rodata_off = self.rodata_intern(&bytes);
+                                let rodata_off = self.unescape_string_literal_into_scratch_and_intern_them_into_rodata(&t);
 
                                 // Reserve space for a pointer into .rodata
                                 let data_off = self.data.len() as _;
@@ -7091,8 +7085,7 @@ impl Compiler {
                 //
 
                 let t = self.next();
-                let bytes = self.unescape_string_literal_into_scratch(&t);
-                let rodata_off = self.rodata_intern(&bytes);
+                let rodata_off = self.unescape_string_literal_into_scratch_and_intern_them_into_rodata(&t);
 
                 // Reserve space for a pointer into .rodata
                 let data_off = self.data.len() as _;
@@ -7304,9 +7297,8 @@ impl Compiler {
             //
 
             let t = self.next();
-            let bytes = self.unescape_string_literal_into_scratch(&t);
-            let actual_len = bytes.len() + 1;
-            let rodata_off = self.rodata_intern(&bytes);
+            let rodata_off = self.unescape_string_literal_into_scratch_and_intern_them_into_rodata(&t);
+            let actual_len = self.strlit_unescaping_scratch.len() + 1;
 
             // lea rdi, [rbp + base_off] - destination
             let dst = self.regs.alloc(Span::POISONED)?;
@@ -7341,7 +7333,7 @@ impl Compiler {
                 self.regs.free(tmp);
             }
 
-            return Ok(bytes.len() as u32 + 1); // \0
+            return Ok(actual_len as _);
         }
 
         // Brace initializer: int arr[N] = {1, 2, 3}
@@ -8620,8 +8612,7 @@ TypeKind::Ptr) |
             TK::StrLit => {
                 let t = self.next();
 
-                let bytes = self.unescape_string_literal_into_scratch(&t);
-                let rodata_off = self.rodata_intern(&bytes);
+                let rodata_off = self.unescape_string_literal_into_scratch_and_intern_them_into_rodata(&t);
 
                 // lea dst, [rip + disp32] - displacement patched by write_elf via R_X86_64_PC32
                 let dst = self.regs.alloc(Span::POISONED)?;
