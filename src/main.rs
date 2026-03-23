@@ -478,8 +478,10 @@ pub enum TK {
     Xor, XorEq, Not, BitNot,
     And, Or,
     Dot,
+    Percent, PercentEq,
     BinAnd,   BinOr,
     BinAndEq, BinOrEq,
+    Question,
 
     // PP-internal - never escapes cooked stream
 
@@ -501,6 +503,7 @@ impl TK {
             TK::BinAndEq => TK::BinAnd,
             TK::XorEq    => TK::Xor,
             TK::BinOrEq  => TK::BinOr,
+            TK::PercentEq => TK::Percent,
             _ => unreachable!(),
         }
     }
@@ -570,12 +573,19 @@ const HASH_ELIF:     u64 = hash_ident("elif");
 const HASH_ENDIF:    u64 = hash_ident("endif");
 const HASH_CASE:     u64 = hash_ident("case");
 const HASH_DEFAULT:  u64 = hash_ident("default");
+const HASH_DO:       u64 = hash_ident("do");
 const HASH_BREAK:    u64 = hash_ident("break");
 const HASH_BOOL:     u64 = hash_ident("bool");
 const HASH__BOOL:    u64 = hash_ident("_Bool");
 const HASH_CONTINUE: u64 = hash_ident("continue");
 
-const HASH___VA_ARGS__: u64 = hash_ident("__VA_ARGS__");
+const HASH___LINE__:            u64 = hash_ident("__LINE__");
+const HASH___FILE__:            u64 = hash_ident("__FILE__");
+const HASH___FUNC__:            u64 = hash_ident("__FUNC__");
+const HASH___FUNCTION__:        u64 = hash_ident("__FUNCTION__");
+const HASH___PRETTY_FUNCTION__: u64 = hash_ident("__PRETTY_FUNCTION__");
+const HASH___COUNTER__:         u64 = hash_ident("__COUNTER__");
+const HASH___VA_ARGS__:         u64 = hash_ident("__VA_ARGS__");
 
 const HASH_BUILTIN_BSWAP16:     u64 = hash_ident("__builtin_bswap16");
 const HASH_BUILTIN_BSWAP32:     u64 = hash_ident("__builtin_bswap32");
@@ -629,6 +639,7 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileRef) -> Token {
     match ch {
         b'\n' => tok!(TK::Newline),
         b'#'  => tok!(TK::Hash),
+        b'?'  => tok!(TK::Question),
         b'['  => tok!(TK::LSquare), b']' => tok!(TK::RSquare),
         b'('  => tok!(TK::LParen),  b')' => tok!(TK::RParen),
         b'{'  => tok!(TK::LCurly),  b'}' => tok!(TK::RCurly),
@@ -639,6 +650,7 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileRef) -> Token {
         b'^'  => tok2!(b'=', TK::XorEq,     TK::Xor),
         b'!'  => tok2!(b'=', TK::NotEq,     TK::Not),
         b'='  => tok2!(b'=', TK::EqEq,      TK::Eq),
+        b'%'  => tok2!(b'=', TK::PercentEq, TK::Percent),
 
         b'<' => {
             if *pos < src.len() && src[*pos] == b'<' { *pos += 1; tok!(TK::LessLess) }
@@ -677,8 +689,15 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileRef) -> Token {
         b'.'  => {
             if *pos+1 < src.len() && src[*pos]==b'.' && src[*pos+1]==b'.' {
                 *pos += 2; tok!(TK::TripleDot)
+            } else if *pos < src.len() && src[*pos].is_ascii_digit() {
+                // .420, .5f, etc - float literal starting with dot
+                while *pos < src.len() && (src[*pos].is_ascii_alphanumeric() || src[*pos] == b'.') {
+                    *pos += 1;
+                }
+                tok!(TK::Number)
+            } else {
+                tok!(TK::Dot)
             }
-            else { tok!(TK::Dot) }
         }
 
         b'/' => {
@@ -752,7 +771,12 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileRef) -> Token {
         }
 
         b'0'..=b'9' => {
-            while *pos < src.len() && (src[*pos].is_ascii_alphanumeric() || src[*pos]==b'.') { *pos += 1; }
+            while *pos < src.len() && src[*pos].is_ascii_alphanumeric() { *pos += 1; }
+            // Allow one decimal point for floats
+            if *pos < src.len() && src[*pos] == b'.' {
+                *pos += 1;
+                while *pos < src.len() && src[*pos].is_ascii_alphanumeric() { *pos += 1; }
+            }
             tok!(TK::Number)
         }
 
@@ -989,9 +1013,14 @@ pub struct PP {
     at_bol:            bx,  // At beginning of line - gate for # directives
     stop_at_newline:   bx,  // For # directives as well
 
-
     pragma_once_paths: HashSet<Box<Path>, wyhash::WyHasherBuilder>,
     include_dirs:      Vec<Box<Path>>,
+
+    __counter__:       u32,
+
+    // Updated every function.
+    __func__:          Span,
+    __pretty_func__:   Box<str>,
 
     macros:            MacroTable, // Huge struct (~194 cache lines)
 }
@@ -1043,6 +1072,9 @@ impl PP {
             stop_at_newline:    false,
             current_token:      Token::EOF,
             next_token:         Token::EOF,
+            __counter__: 0,
+            __pretty_func__: Default::default(),
+            __func__: Span::POISONED,
         };
         pp.init_predefined_macros();
         pp.current_token  = pp.cook();
@@ -1243,7 +1275,7 @@ impl PP {
 
     #[inline]
     fn lex_str(&mut self, s: impl AsRef<[u8]>) -> (FileRef, Vec<Token>) {
-        let fid  = self.src_arena.add_bytes(&PathBuf::from("<builtin>"), s.as_ref());
+        let fid  = self.src_arena.add_bytes("builtin".as_ref(), s.as_ref());
         let data = self.src_arena.slice(fid);
         let mut pos  = 0usize;
         let mut toks = Vec::new();
@@ -1318,6 +1350,79 @@ impl PP {
     }
 
     #[inline]
+    fn get_current_line(&self, span: Span) -> u32 {
+        let src = self.src_arena.files[span.file].data.slice();
+        bytecount::count(&src[..span.start as usize], b'\n') as u32 + 1
+    }
+
+    #[inline]
+    fn handle_builtin_macros(&mut self, hash: u64, span: Span) -> Option<Token> {
+        Some(match hash {
+            HASH___LINE__ => {
+                let line = self.get_current_line(span);
+                let line = line.to_string(); // @Speed
+
+                // Intern the number string into src_arena and return a Number token
+                let fid = self.src_arena.add_bytes("builtin".as_ref(), line.as_bytes());
+                Token {
+                    kind: TK::Number,
+                    span: Span { file: fid, start: 0, len: line.len() as u16 },
+                    hash: 0,
+                }
+            }
+
+            HASH___FILE__ => {
+                let file = self.src_arena.files[span.file].path.as_ref();
+                let quoted = format!("\"{file}\""); // @Speed
+
+                let fid = self.src_arena.add_bytes("builtin".as_ref(), quoted.as_bytes());
+                Token {
+                    kind: TK::StrLit,
+                    span: Span { file: fid, start: 0, len: quoted.len() as u16 },
+                    hash: 0,
+                }
+            }
+
+            HASH___FUNC__ | HASH___FUNCTION__ => {
+                let quoted = format!("\"{f}\"", f = self.s(self.__func__)); // @Speed
+
+                let fid = self.src_arena.add_bytes("builtin".as_ref(), quoted.as_bytes());
+                Token {
+                    kind: TK::StrLit,
+                    span: Span { file: fid, start: 0, len: quoted.len() as u16 },
+                    hash: 0,
+                }
+            }
+
+            HASH___PRETTY_FUNCTION__ => {
+                let quoted = format!("\"{f}\"", f = self.__pretty_func__); // @Speed
+
+                let fid = self.src_arena.add_bytes("builtin".as_ref(), quoted.as_bytes());
+                Token {
+                    kind: TK::StrLit,
+                    span: Span { file: fid, start: 0, len: quoted.len() as u16 },
+                    hash: 0,
+                }
+            }
+
+            HASH___COUNTER__ => {
+                let n = self.__counter__;
+                self.__counter__ += 1;
+                let s = n.to_string(); // @Speed
+
+                let fid = self.src_arena.add_bytes("builtin".as_ref(), s.as_bytes());
+                Token {
+                    kind: TK::Number,
+                    span: Span { file: fid, start: 0, len: s.len() as u16 },
+                    hash: 0,
+                }
+            }
+
+            _ => return None
+        })
+    }
+
+    #[inline]
     fn cook(&mut self) -> Token {
         loop {
             let t = self.raw();
@@ -1345,6 +1450,10 @@ impl PP {
                     } else {
                         hash_ident(t.s(&self.src_arena))
                     };
+
+                    if let Some(tok) = self.handle_builtin_macros(hash, t.span) {
+                        return tok;
+                    }
 
                     let Some(index) = self.macros.find(hash) else {
                         return Token { kind: t.kind, span: t.span, hash };
@@ -1442,7 +1551,7 @@ impl PP {
 
     #[inline]
     #[must_use]
-    pub fn s(&self, t: Token) -> &str { t.s(&self.src_arena) }
+    pub fn s(&self, t: Span) -> &str { t.s(&self.src_arena) }
 
     #[inline]
     fn directive(&mut self) -> PPResult<()> {
@@ -2152,6 +2261,7 @@ impl PP {
         emit_diag_warning(&msg, warning_token.span, &self.src_arena);
     }
 
+    #[inline]
     fn pp_eval_expr(&mut self) -> i64 {
         //
         // Collect raw line - stops at newline
@@ -2336,7 +2446,23 @@ impl PP {
 
     #[inline]
     fn eval_const_expr(&self, toks: &[Token], pos: &mut usize) -> i64 {
-        self.eval_or(toks, pos)
+        self.eval_ternary(toks, pos)
+    }
+
+    #[inline]
+    fn eval_ternary(&self, toks: &[Token], pos: &mut usize) -> i64 {
+        let cond = self.eval_or(toks, pos);
+        if *pos < toks.len() && toks[*pos].kind == TK::Question {
+            *pos += 1; // ?
+            let then = self.eval_ternary(toks, pos);
+            if *pos < toks.len() && toks[*pos].kind == TK::Colon {
+                *pos += 1; // :
+            }
+            let else_ = self.eval_ternary(toks, pos);
+            if cond != 0 { then } else { else_ }
+        } else {
+            cond
+        }
     }
 
     #[inline]
@@ -3281,6 +3407,12 @@ impl TypeTable {
     }
 
     #[inline]
+    #[must_use]
+    pub fn find_relative_index_of_field(&self, start: u32, count: u32, name: u64) -> Option<usize> {
+        self.field_name_slice(start, count).iter().position(|_name| *_name == name)
+    }
+
+    #[inline]
     pub fn patch_struct_forward_decl(&mut self, ty: TypeRef, start: u32, count: u32, is_union: bool) {
         let e = &mut self.entries[ty];
         e.kind   = if is_union { TypeKind::Union } else { TypeKind::Struct };
@@ -3781,6 +3913,21 @@ impl CValue {
     pub const fn get_fimm(self)   -> f64 { f64::from_bits(self.imm.cast_unsigned()) }
     #[inline] #[must_use]
     pub const fn offset(self) -> i32 { self.imm as i32 }
+
+    #[inline]
+    #[must_use]
+    pub fn scalar_as_bytes(&self, types: &TypeTable) -> SmallVec<[u8; 8]> {
+        match types.get_kind(self.ty) {
+            TypeKind::Char  => (self.imm as i8).to_le_bytes().as_slice().into(),
+            TypeKind::Short => (self.imm as i16).to_le_bytes().as_slice().into(),
+            TypeKind::Int   => (self.imm as i32).to_le_bytes().as_slice().into(),
+
+            TypeKind::Float => (self.get_fimm() as f32).to_bits().to_le_bytes().as_slice().into(),
+            TypeKind::LDouble | TypeKind::Double => (self.get_fimm() as f64).to_bits().to_le_bytes().as_slice().into(),
+
+            _ => self.imm.to_le_bytes().into()
+        }
+    }
 
     #[inline]
     #[must_use]
@@ -4293,6 +4440,22 @@ impl CodeBuf {
             self.emit_byte(0xE0 | dst.enc());
             self.emit_i32(imm);
         }
+    }
+    // shl r64, cl - REX.W D3 /4
+    #[inline]
+    pub fn shl_cl(&mut self, dst: Reg) {
+        let rex = 0x48 | (dst.ext() as u8);
+        self.bytes.push(rex);
+        self.bytes.push(0xD3);
+        self.bytes.push(0xE0 | dst.enc());
+    }
+    // shr r64, cl - REX.W D3 /5
+    #[inline]
+    pub fn shr_cl(&mut self, dst: Reg) {
+        let rex = 0x48 | (dst.ext() as u8);
+        self.bytes.push(rex);
+        self.bytes.push(0xD3);
+        self.bytes.push(0xE8 | dst.enc());
     }
     #[inline]
     pub fn shl_ri(&mut self, dst: Reg, imm: u8) {
@@ -5254,7 +5417,7 @@ impl Compiler {
             self.next(); Ok(t)
         } else {
             Err(CError::Expected {
-                span: t.span, expected: what, got: self.s(t).to_owned()
+                span: t.span, expected: what, got: self.s(t.span).to_owned()
             })
         }
     }
@@ -5476,7 +5639,7 @@ impl Compiler {
             let name = name_tok.ok_or_else(|| CError::Expected {
                 span: self.current_token.span,
                 expected: "field name",
-                got: self.s(self.current_token).to_owned(),
+                got: self.s(self.current_token.span).to_owned(),
             })?;
 
             if self.current_token.kind == TK::Colon {
@@ -6002,10 +6165,7 @@ impl Compiler {
 
                 let xmm = self.xmms.alloc(Span::POISONED)?;
                 let rodata_off = self.rodata.len() as u32;
-                match self.get_kind(v.ty) {
-                    TypeKind::Float => self.rodata.extend_from_slice(&(v.get_fimm() as f32).to_bits().to_le_bytes()),
-                    _               => self.rodata.extend_from_slice(&v.get_fimm().to_bits().to_le_bytes()),
-                }
+                self.rodata.extend_from_slice(&v.scalar_as_bytes(&self.types));
                 let text_off = self.emit_float_load_rip(xmm, v.ty) as _;
                 self.rodata_relocs.push(TextRodataReloc { text_off, rodata_off });
 
@@ -6149,7 +6309,7 @@ impl Compiler {
         let name_tok = name_tok_opt.ok_or_else(|| CError::Expected {
             span: self.current_token.span,
             expected: "function or variable name",
-            got: self.s(self.current_token).to_owned(),
+            got: self.s(self.current_token.span).to_owned(),
         })?;
 
         let mut flags = SymFlags::empty();
@@ -6218,6 +6378,25 @@ impl Compiler {
                 if self.get(func_ty).is_variadic() { TypeFlags::VARIADIC } else { TypeFlags::empty() }
             );
 
+            // @Speed
+            {
+                // Collect call sites to patch
+                let sites_to_patch = self.call_relocs
+                    .iter()
+                    .filter(|r| r.sym_index as usize == forward_declaration_symbol_index)
+                    .map(|r| r.offset)
+                    .collect::<Vec<_>>();
+
+                // Patch them
+                let code_off = self.syms[forward_declaration_symbol_index].code_off as usize;
+                for site in &sites_to_patch {
+                    self.code.patch_call(*site as usize, code_off);
+                }
+
+                // Remove from relocs
+                self.call_relocs.retain(|r| r.sym_index as usize != forward_declaration_symbol_index);
+            }
+
             (forward_declaration_symbol_index, forward_func_ty)
         } else {
             let sym_index = self.syms.insert(
@@ -6238,6 +6417,11 @@ impl Compiler {
         self.ret_ty = ret_ty;
         self.vla_sizes = Default::default();
         self.in_global_context = false;
+
+
+        self.__func__ = name_span;
+        self.__pretty_func__ = self.types.to_string(func_ty).into_boxed_str();
+
 
         //
         // Prologue
@@ -6401,6 +6585,7 @@ impl Compiler {
                 HASH_IF       => self.compile_if(),
                 HASH_FOR      => self.compile_for(),
                 HASH_WHILE    => self.compile_while(),
+                HASH_DO       => self.compile_do_while(),
                 HASH_SWITCH   => self.compile_switch(),
                 HASH_BREAK    => self.compile_break(self.current_token.span),
                 HASH_CONTINUE => self.compile_continue(self.current_token.span),
@@ -6417,6 +6602,50 @@ impl Compiler {
             TK::SemiColon => { self.next(); Ok(()) }
 
             _          => self.compile_expr_stmt(),
+        }
+    }
+
+    #[inline]
+    fn compile_stmt_in_statement_expr(&mut self) -> CResult<()> {
+        match self.current_token.kind {
+            TK::Ident => match self.current_token.hash {
+                HASH_RETURN   => self.compile_return(),
+                HASH_IF       => self.compile_if(),
+                HASH_FOR      => self.compile_for(),
+                HASH_WHILE    => self.compile_while(),
+                HASH_SWITCH   => self.compile_switch(),
+                HASH_BREAK    => self.compile_break(self.current_token.span),
+                HASH_CONTINUE => self.compile_continue(self.current_token.span),
+
+                _ => if self.can_hash_start_a_type(self.current_token.hash) {
+                    self.compile_local_decl()
+                } else {
+                    self.compile_expr()?;
+                    self.expect(TK::SemiColon, "';'")?;
+
+                    // If next token is }, this was the last expr - keep value on vstack
+                    if self.current_token.kind != TK::RCurly {
+                        let v = self.vstack.pop();
+                        if matches!(v.kind(), VK::Reg | VK::RegInd) { self.free_reg(v.reg()); }
+                    }
+
+                    Ok(())
+                }
+            }
+
+            TK::LCurly => self.compile_block(),
+            TK::SemiColon => { self.next(); Ok(()) }
+
+            _ => {
+                self.compile_expr()?;
+                self.expect(TK::SemiColon, "';'")?;
+                if self.current_token.kind != TK::RCurly {
+                    let v = self.vstack.pop();
+                    if matches!(v.kind(), VK::Reg | VK::RegInd) { self.free_reg(v.reg()); }
+                }
+
+                Ok(())
+            }
         }
     }
 
@@ -6440,8 +6669,8 @@ impl Compiler {
     fn compile_return(&mut self) -> CResult<()> {
         self.next(); // return
 
-        let mut has_parens = false;
-        if self.current_token.kind == TK::LParen { self.next(); has_parens = true }
+        // let mut has_parens = false;
+        // if self.current_token.kind == TK::LParen { self.next(); has_parens = true }
 
         let ret_ty = self.ret_ty;
         let is_struct = matches!(self.get_kind(ret_ty), TypeKind::Struct | TypeKind::Union);
@@ -6494,7 +6723,8 @@ impl Compiler {
             }
         }
 
-        if has_parens { self.expect(TK::RParen, "')'")?; }
+        // @Incomplete
+        // if has_parens { self.expect(TK::RParen, "')'")?; }
 
         self.expect(TK::SemiColon, "';'")?;
         self.code.mov_rr(Reg::Rsp, Reg::Rbp);
@@ -6571,6 +6801,58 @@ impl Compiler {
         Ok(())
     }
 
+    #[inline]
+    fn compile_do_while(&mut self) -> CResult<()> {
+        self.next(); // do
+
+        let loop_top = self.code.pos();
+
+        //
+        // Body
+        //
+
+        self.loop_stack.push(Default::default());
+
+        self.compile_stmt()?;
+
+        let ctx = self.loop_stack.pop().unwrap();
+
+        // Patch continue jumps to condition
+        let cond_top = self.code.pos();
+        for patch in ctx.continue_patches {
+            self.code.patch_rel32(patch as _, cond_top);
+        }
+
+        // while (cond);
+        if self.current_token.hash != HASH_WHILE {
+            return Err(CError::Expected {
+                span: self.current_token.span,
+                expected: "while",
+                got: self.s(self.current_token.span).to_owned(),
+            });
+        }
+        self.next(); // while
+
+        self.expect(TK::LParen, "'('")?;
+        self.compile_expr_no_comma()?;
+        self.expect(TK::RParen, "')'")?;
+        self.expect(TK::SemiColon, "';'")?;
+
+        let (r, _) = self.pop_reg()?;
+        self.code.test_rr(r);
+        self.regs.free(r);
+
+        let jne_patch = self.code.jne_rel32();
+        self.code.patch_rel32(jne_patch, loop_top);
+
+        // Patch break jumps to here
+        for patch in ctx.break_patches {
+            self.code.patch_rel32(patch as _, self.code.pos());
+        }
+
+        Ok(())
+    }
+
     fn compile_while(&mut self) -> CResult<()> {
         self.next(); // while
 
@@ -6595,6 +6877,7 @@ impl Compiler {
 
         let ctx = self.loop_stack.pop().unwrap();
 
+        // Patch continue jumps to condition
         let cond_top = self.code.pos();
         for patch in ctx.continue_patches {
             self.code.patch_rel32(patch as _, cond_top);
@@ -6944,7 +7227,7 @@ impl Compiler {
         let name_tok = name_tok.ok_or_else(|| CError::Expected {
             span: self.current_token.span,
             expected: "typedef name",
-            got: self.s(self.current_token).to_owned(),
+            got: self.s(self.current_token.span).to_owned(),
         })?;
 
         self.expect(TK::SemiColon, "';'")?;
@@ -6994,7 +7277,7 @@ impl Compiler {
             name_tok = next_name_opt.ok_or_else(|| CError::Expected {
                 span: self.current_token.span,
                 expected: "variable name",
-                got: self.s(self.current_token).to_owned(),
+                got: self.s(self.current_token.span).to_owned(),
             })?;
             ty = next_ty;
         }
@@ -7252,7 +7535,7 @@ impl Compiler {
                 let off = self.data.len() as u32;
                 let size = self.types.size_of(ty_ref) as usize;
 
-                // Reserve space
+                // Reserve space with zeroes
                 let start = self.data.len();
                 self.data.resize(start + size, 0u8);
 
@@ -7263,8 +7546,37 @@ impl Compiler {
                 let mut i = 0usize;
 
                 while self.current_token.kind != TK::RCurly && !self.at_eof() {
-                    if i < count as usize {
+                    //
+                    // Designated initializer: .field_name = expr
+                    //
+
+                    let field = if self.current_token.kind == TK::Dot {
+                        self.next(); // .
+                        let field_tok  = self.eat_ident("field name")?;
+                        let field_hash = field_tok.hash;
+                        self.expect(TK::Eq, "'='")?;
+
+                        let field = self.types.find_field(fstart, count, field_hash)
+                            .copied()
+                            .ok_or_else(|| CError::UnknownField {
+                                span: field_tok.span,
+                                name: field_tok.s(&self.src_arena).to_owned(),
+                            })?;
+
+                        i = self.types.find_relative_index_of_field(fstart, count, field_hash)
+                            .map(|idx| idx + 1)
+                            .unwrap_or(i);
+
+                        Some(field)
+                    } else if i < count as usize {
                         let field = *self.types.get_field_from_start(fstart, i as _);
+                        i += 1;
+                        Some(field)
+                    } else {
+                        None
+                    };
+
+                    if let Some(field) = field {
                         let field_off = field.offset as usize;
                         let field_sz  = self.types.size_of(field.ty) as usize;
 
@@ -7285,7 +7597,6 @@ impl Compiler {
                                     .copy_from_slice(&bytes[..field_sz]);
                             }
                         }
-                        i += 1;
                     } else {
                         // Too many - skip
                         self.try_parse_and_eval_const_int()?;
@@ -7377,34 +7688,62 @@ impl Compiler {
                     let e = self.types.get(ty);
                     let (start, count) = (e.field_start(), e.field_count());
 
-                    let mut i = 0usize;
+                    //
+                    // Zero-initialize the whole struct first so unmentioned fields are 0
+                    //
+                    // @CodeOptimization: Use a memset here if the struct is big
+                    let tmp = self.regs.alloc(Span::POISONED)?;
+                    self.code.xor_rr(tmp, tmp);
+                    for j in 0..count as usize {
+                        let field = *self.types.get_field_from_start(start, j as _);
+                        let foff  = base_off + field.offset as i32;
+                        self.emit_int_store(Reg::Rbp, foff, tmp, field.ty);
+                    }
+                    self.regs.free(tmp);
+
+                    let mut i = 0usize;  // Sequential field index for non-designated
+
                     while self.current_token.kind != TK::RCurly && !self.at_eof() {
-                        if i < count as usize {
-                            let field = *self.types.get_field_from_start(start, i as _);
+                        //
+                        // Designated initializer: .field_name = expr
+                        //
+                        if self.current_token.kind == TK::Dot {
+                            self.next(); // .
+                            let field_tok  = self.eat_ident("field name")?;
+                            let field_hash = field_tok.hash;
+                            self.expect(TK::Eq, "'='")?;
+
+                            let field = self.types.find_field(start, count, field_hash)
+                                .ok_or_else(|| CError::UnknownField {
+                                    span: field_tok.span,
+                                    name: field_tok.s(&self.src_arena).to_owned(),
+                                })?;
+
                             let field_off = base_off + field.offset as i32;
-                            self.compile_initializer(field_off, field.ty)?;
-                            i += 1;
+                            let field_ty  = field.ty;
+
+                            // Update sequential index to field after this one
+                            i = self.types.find_relative_index_of_field(start, count, field_hash)
+                                .map(|idx| idx + 1)
+                                .unwrap_or(i);
+
+                            self.compile_initializer(field_off, field_ty)?;
                         } else {
-                            self.compile_expr_no_comma()?;
-                            self.vstack.pop();
+                            //
+                            // Sequential initializer
+                            //
+                            if i < count as usize {
+                                let field     = *self.types.get_field_from_start(start, i as _);
+                                let field_off = base_off + field.offset as i32;
+                                self.compile_initializer(field_off, field.ty)?;
+                                i += 1;
+                            } else {
+                                self.compile_expr_no_comma()?;
+                                self.vstack.pop();
+                            }
                         }
 
                         if self.current_token.kind == TK::Comma { self.next(); }
-                    }
-
-                    //
-                    // Zero remaining fields
-                    //
-                    // @CodeOptimization: Use a memset here if the struct is big
-                    if i < count as usize {
-                        let tmp = self.regs.alloc(Span::POISONED)?;
-                        self.code.xor_rr(tmp, tmp);
-                        for j in i..count as usize {
-                            let field = *self.types.get_field_from_start(start, j as _);
-                            let foff = base_off + field.offset as i32;
-                            self.emit_int_store(Reg::Rbp, foff, tmp, field.ty);
-                        }
-                        self.regs.free(tmp);
                     }
 
                     self.expect(TK::RCurly, "'}'")?;
@@ -7429,9 +7768,11 @@ impl Compiler {
                 } else {
                     self.compile_expr_no_comma()?;
                 }
+
                 self.emit_store(Reg::Rbp, base_off, ty)?;
             }
         }
+
         Ok(())
     }
 
@@ -7657,7 +7998,7 @@ impl Compiler {
         let name_tok = name_tok.ok_or_else(|| CError::Expected {
             span: self.current_token.span,
             expected: "variable name",
-            got: self.s(self.current_token).to_owned(),
+            got: self.s(self.current_token.span).to_owned(),
         })?;
 
         // Inferred array: int arr[] = {...}
@@ -7712,18 +8053,27 @@ impl Compiler {
         match k {
             TK::Comma => Some((0, false)),
 
+            TK::Question => Some((1, true)),  // Ternary
+
             TK::Eq     | TK::PlusEq  | TK::MinusEq  |
             TK::StarEq | TK::SlashEq | TK::BinAndEq |
             TK::XorEq  | TK::BinOrEq => Some((2, true)),
-            TK::Or                   => Some((3, false)),
-            TK::And                  => Some((4, false)),
-            TK::BinOr                => Some((5, false)),
-            TK::Xor                  => Some((6, false)),
-            TK::BinAnd               => Some((7, false)),
-            TK::EqEq | TK::NotEq     => Some((8, false)),
+
+            TK::Or  => Some((3, false)),
+            TK::And => Some((4, false)),
+
+            TK::BinOr  => Some((5, false)),
+            TK::Xor    => Some((6, false)),
+            TK::BinAnd => Some((7, false)),
+
+            TK::EqEq | TK::NotEq => Some((8, false)),
+
             TK::Less | TK::Greater | TK::LessEq | TK::GreaterEq => Some((9, false)),
-            TK::Plus | TK::Minus     => Some((10, false)),
-            TK::Star | TK::Slash     => Some((11, false)),
+
+            TK::LessLess | TK::GreaterGreater => Some((10, false)),
+
+            TK::Plus | TK::Minus => Some((11, false)),
+            TK::Star | TK::Slash | TK::Percent => Some((12, false)),
 
             _ => None
         }
@@ -7761,13 +8111,14 @@ impl Compiler {
                 // Compound assignment operators
                 TK::Eq | TK::PlusEq | TK::MinusEq |
                 TK::StarEq | TK::SlashEq | TK::BinAndEq |
-                TK::XorEq  | TK::BinOrEq => {
+                TK::XorEq  | TK::BinOrEq | TK::PercentEq => {
                     self.compile_assign(op, prec, right, span)?;
                 }
 
                 // Short circuit
                 TK::And => self.compile_logical_and(prec, span)?,
                 TK::Or  => self.compile_logical_or(prec, span)?,
+                TK::Question => self.compile_ternary(prec, span)?,
 
                 _ => {
                     self.compile_expr_impl(if right { prec } else { prec + 1 })?;
@@ -7898,6 +8249,83 @@ impl Compiler {
     }
 
     #[inline]
+    fn compile_ternary(&mut self, prec: u8, _span: Span) -> CResult<()> {
+        let (cond, _) = self.pop_reg()?;
+        self.code.test_rr(cond);
+        self.regs.free(cond);
+
+        let je_patch = self.code.je_rel32(); // je .else
+
+        //
+        // Then branch
+        //
+        self.compile_expr_no_comma()?;
+        let then_v = self.vstack.pop();
+        let then_ty = then_v.ty;
+        let is_float  = self.is_float(then_ty);
+        let is_struct = matches!(self.get_kind(then_ty), TypeKind::Struct | TypeKind::Union);
+
+        let jmp_patch = self.code.jmp_rel32(); // jmp .end
+        self.code.patch_rel32(je_patch, self.code.pos());
+
+        self.expect(TK::Colon, "':'")?;
+
+        //
+        // Else branch
+        //
+        self.compile_expr_impl(prec)?;
+
+        if is_struct {
+            //
+            // Allocate a hidden local to hold the result, copy winning branch into it
+            //
+            let size    = self.types.size_of(then_ty) as i32;
+            let ret_off = self.locals.alloc(HASH_HIDDEN_LOCAL, then_ty, &self.types);
+
+            let else_v = self.vstack.pop();
+            let (else_base, else_off) = match else_v.kind() {
+                VK::Local | VK::RegInd => (else_v.reg().as_gp(), else_v.offset()),
+                VK::Reg               => (else_v.reg().as_gp(), 0),
+                VK::Imm               => unreachable!(),
+            };
+            self.emit_struct_copy(Reg::Rbp, ret_off, else_base, else_off, size)?;
+            if else_v.kind() == VK::RegInd { self.regs.free(else_base); }
+
+            let jmp_end = self.code.jmp_rel32();
+            self.code.patch_rel32(jmp_patch, self.code.pos());
+
+            // Re-evaluate then branch position - it's already been computed,
+            // we need to copy it into ret_off
+            let (then_base, then_off) = match then_v.kind() {
+                VK::Local | VK::RegInd => (then_v.reg().as_gp(), then_v.offset()),
+                VK::Reg               => (then_v.reg().as_gp(), 0),
+                VK::Imm               => unreachable!(),
+            };
+            self.emit_struct_copy(Reg::Rbp, ret_off, then_base, then_off, size)?;
+            if then_v.kind() == VK::RegInd { self.regs.free(then_base); }
+
+            self.code.patch_rel32(jmp_end, self.code.pos());
+            self.vstack.push(CValue::local(then_ty, ret_off));
+        } else if is_float {
+            let then_r = self.force_xmm(then_v)?;
+            let (else_r, _) = self.pop_xmm()?;
+            self.emit_float_mov(then_r, else_r, then_ty);
+            self.xmms.free(else_r);
+            self.code.patch_rel32(jmp_patch, self.code.pos());
+            self.vstack.push(CValue::xmm(then_ty, then_r));
+        } else {
+            let then_r = self.force_gp(then_v)?;
+            let (else_r, _) = self.pop_reg()?;
+            self.code.mov_rr(then_r, else_r);
+            self.regs.free(else_r);
+            self.code.patch_rel32(jmp_patch, self.code.pos());
+            self.vstack.push(CValue::gp(then_ty, then_r));
+        }
+
+        Ok(())
+    }
+
+    #[inline]
     fn decay_array_type(&mut self, ty: TypeRef) -> TypeRef {
         if self.types.get_kind(ty) != TypeKind::Array {
             return ty;
@@ -7973,10 +8401,11 @@ impl Compiler {
     fn compile_binop(&mut self, op: TK, span: Span) -> CResult<()> {
         match op {
             TK::Plus | TK::Minus                                 => self.compile_additive(op, span)?,
-            TK::Star | TK::Slash                                 => self.compile_multiplicative(op, span)?,
+            TK::Star | TK::Slash | TK::Percent                   => self.compile_multiplicative(op, span)?,
             TK::BinAnd | TK::BinOr | TK::Xor                     => self.compile_bitwise(op)?,
             TK::EqEq | TK::NotEq |
             TK::Less | TK::Greater | TK::LessEq | TK::GreaterEq  => self.compile_cmp(op)?,
+            TK::LessLess | TK::GreaterGreater => self.compile_shift(op)?,
 
             TK::Comma => {
                 // Discard lhs, keep rhs - already on vstack in right order
@@ -7989,6 +8418,38 @@ impl Compiler {
             other => unreachable!("{other:?}"),
         }
 
+        Ok(())
+    }
+
+    #[inline]
+    fn compile_shift(&mut self, op: TK) -> CResult<()> {
+        let rhs = self.vstack.pop();
+        let lhs = self.vstack.pop();
+
+        if lhs.kind() == VK::Imm && rhs.kind() == VK::Imm {
+            // :ConstantFold
+            let result = match op {
+                TK::LessLess       => lhs.imm.wrapping_shl(rhs.imm as u32),
+                TK::GreaterGreater => lhs.imm.wrapping_shr(rhs.imm as u32),
+                _ => unreachable!(),
+            };
+            self.vstack.push(CValue::imm(lhs.ty, result));
+            return Ok(());
+        }
+
+        let (lhs, ty) = (self.force_gp(lhs)?, lhs.ty);
+        // Shift count must be in cl
+        let rhs = self.force_gp(rhs)?;
+        self.code.mov_rr(Reg::Rcx, rhs);
+        self.regs.free(rhs);
+
+        match op {
+            TK::LessLess       => self.code.shl_cl(lhs),
+            TK::GreaterGreater => self.code.shr_cl(lhs),
+            _ => unreachable!(),
+        }
+
+        self.vstack.push(CValue::gp(ty, lhs));
         Ok(())
     }
 
@@ -8081,6 +8542,25 @@ impl Compiler {
                 self.vstack.push(CValue::gp(common_ty, Reg::Rax));
             }
 
+            TK::Percent => {
+                self.code.mov_rr(Reg::Rax, lhs);
+                self.code.cqo();
+                let actual = if rhs == Reg::Rdx {
+                    let t = self.regs.alloc(span)?;
+                    self.code.mov_rr(t, Reg::Rdx);
+                    t
+                } else {
+                    rhs
+                };
+                self.code.idiv_r(actual);
+                self.regs.free(lhs);
+                self.regs.free(actual);
+
+                if actual != rhs { self.regs.free(rhs); }
+                self.regs.mark(Reg::Rdx);
+                self.vstack.push(CValue::gp(common_ty, Reg::Rdx)); // Remainder in rdx
+            }
+
             _ => unreachable!(),
         }
 
@@ -8099,8 +8579,10 @@ impl Compiler {
             let result = match op {
                 TK::Star  => vlhs.imm.wrapping_mul(vrhs.imm),
                 TK::Slash => if vrhs.imm != 0 { vlhs.imm / vrhs.imm } else { 0 },
+                TK::Percent => if vrhs.imm != 0 { vlhs.imm % vrhs.imm } else { 0 },
                 _ => unreachable!(),
             };
+
             self.vstack.push(CValue::imm(common_ty, result));
             return Ok(());
         }
@@ -8720,15 +9202,41 @@ impl Compiler {
                 self.vstack.push(v);
             }
 
-            // void cast - evaluate for side effects, discard
             (_, TypeKind::Void) => {
-                self.force_gp(v)?; // materialize and discard
-                // push nothing, or a sentinel void value if your vstack needs it
+                match v.kind() {
+                    VK::Reg | VK::RegInd => { self.free_reg(v.reg()); }
+                    VK::Imm | VK::Local  => {}
+                }
+                self.vstack.push(CValue::imm(TYPE_VOID, 0)); // sentinel to keep vstack balanced
             }
 
             _ => todo!() // nocheckin
         }
 
+        Ok(())
+    }
+
+    #[inline]
+    fn compile_statement_expr(&mut self) -> CResult<()> {
+        self.expect(TK::LCurly, "'{'")?;
+        self.locals.push_scope();
+
+        let vstack_before = self.vstack.top;
+
+        while self.current_token.kind != TK::RCurly && !self.at_eof() {
+            self.compile_stmt_in_statement_expr()?;
+        }
+
+        //
+        // If nothing was left on the vstack, push a void sentinel
+        //
+        if self.vstack.top == vstack_before {
+            self.vstack.push(CValue::imm(TYPE_VOID, 0));
+        }
+
+        self.locals.pop_scope();
+        self.expect(TK::RCurly, "'}'")?;
+        self.expect(TK::RParen, "')'")?;
         Ok(())
     }
 
@@ -8738,7 +9246,7 @@ impl Compiler {
                 // @Cleanup
 
                 let t = self.next();
-                let s = self.s(t);
+                let s = self.s(t.span);
                 let is_float_literal = s.contains('.');
 
                 if !is_float_literal {
@@ -8811,6 +9319,18 @@ impl Compiler {
                 self.vstack.push(CValue::imm(TYPE_INT, val));
             }
 
+            TK::LParen if self.next_token.kind == TK::LCurly => {
+                self.next(); // (
+
+                // GCC statement expression: ({ ... })
+                if self.current_token.kind == TK::LCurly {
+                    return self.compile_statement_expr();
+                }
+
+                self.compile_expr()?;
+                self.expect(TK::RParen, "')'")?;
+            }
+
             TK::LParen if self.can_hash_start_a_type(self.next_token.hash) => {
                 self.next(); // (
 
@@ -8824,7 +9344,7 @@ impl Compiler {
                     self.vstack.push(CValue::local(cast_ty, off));
                 } else {
                     // Regular cast
-                    self.compile_unary()?;
+                    self.compile_expr_impl(13)?;  // Higher than any binary op prec
                     let v = self.vstack.pop();
                     self.emit_cast(v, cast_ty)?;
                 }
@@ -8930,7 +9450,7 @@ impl Compiler {
                 }  else {
                     return Err(CError::Undefined {
                         span: name_tok.span,
-                        name: self.s(name_tok).to_owned()
+                        name: self.s(name_tok.span).to_owned()
                     });
                 }
             }
@@ -9356,7 +9876,7 @@ impl Compiler {
                 Some(func_ty) => (func_ty, CalleeKind::LocalFp(lv.rbp_off)),
                 None => return Err(CError::Undefined {
                     span: name_tok.span,
-                    name: self.s(name_tok).to_owned()
+                    name: self.s(name_tok.span).to_owned()
                 }),
             }
         } else if let Some(gv) = self.globals.find(callee_hash) {
@@ -9376,13 +9896,13 @@ impl Compiler {
 
                 None => return Err(CError::Undefined {
                     span: name_tok.span,
-                    name: self.s(name_tok).to_owned()
+                    name: self.s(name_tok.span).to_owned()
                 }),
             }
         } else {
             return Err(CError::Undefined {
                 span: name_tok.span,
-                name: self.s(name_tok).to_owned()
+                name: self.s(name_tok.span).to_owned()
             });
         };
 
@@ -10107,7 +10627,7 @@ impl Compiler {
                     // Store bits in a fresh Imm with fimm set
                     //
 
-                    let fval = v.get_fimm();
+                    let fval = v.imm as f64;
                     return Ok(CValue::fimm(target, fval));
                 }
 
