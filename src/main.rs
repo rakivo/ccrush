@@ -72,7 +72,7 @@
 // TODO(#18): Resolve the situation with sret and VLA hidden slot using the same slot...?
 
 //
-// @Cleanup: There's lots of unnecessary std::process::exit calls.
+// @Cleanup: There's a ton of unnecessary std::process::exit calls.
 //
 
 #![warn(clippy::all, clippy::pedantic, clippy::cargo, dead_code)]
