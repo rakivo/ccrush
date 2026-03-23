@@ -7997,7 +7997,7 @@ impl Compiler {
         let vlhs = self.pop_vstack_and_decay_array()?;
 
         if vlhs.kind() == VK::Imm && vrhs.kind() == VK::Imm {
-            // Constant folding
+            // :ConstantFold
             let common_ty = self.get_usual_arithmetic_conversion_type(vlhs.ty, vrhs.ty);
             let result = match op {
                 TK::Plus  => vlhs.imm.wrapping_add(vrhs.imm),
@@ -8092,6 +8092,8 @@ impl Compiler {
         let vlhs = self.vstack.pop();
 
         if vlhs.kind() == VK::Imm && vrhs.kind() == VK::Imm && !self.is_float(vlhs.ty) {
+            // :ConstantFold
+
             let common_ty = self.get_usual_arithmetic_conversion_type(vlhs.ty, vrhs.ty);
             let result = match op {
                 TK::Star  => vlhs.imm.wrapping_mul(vrhs.imm),
@@ -8111,6 +8113,7 @@ impl Compiler {
         let lhs = self.vstack.pop();
 
         if lhs.kind() == VK::Imm && rhs.kind() == VK::Imm {
+            // :ConstantFold
             let common_ty = self.get_usual_arithmetic_conversion_type(lhs.ty, rhs.ty);
             let result = match op {
                 TK::BinAnd => lhs.imm & rhs.imm,
@@ -8245,6 +8248,8 @@ impl Compiler {
         let lhs = self.vstack.pop();
 
         if lhs.kind() == VK::Imm && rhs.kind() == VK::Imm && !self.is_float(lhs.ty) {
+            // :ConstantFold
+
             //
             // Apply UAC to get correct signedness for the comparison
             //
@@ -8701,11 +8706,17 @@ impl Compiler {
             }
 
             // ptr -> ptr, ptr -> int, int -> ptr: just retag
-            (TypeKind::Ptr | TypeKind::Int | TypeKind::Long | TypeKind::LLong,
-TypeKind::Ptr) |
-(TypeKind::Ptr, TypeKind::Int | TypeKind::Long | TypeKind::LLong) => {
-                let r = self.force_gp(v)?;
-                self.vstack.push(CValue::gp(to, r));
+            (TypeKind::Ptr | TypeKind::Int | TypeKind::Long | TypeKind::LLong, TypeKind::Ptr) |
+            (TypeKind::Ptr, TypeKind::Int | TypeKind::Long | TypeKind::LLong) => {
+                // :ConstantFold
+                let v = if v.kind() == VK::Imm {
+                    CValue::imm(to, v.imm)
+                } else {
+                    let r = self.force_gp(v)?;
+                    CValue::gp(to, r)
+                };
+
+                self.vstack.push(v);
             }
 
             // void cast - evaluate for side effects, discard
@@ -9961,6 +9972,8 @@ TypeKind::Ptr) |
             TypeKind::Bool | TypeKind::Char | TypeKind::Short => {
                 // Imm path: just retag, full i64 bits are already correct
                 if v.kind() == VK::Imm {
+                    // :ConstantFold
+
                     return Ok(CValue::imm(TYPE_INT, v.imm));
                 }
 
@@ -10048,6 +10061,7 @@ TypeKind::Ptr) |
     #[inline]
     fn coerce_int(&mut self, v: CValue, target: TypeRef) -> CResult<CValue> {
         if v.ty == target { return Ok(v) }
+        // :ConstantFold
         if v.kind() == VK::Imm { return Ok(CValue::imm(target, v.imm)) }
 
         let r = self.force_gp(v)?;
@@ -10087,9 +10101,11 @@ TypeKind::Ptr) |
              TypeKind::Float | TypeKind::Double) => {
                 // TODO(flags): warn on precision loss if -Wfloat-conversion
                 if v.kind() == VK::Imm {
+                    // :ConstantFold
                     //
-                    // Constant fold: store bits in a fresh Imm with fimm set
+                    // Store bits in a fresh Imm with fimm set
                     //
+
                     let fval = v.get_fimm();
                     return Ok(CValue::fimm(target, fval));
                 }
@@ -10129,6 +10145,8 @@ TypeKind::Ptr) |
             // float <-> float
             (TypeKind::Float, TypeKind::Double) => {
                 if v.kind() == VK::Imm {
+                    // :ConstantFold
+
                     return Ok(CValue::fimm(target, v.get_fimm()));
                 }
                 let xmm = self.force_xmm(v)?;
@@ -10138,6 +10156,8 @@ TypeKind::Ptr) |
             (TypeKind::Double, TypeKind::Float) => {
                 // TODO(flags): warn on precision loss if -Wfloat-conversion
                 if v.kind() == VK::Imm {
+                    // :ConstantFold
+
                     return Ok(CValue::fimm(target, f64::from(v.get_fimm() as f32)));
                 }
                 let xmm = self.force_xmm(v)?;
@@ -10148,7 +10168,11 @@ TypeKind::Ptr) |
             // ptr <-> ptr (void* and others)
             (TypeKind::Ptr, TypeKind::Ptr) => {
                 // TODO(flags): warn on non-void* incompatible pointer if -Wincompatible-pointer-types
-                if v.kind() == VK::Imm { return Ok(CValue::imm(target, v.imm)); }
+                if v.kind() == VK::Imm {
+                    // :ConstantFold
+
+                    return Ok(CValue::imm(target, v.imm));
+                }
                 let r = self.force_gp(v)?;
                 Ok(CValue::gp(target, r))
             }
@@ -10157,7 +10181,11 @@ TypeKind::Ptr) |
             (TypeKind::Int | TypeKind::Long | TypeKind::LLong, TypeKind::Ptr) |
             (TypeKind::Ptr, TypeKind::Int | TypeKind::Long | TypeKind::LLong) => {
                 // TODO(flags): warn if -Wint-conversion
-                if v.kind() == VK::Imm { return Ok(CValue::imm(target, v.imm)); }
+                if v.kind() == VK::Imm {
+                    // :ConstantFold
+
+                    return Ok(CValue::imm(target, v.imm));
+                }
                 let r = self.force_gp(v)?;
                 Ok(CValue::gp(target, r))
             }
