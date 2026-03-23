@@ -7034,6 +7034,26 @@ impl Compiler {
                 return Ok(());
             }
 
+            TypeKind::Ptr if self.get_kind(self.get(ty_ref).pointee()) == TypeKind::Char => {
+                // @Cutnpaste from above
+
+                //
+                // Store bytes in .rodata, emit a relocation to point at them
+                //
+
+                let t = self.next();
+                let bytes = self.unescape_string_literal_into_scratch(&t);
+                let rodata_off = self.rodata_intern(&bytes);
+
+                // Reserve space for a pointer into .rodata
+                let data_off = self.data.len() as _;
+                self.data.extend_from_slice(&0usize.to_le_bytes());
+
+                self.data_rodata_relocs.push(DataRodataReloc { data_off, rodata_off });
+
+                (false, data_off)
+            }
+
             TypeKind::Struct | TypeKind::Union => {
                 let off = self.data.len() as u32;
                 let size = self.types.size_of(ty_ref) as usize;
