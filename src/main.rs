@@ -65,7 +65,6 @@
 // TODO(#3): Function pointers
 // TODO(#7): __attribute__
 // TODO(#9): Global extern symbols
-// TODO(#10): Stringify, __VA_ARGS__ and concat in macros
 // TODO(#13): Debug info
 // TODO(#15): Stack unwind info
 // TODO(#14): GCC statement expressions
