@@ -63,7 +63,6 @@
 // TODO(#13): Debug info
 // TODO(#15): Stack unwind info
 // TODO(#14): GCC statement expressions
-// TODO(#27): Switch statements
 // TODO(#30): Ternary operator
 // TODO(#29): static assert
 
