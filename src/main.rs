@@ -64,7 +64,6 @@
 // TODO(#13): Debug info
 // TODO(#15): Stack unwind info
 // TODO(#14): GCC statement expressions
-// TODO(#26): 50.f float literals
 // TODO(#27): Switch statements
 
 // TODO(#18): Resolve the situation with sret and VLA hidden slot using the same slot...?
