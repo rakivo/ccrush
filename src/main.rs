@@ -792,17 +792,27 @@ fn lex(src: &[u8], pos: &mut usize, fid: FileRef) -> Token {
 #[inline]
 pub fn parse_number_int(s: &str) -> (i64, TypeRef) {
     let s = s.trim();
+    let bytes = s.as_bytes();
 
-    // Find where the suffix starts (from the end, skip ascii alpha chars)
-    let suffix_start = s
-        .as_bytes()
-        .iter()
-        .rposition(|b| !b.is_ascii_alphabetic())
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    // Detect base
+    let (base, start) = if s.starts_with("0x") || s.starts_with("0X") {
+        (16, 2)
+    } else if s.starts_with('0') {
+        (8, 1)
+    } else {
+        (10, 0)
+    };
 
-    let base = &s[..suffix_start];
-    let suffix = &s[suffix_start..];
+    // Find end of numeric part
+    let end = bytes[start..].iter().position(|&b| !match base {
+        16 => b.is_ascii_hexdigit(),
+        10 => b.is_ascii_digit(),
+        8  => b >= b'0' && b <= b'7',
+        _ => unreachable!(),
+    }).map(|i| i + start).unwrap_or(bytes.len());
+
+    let number_part = &s[..end];
+    let suffix = &s[end..];
 
     let ty = match suffix {
         "u" | "U" => TYPE_UINT,
@@ -813,16 +823,17 @@ pub fn parse_number_int(s: &str) -> (i64, TypeRef) {
         _ => TYPE_INT,
     };
 
-    let value = if let Some(hex) = base.strip_prefix("0x").or_else(|| base.strip_prefix("0X")) {
-        i64::from_str_radix(hex, 16).unwrap_or(0)
-    } else if let Some(oct) = base.strip_prefix('0') {
-        if oct.is_empty() {
-            0
-        } else {
-            i64::from_str_radix(oct, 8).unwrap_or(0)
+    let value = match base {
+        16 => i64::from_str_radix(&number_part[2..], 16).unwrap_or(0),
+        8 => {
+            if number_part.len() == 1 {
+                0
+            } else {
+                i64::from_str_radix(&number_part[1..], 8).unwrap_or(0)
+            }
         }
-    } else {
-        base.parse::<i64>().unwrap_or(0)
+        10 => number_part.parse::<i64>().unwrap_or(0),
+        _ => unreachable!(),
     };
 
     (value, ty)
