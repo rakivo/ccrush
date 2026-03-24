@@ -1253,6 +1253,7 @@ impl PP {
         self.define_noop_func_macro("__attribute",   &["x"]);
         self.define_noop_func_macro("__asm__",       &["x"]);
         self.define_noop_func_macro("__asm",         &["x"]);
+        self.define_noop_func_macro("_Pragma",       &["x"]);
 
         self.define_func_macro("__has_feature", &["x"], *b"0");
         self.define_func_macro("__has_extension", &["x"], *b"0");
