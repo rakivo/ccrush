@@ -9266,7 +9266,8 @@ impl Compiler {
     }
 
     fn compile_primary(&mut self) -> CResult<()> {
-        match self.current_token.kind {
+        let kind = self.current_token.kind;
+        match kind {
             TK::Number => {
                 // @Cleanup
 
@@ -9356,7 +9357,11 @@ impl Compiler {
                 self.expect(TK::RParen, "')'")?;
             }
 
-            TK::LParen if self.can_hash_start_a_type(self.next_token.hash) => {
+            TK::LParen if {
+                self.can_hash_start_a_type(self.next_token.hash) &&
+                !self.is_hash_a_local_or_a_global(self.next_token.hash) &&
+                self.syms.find(self.next_token.hash).is_none()
+            } => {
                 self.next(); // (
 
                 let cast_ty = self.compile_type()?;
@@ -10285,10 +10290,11 @@ impl Compiler {
 
             if argc < ARG_REGS.len() {
                 self.emit_int_load(ARG_REGS[argc], Reg::Rbp, spill_off, ty);
-                argc += 1;
 
                 // Mark the reg so it doesn't get clobbered during potential memcpy inside pass_struct_arg
                 self.regs.mark(ARG_REGS[argc]);
+
+                argc += 1;
             } else {
                 //
                 // Write integer directly to the pre-allocated stack slot
