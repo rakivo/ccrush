@@ -61,7 +61,11 @@
 // TODO(#7): __attribute__
 // TODO(#13): Debug info
 // TODO(#15): Stack unwind info
-// TODO(#29): static assert
+// TODO: #include_next
+// TODO: __VA_OPT__
+// TODO: #elifdef, #elifndef
+// TODO: #line
+// TODO: Empty directives
 
 // TODO(#18): Resolve the situation with sret and VLA hidden slot using the same slot...?
 
