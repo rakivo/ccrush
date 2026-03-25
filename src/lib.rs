@@ -402,6 +402,9 @@ pub enum CError {
     #[error("{0}")]
     PP(#[from] PPError),
 
+    #[error("static assertion failed")]
+    StaticAssertionFailed { span: Span },
+
     #[error("expected {expected}, got '{got}'")]
     Expected    { span: Span, expected: &'static str, got: String },
 
@@ -443,6 +446,7 @@ impl CError {
         match self {
             CError::PP(pp) => pp.span(),
 
+            CError::StaticAssertionFailed { span }     |
             CError::Expected    { span, .. }           |
             CError::UnknownType { span, .. }           |
             CError::UnknownField { span, .. }          |
@@ -579,7 +583,13 @@ const HASH_DO:       u64 = hash_ident("do");
 const HASH_BREAK:    u64 = hash_ident("break");
 const HASH_BOOL:     u64 = hash_ident("bool");
 const HASH__BOOL:    u64 = hash_ident("_Bool");
+const HASH__TRUE:    u64 = hash_ident("_True");
+const HASH__FALSE:   u64 = hash_ident("_False");
+const HASH_FALSE:    u64 = hash_ident("false");
+const HASH_TRUE:     u64 = hash_ident("true");
 const HASH_CONTINUE: u64 = hash_ident("continue");
+const HASH_STATIC_ASSERT: u64 = hash_ident("static_assert");
+const HASH__STATIC_ASSERT: u64 = hash_ident("_Static_assert");
 
 const HASH___LINE__:            u64 = hash_ident("__LINE__");
 const HASH___FILE__:            u64 = hash_ident("__FILE__");
@@ -899,7 +909,6 @@ struct MacroTable {
     // arg_pool holds the cooked tokens for all args of the current call;
     // arg_ends[i] is the exclusive end index in arg_pool for argument i.
     arg_pool: Vec<Token>,
-    arg_ends: SmallVec<[u32; MAX_PARAMS]>,
 
     expanding: IntSet<u64>, // Hashes of macros currently being expanded
 
@@ -915,7 +924,6 @@ impl MacroTable {
             expanding: IntSet::with_capacity_and_hasher(8, Default::default()),
             index: IntMap::with_capacity_and_hasher(64, Default::default()),
             tok_pool: SmallVec::new(),
-            arg_ends: SmallVec::new(),
             scratch: Vec::with_capacity(256),
             arg_pool: Vec::with_capacity(256),
         }
@@ -1516,7 +1524,7 @@ impl PP {
                     }
 
                     let def = self.macros.defs[index];
-                    if def.param_count == 0 {
+                    if def.param_count == 0 && !def.is_variadic {
                         //
                         // Object macro - mark as expanding, push body + MacroEnd sentinel
                         //
@@ -1576,6 +1584,11 @@ impl PP {
 
                     // Don't return - continue the cook loop
                 }
+
+                // :PPDebug
+                // TK::Param(_) | TK::Paste | TK::Stringify => {
+                //     eprintln!("internal PP token escaped cook(): {:?} at {:?}", t.kind, t.span.s(&self.src_arena));
+                // }
 
                 TK::Eof => return t,
 
@@ -1859,6 +1872,8 @@ impl PP {
         let mut arg_ranges = SmallVec::<[_; MAX_PARAMS]>::new();
         let mut arg_start = scratch_base;
 
+        let named_params = (def.param_count as usize).saturating_sub(def.is_variadic as _);
+
         loop {
             let t = self.raw();
             match t.kind {
@@ -1875,8 +1890,6 @@ impl PP {
                 }
 
                 TK::Comma if depth == 0 => {
-                    let named_params = def.param_count as usize - usize::from(def.is_variadic);
-
                     if arg_index < named_params {
                         // We are finishing a named parameter
                         arg_ranges.push((arg_start, self.macros.scratch.len() as u32 - arg_start));
@@ -1903,8 +1916,6 @@ impl PP {
                 _ => self.macros.scratch.push(t),
             }
         }
-
-        let named_params = def.param_count as usize - usize::from(def.is_variadic);
 
         if arg_ranges.len() < named_params {
             self.macros.scratch.truncate(scratch_base as usize);
@@ -1973,7 +1984,7 @@ impl PP {
         //
 
         let arg_pool_base = self.macros.arg_pool.len() as u32;
-        self.macros.arg_ends.clear();
+        let mut arg_ends = SmallVec::<[u32; MAX_PARAMS]>::new();
 
         for &(start, len) in &arg_ranges {
             let s = start as usize;
@@ -1981,7 +1992,7 @@ impl PP {
             if s == e {
                 // We still need to record the end of this empty argument
                 // so the arg_ends index stays aligned with the parameter index.
-                self.macros.arg_ends.push(self.macros.arg_pool.len() as u32);
+                arg_ends.push(self.macros.arg_pool.len() as u32);
                 continue;
             }
 
@@ -2003,7 +2014,7 @@ impl PP {
                 self.macros.arg_pool.push(t);
             }
 
-            self.macros.arg_ends.push(self.macros.arg_pool.len() as u32);
+            arg_ends.push(self.macros.arg_pool.len() as u32);
         }
         self.macros.scratch.truncate(scratch_base as usize);
 
@@ -2024,16 +2035,17 @@ impl PP {
                 TK::Param(pi) => {
                     let pi = pi as usize;
 
-                    if pi >= self.macros.arg_ends.len() {
-                        // This prevents the panic. If this hits, your definition parser
-                        // allowed a Param index higher than the parameter count.
+                    // :PPDebug
+                    // eprintln!("substituting Param({pi}) body_start={body_start} body_len={body_len} i={}", i-1);
+
+                    if pi >= arg_ends.len() {
                         continue;
                     }
 
                     let arg_start = if pi == 0 { arg_pool_base as usize }
-                                    else       { self.macros.arg_ends[pi - 1] as usize };
+                                    else       { arg_ends[pi - 1] as usize };
 
-                    let arg_end   = self.macros.arg_ends[pi] as usize;
+                    let arg_end   = arg_ends[pi] as usize;
 
                     self.exp.pool.extend_from_slice(&self.macros.arg_pool[arg_start..arg_end]);
                     frame_len += (arg_end - arg_start) as u32;
@@ -2043,9 +2055,9 @@ impl PP {
                     let pi = t.hash as usize;
 
                     let arg_start = if pi == 0 { arg_pool_base as usize }
-                    else        { self.macros.arg_ends[pi - 1] as usize };
+                    else        { arg_ends[pi - 1] as usize };
 
-                    let arg_end = self.macros.arg_ends[pi] as usize;
+                    let arg_end = arg_ends[pi] as usize;
 
                     let mut s = "\"".to_owned();
                     for tok in &self.macros.arg_pool[arg_start..arg_end] {
@@ -2087,9 +2099,9 @@ impl PP {
                                 let pi = pi as usize;
 
                                 let arg_start = if pi == 0 { arg_pool_base as usize }
-                                else { self.macros.arg_ends[pi-1] as usize };
+                                else { arg_ends[pi-1] as usize };
 
-                                let arg_end  = self.macros.arg_ends[pi] as usize;
+                                let arg_end  = arg_ends[pi] as usize;
 
                                 if arg_start < arg_end { self.macros.arg_pool[arg_start] }
                                 else { continue } // Empty arg, discard lhs too?..
@@ -2114,6 +2126,11 @@ impl PP {
                 }
 
                 _ => {
+                    // :PPDebug
+                    // if matches!(t.kind, TK::Param(_)) {
+                    //     eprintln!("BUG: Param in _ arm: {:?}", t.kind);
+                    // }
+
                     self.exp.pool.push(t);
                     frame_len += 1;
                 }
@@ -6359,6 +6376,16 @@ impl Compiler {
             return Ok(());
         }
 
+        if self.current_token.kind == TK::Ident &&
+            !self.can_hash_start_a_type(self.current_token.hash) &&
+            self.next_token.kind == TK::LParen
+        {
+            let ident_token = self.next(); // ident
+            self.try_compile_builtin(ident_token.hash)?;
+            self.expect(TK::SemiColon, "';'")?;
+            return Ok(());
+        }
+
         //
         // Consume specifiers
         //
@@ -8337,6 +8364,35 @@ impl Compiler {
 
     #[inline]
     fn compile_ternary(&mut self, prec: u8, _span: Span) -> CResult<()> {
+        //
+        // Minimal :ConstantFold
+        //
+        // If condition is known at compile time, pick a branch.
+        // Both branches are still compiled (tokens consumed, code emitted) but
+        // the discarded branch's result is freed.
+        //
+        // @Important: Inside with_rollback (enum constants, sizeof, etc.)
+        // the emitted code gets truncated anyway.
+        //
+        let cond_v = self.vstack.peek();
+        if cond_v.kind() == VK::Imm && !self.is_float(cond_v.ty) {
+            let cond = self.vstack.pop().imm;
+
+            self.compile_expr_no_comma()?;
+            let then_v = self.vstack.pop();
+
+            self.expect(TK::Colon, "':'")?;
+
+            self.compile_expr_impl(prec)?;
+            let else_v = self.vstack.pop();
+
+            let (keep, discard) = if cond != 0 { (then_v, else_v) } else { (else_v, then_v) };
+            if matches!(discard.kind(), VK::Reg | VK::RegInd) { self.free_reg(discard.reg()); }
+
+            self.vstack.push(keep);
+            return Ok(());
+        }
+
         let (cond, _) = self.pop_reg()?;
         self.code.test_rr(cond);
         self.regs.free(cond);
@@ -9316,6 +9372,8 @@ impl Compiler {
 
     fn compile_primary(&mut self) -> CResult<()> {
         let kind = self.current_token.kind;
+        let hash = self.current_token.hash;
+
         match kind {
             TK::Number => {
                 // @Cleanup
@@ -9430,14 +9488,25 @@ impl Compiler {
             }
 
             TK::LParen => {
-                self.next();
+                self.next(); // (
                 self.compile_expr()?;
                 self.expect(TK::RParen, "')'")?;
             }
 
+            TK::Ident if matches!(hash, HASH_TRUE | HASH__TRUE) => {
+                self.next(); // true
+                self.vstack.push(CValue::imm(TYPE_INT, 1));
+            }
+
+            TK::Ident if matches!(hash, HASH_FALSE | HASH__FALSE) => {
+                self.next(); // false
+                self.vstack.push(CValue::imm(TYPE_INT, 0));
+            }
+
             TK::Ident => {
-                let name_tok = self.next();
-                let hash     = name_tok.hash;
+                let name_tok = self.current_token;
+
+                self.next(); // name
 
                 if hash == HASH_SIZEOF {
                     let mut has_parens = false;
@@ -9693,6 +9762,32 @@ impl Compiler {
     /// Returns true if the builtin was handled, false if it should fall through to normal call.
     fn try_compile_builtin(&mut self, hash: u64) -> CResult<bool> {
         match hash {
+            HASH_STATIC_ASSERT | HASH__STATIC_ASSERT => {
+                let span = self.current_token.span;
+
+                self.next(); // (
+
+                let v = self.try_parse_and_eval_const_int()?;       // cond
+                self.expect(TK::Comma, "','")?;
+
+                // @Cutnpaste from compile_global_decl_impl
+
+                let t = self.expect(TK::StrLit, "string literal")?; // strlit
+                let rodata_off = self.unescape_string_literal_into_scratch_and_intern_them_into_rodata(&t);
+                // Reserve space for a pointer into .rodata
+                let data_off = self.data.len() as _;
+                self.data.extend_from_slice(&0usize.to_le_bytes());
+                self.data_rodata_relocs.push(DataRodataReloc { data_off, rodata_off });
+
+                self.expect(TK::RParen, "')'")?;
+
+                if v <= 0 {
+                    return Err(CError::StaticAssertionFailed { span })
+                } else {
+                    Ok(true)
+                }
+            }
+
             HASH_BUILTIN_BSWAP16 | HASH_BUILTIN_BSWAP32 | HASH_BUILTIN_BSWAP64 => {
                 self.next(); // (
                 self.compile_expr_no_comma()?;
