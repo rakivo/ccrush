@@ -1839,27 +1839,28 @@ impl PP {
                 }
 
                 TK::Comma if depth == 0 => {
-                    arg_ranges.push((arg_start, self.macros.scratch.len() as u32 - arg_start));
-                    arg_index += 1;
-
                     let named_params = def.param_count as usize - usize::from(def.is_variadic);
 
-                    if arg_index >= named_params && !def.is_variadic {
-                        self.macros.scratch.truncate(scratch_base as usize);
-                        return Err(PPError::ArgumentCountMismatch {
-                            span: t.span,
-                            expected: def.param_count as _,
-                            name: def.def_span.s(&self.src_arena).to_owned(),
-                        });
-                    }
-
                     if arg_index < named_params {
-                        // Normal named param separator - start new range
+                        // We are finishing a named parameter
+                        arg_ranges.push((arg_start, self.macros.scratch.len() as u32 - arg_start));
+                        arg_index += 1;
+
+                        // Start of the next argument
                         arg_start = self.macros.scratch.len() as u32;
                     } else {
-                        // Inside __VA_ARGS__ - keep comma as a token
+                        // We are inside __VA_ARGS__, commas here don't start a new macro parameter
+                        if !def.is_variadic {
+                            self.macros.scratch.truncate(scratch_base as usize);
+                            return Err(PPError::ArgumentCountMismatch {
+                                span: t.span,
+                                expected: def.param_count as _,
+                                name: def.def_span.s(&self.src_arena).to_owned(),
+                            });
+                        }
+
+                        // Just push the comma token to the current variadic argument pool
                         self.macros.scratch.push(t);
-                        // Don't update arg_start, all remaining tokens go into the VA range
                     }
                 }
 
@@ -1941,7 +1942,12 @@ impl PP {
         for &(start, len) in &arg_ranges {
             let s = start as usize;
             let e = s + len as usize;
-            if s == e { continue; }
+            if s == e {
+                // We still need to record the end of this empty argument
+                // so the arg_ends index stays aligned with the parameter index.
+                self.macros.arg_ends.push(self.macros.arg_pool.len() as u32);
+                continue;
+            }
 
             //
             // Copy the arg tokens + EOF sentinel into exp.pool as a temporary frame.
@@ -1981,6 +1987,12 @@ impl PP {
             match t.kind {
                 TK::Param(pi) => {
                     let pi = pi as usize;
+
+                    if pi >= self.macros.arg_ends.len() {
+                        // This prevents the panic. If this hits, your definition parser
+                        // allowed a Param index higher than the parameter count.
+                        continue;
+                    }
 
                     let arg_start = if pi == 0 { arg_pool_base as usize }
                                     else       { self.macros.arg_ends[pi - 1] as usize };
