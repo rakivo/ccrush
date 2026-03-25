@@ -65,7 +65,7 @@
 // TODO(#32): __VA_OPT__
 // TODO(#35): #elifdef, #elifndef
 // TODO(#33): #line
-// TODO: Empty directives
+// TODO(#34): Empty directives
 
 // TODO(#18): Resolve the situation with sret and VLA hidden slot using the same slot...?
 
@@ -11605,4 +11605,3 @@ pub fn run_str(name: impl AsRef<Path>, src: impl Into<Box<[u8]>>) -> CResult<i32
     cc.compile();
     Ok(run_main(cc))
 }
-     
